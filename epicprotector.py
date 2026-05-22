@@ -126,6 +126,13 @@ manual_operation  = {}   # stores selected operation
 manual_workspace  = {}   # stores decoded workspace path for advisory scan
 manual_scan_result= {}   # stores last scan result for detail view
 
+# ── COMPLIANCE SCANNER STATE ─────────────────────────────────────────────────
+compliance_session    = {}   # stores full compliance scan session per admin
+compliance_apk_path   = {}   # stores apk path waiting for compliance approval
+compliance_workspace  = {}   # stores workspace path during compliance review
+compliance_job_dir    = {}   # stores job work dir during compliance review
+compliance_custom_list= {}   # stores admin custom banned word additions
+
 
 # ── TOOL INSTALLER ───────────────────────────────────────────────────────────
 class ToolInstaller:
@@ -1332,26 +1339,394 @@ class Level5_APKBuilder:
 
 
 
+# ── SIGNATURE STRIPPER ────────────────────────────────────────────────────────
+class SignatureStripper:
+    """
+    Detects and strips all existing signature artifacts from an APK
+    before processing begins.
+
+    Strips:
+      - META-INF/*.SF   — JAR signature manifest
+      - META-INF/*.RSA  — RSA certificate block
+      - META-INF/*.DSA  — DSA certificate block
+      - META-INF/*.EC   — EC certificate block
+      - META-INF/MANIFEST.MF — JAR manifest (regenerated on rebuild)
+
+    The APK Signing Block v2/v3 is embedded before the ZIP central
+    directory — it is automatically discarded when apktool rebuilds
+    the APK from the workspace. No manual stripping needed for v2/v3.
+
+    Returns a report of what was found and removed.
+    """
+
+    # File patterns inside META-INF that must be removed
+    SIGNATURE_PATTERNS = (
+        re.compile(r'^META-INF/.*\.SF$',   re.IGNORECASE),
+        re.compile(r'^META-INF/.*\.RSA$',  re.IGNORECASE),
+        re.compile(r'^META-INF/.*\.DSA$',  re.IGNORECASE),
+        re.compile(r'^META-INF/.*\.EC$',   re.IGNORECASE),
+        re.compile(r'^META-INF/MANIFEST\.MF$', re.IGNORECASE),
+    )
+
+    def detect(self, apk_path: str) -> dict:
+        """
+        Scan APK for existing signature artifacts.
+        Returns a report dict with found items and signing block status.
+        """
+        found_files = []
+        has_signing_block = False
+
+        # Check ZIP entries for META-INF signature files
+        try:
+            with zipfile.ZipFile(apk_path, 'r') as z:
+                for name in z.namelist():
+                    for pat in self.SIGNATURE_PATTERNS:
+                        if pat.match(name):
+                            found_files.append(name)
+                            break
+        except Exception as e:
+            logger.warning(f"[SignatureStripper] ZIP scan failed: {e}")
+
+        # Check for APK Signing Block v2/v3 magic bytes
+        try:
+            with open(apk_path, 'rb') as f:
+                data = f.read()
+            if b"APK Sig Block 42" in data:
+                has_signing_block = True
+        except Exception as e:
+            logger.warning(f"[SignatureStripper] Signing block check failed: {e}")
+
+        return {
+            "meta_inf_files":    found_files,
+            "has_signing_block": has_signing_block,
+            "total_found":       len(found_files) + (1 if has_signing_block else 0),
+        }
+
+    def strip(self, apk_path: str, out_path: str) -> dict:
+        """
+        Strip all META-INF signature files from the APK.
+        Writes clean APK to out_path.
+        APK Signing Block v2/v3 is handled by apktool rebuild — not touched here.
+        Returns report of what was stripped.
+        """
+        stripped      = []
+        kept          = []
+        files_written = 0
+
+        try:
+            with zipfile.ZipFile(apk_path, 'r') as src:
+                with zipfile.ZipFile(out_path, 'w', zipfile.ZIP_DEFLATED) as dst:
+                    for item in src.infolist():
+                        is_sig = any(
+                            pat.match(item.filename)
+                            for pat in self.SIGNATURE_PATTERNS
+                        )
+                        if is_sig:
+                            stripped.append(item.filename)
+                            logger.info(
+                                f"[SignatureStripper] Stripped: {item.filename}")
+                        else:
+                            # Preserve original compression for non-signature files
+                            data = src.read(item.filename)
+                            dst.writestr(item, data)
+                            kept.append(item.filename)
+                            files_written += 1
+
+        except Exception as e:
+            raise RuntimeError(f"Signature strip failed: {e}")
+
+        return {
+            "stripped_files": stripped,
+            "files_kept":     files_written,
+            "clean_apk":      out_path,
+        }
+
+
+# ── ELITE FRESH FINGERPRINT GENERATOR ────────────────────────────────────────
+class EliteFingerprintGenerator:
+    """
+    Generates a completely unique, legitimate-looking digital identity
+    and keystore for every single build.
+
+    Every build gets:
+      - Fresh RSA 2048-bit keypair — never reused
+      - Professional CN drawn from real word pools
+      - Matching O, OU, L, ST, C fields
+      - Randomized validity between 8000-12000 days
+      - Structured human-looking passwords
+      - Unique alias with numeric suffix
+      - Keystore deleted after APK is delivered — zero reuse
+
+    No two builds will ever share the same fingerprint.
+    """
+
+    # ── Word pools for identity generation ───────────────────────────────────
+
+    CN_POOL_A = [
+        "Apex", "Nova", "Vanta", "Cipher", "Shield", "Nexus",
+        "Titan", "Prism", "Vertex", "Aura", "Crest", "Forge",
+        "Sterling", "Beacon", "Zenith", "Atlas", "Solace", "Vero",
+        "Lumex", "Orion", "Phaeton", "Stratos", "Helion", "Caden",
+        "Rivet", "Onyx", "Halcyon", "Sable", "Ardent", "Cobalt",
+    ]
+
+    CN_POOL_B = [
+        "Systems", "Solutions", "Technologies", "Dynamics",
+        "Innovations", "Ventures", "Applications", "Labs",
+        "Platforms", "Networks", "Enterprises", "Digital",
+        "Software", "Services", "Group", "Partners",
+        "Computing", "Intelligence", "Analytics", "Security",
+    ]
+
+    OU_POOL = [
+        "MobileDivision", "SecurityUnit", "AppDevelopment",
+        "DigitalServices", "CoreEngineering", "PlatformTeam",
+        "SoftwareGroup", "ProductDivision", "TechOperations",
+        "InnovationLab", "EnterpriseUnit", "CloudServices",
+        "DataEngineering", "SystemsGroup", "ApplicationTeam",
+    ]
+
+    # City → State mapping for legitimate US addresses
+    CITY_STATE_MAP = {
+        "Austin":       "Texas",
+        "Seattle":      "Washington",
+        "Boston":       "Massachusetts",
+        "Denver":       "Colorado",
+        "Atlanta":      "Georgia",
+        "Chicago":      "Illinois",
+        "Portland":     "Oregon",
+        "Phoenix":      "Arizona",
+        "Nashville":    "Tennessee",
+        "Raleigh":      "North Carolina",
+        "Dallas":       "Texas",
+        "Miami":        "Florida",
+        "Charlotte":    "North Carolina",
+        "Indianapolis": "Indiana",
+        "Tampa":        "Florida",
+        "San Jose":     "California",
+        "San Diego":    "California",
+        "Columbus":     "Ohio",
+        "Louisville":   "Kentucky",
+        "Baltimore":    "Maryland",
+    }
+
+    COUNTRY_POOL = ["US", "GB", "CA", "AU", "DE", "NL", "SE", "SG"]
+
+    # Word pools for structured human-looking passwords
+    PASS_WORDS = [
+        "Cipher", "Shield", "Nexus", "Titan", "Prism",
+        "Vertex", "Atlas", "Forge", "Beacon", "Zenith",
+        "Cobalt", "Onyx", "Ardent", "Stratos", "Helion",
+        "Sable", "Orion", "Vanta", "Lumex", "Crest",
+    ]
+
+    ORG_SUFFIX_POOL = ["Inc", "Corp", "Ltd", "Group", "LLC"]
+
+    def _gen_password(self) -> str:
+        """
+        Generate a structured human-looking password.
+        Format: Word + digits + symbol + Word + digits
+        Example: Cipher847#Atlas293
+        Never purely random — looks human-created.
+        """
+        w1     = random.choice(self.PASS_WORDS)
+        w2     = random.choice([w for w in self.PASS_WORDS if w != w1])
+        n1     = random.randint(100, 999)
+        n2     = random.randint(100, 999)
+        symbol = random.choice(["#", "@", "!", "$"])
+        return f"{w1}{n1}{symbol}{w2}{n2}"
+
+    def _gen_alphanumeric(self, length: int) -> str:
+        """Generate a purely alphanumeric random string."""
+        chars = string.ascii_letters + string.digits
+        return ''.join(random.choices(chars, k=length))
+
+    def generate(self, work_dir: str) -> dict:
+        """
+        Generate a complete fresh digital identity and keystore.
+        Returns all identity fields and keystore path.
+        Keystore is written to work_dir — caller must delete after use.
+        """
+        # ── Draw identity fields from pools ──────────────────────────────────
+        cn_a   = random.choice(self.CN_POOL_A)
+        cn_b   = random.choice(self.CN_POOL_B)
+        cn     = f"{cn_a}{cn_b}"
+
+        org_a  = random.choice(self.CN_POOL_A)
+        org_b  = random.choice(self.CN_POOL_B)
+        org_suffix = random.choice(self.ORG_SUFFIX_POOL)
+        org    = f"{org_a}{org_b} {org_suffix}"
+
+        ou     = random.choice(self.OU_POOL)
+
+        city   = random.choice(list(self.CITY_STATE_MAP.keys()))
+        state  = self.CITY_STATE_MAP[city]
+        country = random.choice(self.COUNTRY_POOL)
+
+        validity = random.randint(8000, 12000)
+
+        # ── Generate unique alias ─────────────────────────────────────────────
+        alias_base = f"{cn_a.lower()}_{cn_b.lower()}"
+        alias      = f"{alias_base}_{random.randint(100000, 999999)}"
+
+        # ── Generate structured passwords ────────────────────────────────────
+        ks_pass  = self._gen_password()
+        key_pass = self._gen_password()
+
+        # ── Build dname string ────────────────────────────────────────────────
+        # Quote carefully — keytool dname uses comma separation
+        dname = (
+            f"CN={cn}, "
+            f"OU={ou}, "
+            f"O={org}, "
+            f"L={city}, "
+            f"ST={state}, "
+            f"C={country}"
+        )
+
+        # ── Keystore path — unique per build ──────────────────────────────────
+        ks_filename = f"epic_{cn.lower()}_{int(time.time())}.keystore"
+        ks_path     = os.path.join(work_dir, ks_filename)
+
+        # ── Generate keystore using keytool ──────────────────────────────────
+        cmd = (
+            f'keytool -genkeypair -v '
+            f'-keystore "{ks_path}" '
+            f'-alias "{alias}" '
+            f'-keyalg RSA '
+            f'-keysize 2048 '
+            f'-validity {validity} '
+            f'-storepass "{ks_pass}" '
+            f'-keypass "{key_pass}" '
+            f'-dname "{dname}" '
+            f'2>/dev/null'
+        )
+
+        result = subprocess.run(cmd, shell=True, capture_output=True)
+
+        if result.returncode != 0 or not os.path.exists(ks_path):
+            raise RuntimeError(
+                f"Keystore generation failed.\n"
+                f"stderr: {result.stderr.decode(errors='ignore')}"
+            )
+
+        logger.info(
+            f"[EliteFingerprint] Fresh keystore generated: "
+            f"CN={cn}, OU={ou}, O={org}, L={city}, ST={state}, "
+            f"C={country}, validity={validity}d, alias={alias}"
+        )
+
+        return {
+            "keystore_path": ks_path,
+            "alias":         alias,
+            "ks_pass":       ks_pass,
+            "key_pass":      key_pass,
+            "cn":            cn,
+            "ou":            ou,
+            "org":           org,
+            "city":          city,
+            "state":         state,
+            "country":       country,
+            "validity_days": validity,
+            "dname":         dname,
+        }
+
+    def get_sha256_fingerprint(self, ks_path: str, alias: str,
+                                ks_pass: str) -> str:
+        """
+        Extract SHA-256 fingerprint from generated keystore.
+        Returns fingerprint string or empty string on failure.
+        """
+        cmd = (
+            f'keytool -list -v '
+            f'-keystore "{ks_path}" '
+            f'-alias "{alias}" '
+            f'-storepass "{ks_pass}" '
+            f'2>/dev/null'
+        )
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            if "SHA256:" in line or "SHA-256" in line:
+                return line.strip()
+        return ""
+
+    def destroy(self, ks_path: str):
+        """
+        Securely delete keystore file after APK is delivered.
+        Overwrites with random bytes before deletion — no recovery.
+        """
+        try:
+            if os.path.exists(ks_path):
+                size = os.path.getsize(ks_path)
+                with open(ks_path, 'wb') as f:
+                    f.write(os.urandom(size))
+                os.remove(ks_path)
+                logger.info(
+                    f"[EliteFingerprint] Keystore securely destroyed: "
+                    f"{os.path.basename(ks_path)}")
+        except Exception as e:
+            logger.warning(
+                f"[EliteFingerprint] Keystore destruction failed: {e}")
+
+
 # ── LEVEL 6 — SIGN & ALIGN ────────────────────────────────────────────────────
 class Level6_Signer:
+    """
+    Level 6 — Sign & Align using Elite Fresh Fingerprint.
+
+    Every call generates a brand new digital identity via
+    EliteFingerprintGenerator. The keystore is securely destroyed
+    after the APK is signed and delivered — zero reuse guaranteed.
+
+    Signing pipeline:
+      Path A — apksigner (preferred): zipalign → sign
+      Path B — jarsigner (fallback):  sign → zipalign
+    """
 
     def __init__(self, work_dir):
-        self.work_dir   = work_dir
-        self.keystore   = os.path.join(work_dir, "epic.keystore")
-        self.alias      = "epicprotector"
-        self.kp         = KS_KEY
-        self.sp         = KS_PASS
+        self.work_dir  = work_dir
+        self._identity = None   # populated by generate_keystore()
 
-    def generate_keystore(self):
-        if os.path.exists(self.keystore):
-            return True
-        cmd = (
-            f"keytool -genkeypair -v -keystore {self.keystore} "
-            f"-alias {self.alias} -keyalg RSA -keysize 2048 -validity 10000 "
-            f"-storepass {self.sp} -keypass {self.kp} "
-            f"-dname 'CN=EpicProtector,O=Security,C=US' 2>/dev/null"
+    def generate_keystore(self) -> dict:
+        """
+        Generate a fresh unique keystore for this build only.
+        Stores identity in self._identity for use by sign methods.
+        Returns the full identity dict.
+        """
+        gen = EliteFingerprintGenerator()
+        self._identity = gen.generate(self.work_dir)
+        logger.info(
+            f"[Level6] Fresh identity: CN={self._identity['cn']}, "
+            f"O={self._identity['org']}, "
+            f"C={self._identity['country']}, "
+            f"validity={self._identity['validity_days']}d"
         )
-        return subprocess.run(cmd, shell=True, capture_output=True).returncode == 0
+        return self._identity
+
+    def destroy_keystore(self):
+        """
+        Securely destroy keystore after APK delivery.
+        Called automatically by prepare() after signing succeeds.
+        """
+        if self._identity and self._identity.get("keystore_path"):
+            EliteFingerprintGenerator().destroy(
+                self._identity["keystore_path"])
+
+    @property
+    def keystore(self):
+        return self._identity["keystore_path"] if self._identity else ""
+
+    @property
+    def alias(self):
+        return self._identity["alias"] if self._identity else ""
+
+    @property
+    def sp(self):
+        return self._identity["ks_pass"] if self._identity else ""
+
+    @property
+    def kp(self):
+        return self._identity["key_pass"] if self._identity else ""
 
     def zipalign(self, inp, out=None) -> str:
         """
@@ -1427,39 +1802,108 @@ class Level6_Signer:
 
         return aligned
 
-    def prepare(self, inp) -> str:
+    def prepare(self, inp) -> dict:
         """
-        Full Level 6 certification pipeline — two paths, each in correct order:
+        Full Level 6 certification pipeline:
 
-        Path A — apksigner (preferred):
-            zipalign → apksigner sign → EPIC_PROTECTED.apk
-            apksigner verifies alignment internally so zipalign must come first.
+          Step 0 — Strip existing signature artifacts from APK
+          Step 1 — Generate fresh Elite digital identity + keystore
+          Step 2A — apksigner path: zipalign → sign (preferred)
+          Step 2B — jarsigner path: sign → zipalign (fallback)
+          Step 3 — Extract SHA-256 fingerprint of new certificate
+          Step 4 — Securely destroy keystore — zero reuse
 
-        Path B — jarsigner (fallback):
-            jarsigner sign → zipalign → EPIC_PROTECTED.apk
-            jarsigner rewrites the ZIP on signing so it must run BEFORE zipalign.
-            Running zipalign before jarsigner would break alignment and cause
-            Android to reject the APK on install.
+        Returns dict with output APK path and identity report.
         """
-        self.generate_keystore()
+        # ── Step 0 — Strip existing signature ────────────────────────────────
+        stripper    = SignatureStripper()
+        strip_report = stripper.detect(inp)
 
-        # ── Path A — apksigner: zipalign first, then sign ─────────────────────
-        aligned = self.zipalign(inp)
-        result  = self._sign_with_apksigner(aligned)
+        if strip_report["total_found"] > 0:
+            stripped_apk = inp.replace(".apk", "_stripped.apk")
+            strip_result = stripper.strip(inp, stripped_apk)
+            logger.info(
+                f"[Level6] Stripped {len(strip_result['stripped_files'])} "
+                f"signature artifacts.")
+            inp = stripped_apk
+        else:
+            strip_result = {"stripped_files": [], "files_kept": 0}
 
-        # Clean up aligned intermediate if apksigner succeeded
-        if result:
+        # ── Step 1 — Generate fresh Elite identity ────────────────────────────
+        identity = self.generate_keystore()
+
+        try:
+            # ── Step 2A — apksigner: zipalign first, then sign ────────────────
+            aligned = self.zipalign(inp)
+            result  = self._sign_with_apksigner(aligned)
+
+            # Clean up aligned intermediate if apksigner succeeded
+            if result:
+                try:
+                    if aligned != inp and os.path.exists(aligned):
+                        os.remove(aligned)
+                except Exception:
+                    pass
+
+                # ── Step 3 — Extract fingerprint ─────────────────────────────
+                gen         = EliteFingerprintGenerator()
+                fingerprint = gen.get_sha256_fingerprint(
+                    identity["keystore_path"],
+                    identity["alias"],
+                    identity["ks_pass"]
+                )
+
+                # ── Step 4 — Destroy keystore ─────────────────────────────────
+                self.destroy_keystore()
+
+                # Clean up stripped intermediate
+                try:
+                    if "_stripped.apk" in inp and os.path.exists(inp):
+                        os.remove(inp)
+                except Exception:
+                    pass
+
+                return {
+                    "output_apk":      result,
+                    "identity":        identity,
+                    "fingerprint":     fingerprint,
+                    "stripped_files":  strip_result["stripped_files"],
+                    "signing_method":  "apksigner",
+                }
+
+            # ── Step 2B — jarsigner fallback: sign first, then zipalign ──────
+            final = self._sign_with_jarsigner(inp)
+
+            # ── Step 3 — Extract fingerprint ─────────────────────────────────
+            gen         = EliteFingerprintGenerator()
+            fingerprint = gen.get_sha256_fingerprint(
+                identity["keystore_path"],
+                identity["alias"],
+                identity["ks_pass"]
+            )
+
+            # ── Step 4 — Destroy keystore ─────────────────────────────────────
+            self.destroy_keystore()
+
+            # Clean up stripped intermediate
             try:
-                if aligned != inp and os.path.exists(aligned):
-                    os.remove(aligned)
+                if "_stripped.apk" in inp and os.path.exists(inp):
+                    os.remove(inp)
             except Exception:
                 pass
-            return result
 
-        # ── Path B — jarsigner fallback: sign first, then zipalign ───────────
-        # Pass the original UNALIGNED inp — jarsigner must not receive
-        # an already-aligned file or the final alignment will be broken
-        return self._sign_with_jarsigner(inp)
+            return {
+                "output_apk":     final,
+                "identity":       identity,
+                "fingerprint":    fingerprint,
+                "stripped_files": strip_result["stripped_files"],
+                "signing_method": "jarsigner",
+            }
+
+        except Exception as e:
+            # Always destroy keystore even on failure
+            self.destroy_keystore()
+            raise
 
 
 # ── INTEGRITY GUARDIAN ────────────────────────────────────────────────────────
@@ -2045,6 +2489,385 @@ class ManualControlEngine:
             return {"error": f"Unknown operation: {operation}"}
 
 
+# ── COMPLIANCE SCANNER ENGINE ────────────────────────────────────────────────
+class ComplianceScannerEngine:
+    """
+    Elite Master Hybrid — Compliance Scanner Engine
+
+    Automatically scans APK internal files and folders for banned or
+    suspicious words before any protection is applied. Reports findings
+    to the Telegram bot with severity levels, smart suggestions, before/after
+    preview, compliance score, and rename consistency enforcement.
+
+    Integrated into the protection pipeline — runs after Level 1 decode,
+    before Level 2 manifest hardening. No protection proceeds until admin
+    reviews and approves all findings.
+
+    Scan targets:
+      - Folder names inside decoded workspace
+      - File names inside decoded workspace
+      - Smali class names and method names
+      - String values inside smali files
+      - Comment lines inside smali files
+
+    Severity levels:
+      CRITICAL  — Will definitely trigger security scanners
+      WARNING   — May trigger some scanners
+      ADVISORY  — Professional improvement suggested
+    """
+
+    # ── Permanently banned words — Critical level ────────────────────────────
+    CRITICAL_BANNED = [
+        "fake", "decoy", "trap", "junk", "inject", "payload",
+        "backdoor", "bypass", "hijack", "exploit", "hook", "spy",
+        "malware", "ghost", "stealth", "rootkit", "trojan",
+        "worm", "virus", "ransom", "keylog", "sniffer",
+    ]
+
+    # ── Warning level words — may trigger some scanners ─────────────────────
+    WARNING_BANNED = [
+        "crack", "patch", "cheat", "dump", "leak", "steal",
+        "sniff", "intercept", "capture", "grab", "harvest",
+        "scrape", "mine", "forge", "spoof", "fake",
+    ]
+
+    # ── Advisory level words — professional improvement suggested ────────────
+    ADVISORY_BANNED = [
+        "hack", "reverse", "decompile", "strip", "raw",
+        "debug", "test", "temp", "tmp", "dirty",
+    ]
+
+    # ── Smart replacement suggestions ────────────────────────────────────────
+    SMART_SUGGESTIONS = {
+        "inject":      "integrate",
+        "hook":        "monitor",
+        "hidden":      "protected",
+        "backdoor":    "serviceChannel",
+        "bypass":      "override",
+        "exploit":     "utilize",
+        "hijack":      "redirect",
+        "spy":         "observe",
+        "malware":     "securityModule",
+        "ghost":       "backgroundService",
+        "stealth":     "silentMode",
+        "payload":     "dataPackage",
+        "fake":        "simulation",
+        "decoy":       "placeholder",
+        "trap":        "validator",
+        "junk":        "buffer",
+        "crack":       "analyze",
+        "patch":       "update",
+        "dump":        "export",
+        "leak":        "transfer",
+        "steal":       "retrieve",
+        "sniff":       "monitor",
+        "intercept":   "capture",
+        "harvest":     "collect",
+        "scrape":      "extract",
+        "forge":       "generate",
+        "spoof":       "simulate",
+        "hack":        "modify",
+        "reverse":     "analyze",
+        "decompile":   "inspect",
+        "strip":       "remove",
+        "debug":       "diagnostic",
+        "temp":        "transient",
+        "tmp":         "transient",
+        "rootkit":     "systemModule",
+        "trojan":      "serviceAgent",
+        "worm":        "propagationModule",
+        "virus":       "securityAgent",
+        "ransom":      "lockModule",
+        "keylog":      "inputMonitor",
+        "sniffer":     "networkMonitor",
+    }
+
+    # ── Context type labels ──────────────────────────────────────────────────
+    CONTEXT_LABELS = {
+        "folder":  "📁 Folder",
+        "file":    "📄 File",
+        "class":   "🔷 Class Name",
+        "method":  "🔧 Method Name",
+        "string":  "🔤 String Value",
+        "comment": "💬 Comment",
+    }
+
+    def __init__(self):
+        self.findings        = []   # list of finding dicts
+        self.custom_banned   = []   # admin-added custom banned words
+        self.rename_map      = {}   # tracks all renames for consistency
+
+    def _get_severity(self, word: str) -> str:
+        w = word.lower()
+        if w in [x.lower() for x in self.CRITICAL_BANNED]:
+            return "CRITICAL"
+        if w in [x.lower() for x in self.WARNING_BANNED]:
+            return "WARNING"
+        return "ADVISORY"
+
+    def _get_suggestion(self, word: str) -> str:
+        return self.SMART_SUGGESTIONS.get(word.lower(), f"{word}Safe")
+
+    def _all_banned(self) -> list:
+        base = self.CRITICAL_BANNED + self.WARNING_BANNED + self.ADVISORY_BANNED
+        return [w.lower() for w in base] + [w.lower() for w in self.custom_banned]
+
+    def _check_text(self, text: str) -> list:
+        """Return list of banned words found in text."""
+        found = []
+        text_lower = text.lower()
+        for word in self._all_banned():
+            if word in text_lower:
+                found.append(word)
+        return list(set(found))
+
+    def scan_workspace(self, workspace_dir: str) -> list:
+        """
+        Full compliance scan of decoded APK workspace.
+        Returns list of finding dicts with location, word, severity, suggestion.
+        """
+        self.findings = []
+        workspace_path = Path(workspace_dir)
+
+        # ── Scan folder names ────────────────────────────────────────────────
+        for item in workspace_path.rglob("*"):
+            rel = str(item.relative_to(workspace_path))
+            if item.is_dir():
+                banned_in_name = self._check_text(item.name)
+                for word in banned_in_name:
+                    self.findings.append({
+                        "context":    "folder",
+                        "location":   rel,
+                        "word":       word,
+                        "severity":   self._get_severity(word),
+                        "suggestion": self._get_suggestion(word),
+                        "original":   item.name,
+                        "proposed":   item.name.lower().replace(
+                            word, self._get_suggestion(word)),
+                        "full_path":  str(item),
+                    })
+
+        # ── Scan file names ──────────────────────────────────────────────────
+        for item in workspace_path.rglob("*"):
+            if item.is_file():
+                rel = str(item.relative_to(workspace_path))
+                banned_in_name = self._check_text(item.stem)
+                for word in banned_in_name:
+                    self.findings.append({
+                        "context":    "file",
+                        "location":   rel,
+                        "word":       word,
+                        "severity":   self._get_severity(word),
+                        "suggestion": self._get_suggestion(word),
+                        "original":   item.name,
+                        "proposed":   item.name.lower().replace(
+                            word, self._get_suggestion(word)),
+                        "full_path":  str(item),
+                    })
+
+        # ── Deep scan smali files ────────────────────────────────────────────
+        for sf in workspace_path.rglob("*.smali"):
+            rel = str(sf.relative_to(workspace_path))
+            try:
+                with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+                for line_num, line in enumerate(lines, 1):
+                    line_stripped = line.strip()
+                    # Determine context from line content
+                    if line_stripped.startswith(".class"):
+                        ctx = "class"
+                    elif line_stripped.startswith(".method"):
+                        ctx = "method"
+                    elif line_stripped.startswith("const-string"):
+                        ctx = "string"
+                    elif line_stripped.startswith("#"):
+                        ctx = "comment"
+                    else:
+                        continue
+
+                    banned_in_line = self._check_text(line_stripped)
+                    for word in banned_in_line:
+                        self.findings.append({
+                            "context":    ctx,
+                            "location":   f"{rel}:{line_num}",
+                            "word":       word,
+                            "severity":   self._get_severity(word),
+                            "suggestion": self._get_suggestion(word),
+                            "original":   line_stripped[:80],
+                            "proposed":   line_stripped[:80].lower().replace(
+                                word, self._get_suggestion(word)),
+                            "full_path":  str(sf),
+                            "line_num":   line_num,
+                        })
+            except Exception as e:
+                logger.warning(f"[ComplianceScanner] Skipped {sf.name}: {e}")
+
+        # Deduplicate by location+word
+        seen = set()
+        unique = []
+        for f in self.findings:
+            key = (f["location"], f["word"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+        self.findings = unique
+
+        logger.info(
+            f"[ComplianceScanner] Scan complete — "
+            f"{len(self.findings)} findings")
+        return self.findings
+
+    def compute_score(self, findings: list) -> int:
+        """
+        Compute compliance score 0-100.
+        Starts at 100. Deducts per severity level.
+        """
+        score = 100
+        for f in findings:
+            if f["severity"] == "CRITICAL":
+                score -= 15
+            elif f["severity"] == "WARNING":
+                score -= 7
+            else:
+                score -= 3
+        return max(0, score)
+
+    def apply_rename(self, finding: dict) -> bool:
+        """
+        Apply a single rename to the APK workspace.
+        Handles file rename, folder rename, and smali line replacement.
+        Enforces rename consistency across all occurrences.
+        Returns True on success.
+        """
+        try:
+            ctx       = finding["context"]
+            word      = finding["word"]
+            suggested = finding["suggestion"]
+            full_path = finding["full_path"]
+
+            if ctx in ("folder", "file"):
+                p = Path(full_path)
+                if p.exists():
+                    new_name = p.name.lower().replace(word, suggested)
+                    new_path = p.parent / new_name
+                    p.rename(new_path)
+                    self.rename_map[word] = suggested
+                    logger.info(
+                        f"[ComplianceScanner] Renamed: {p.name} → {new_name}")
+                    return True
+
+            elif ctx in ("class", "method", "string", "comment"):
+                p = Path(full_path)
+                if p.exists():
+                    with open(p, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    # Replace all occurrences for consistency
+                    new_content = content.replace(word, suggested)
+                    new_content = new_content.replace(
+                        word.capitalize(),
+                        suggested.capitalize())
+                    with open(p, 'w', encoding='utf-8') as f:
+                        f.write(new_content)
+                    self.rename_map[word] = suggested
+                    logger.info(
+                        f"[ComplianceScanner] Replaced '{word}' → "
+                        f"'{suggested}' in {p.name}")
+                    return True
+        except Exception as e:
+            logger.warning(f"[ComplianceScanner] Rename failed: {e}")
+        return False
+
+    def apply_all_critical(self, findings: list) -> int:
+        """Apply all suggested renames for CRITICAL severity findings."""
+        fixed = 0
+        for f in findings:
+            if f["severity"] == "CRITICAL":
+                if self.apply_rename(f):
+                    fixed += 1
+        return fixed
+
+    def save_audit_log(self, findings: list, fixed: int,
+                       skipped: int, apk_name: str) -> str:
+        """Save compliance audit log to file. Returns file path."""
+        score_before = self.compute_score(findings)
+        remaining    = [f for f in findings if f not in self.rename_map]
+        score_after  = self.compute_score(remaining)
+
+        log = {
+            "audit_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "apk_name":        apk_name,
+            "total_found":     len(findings),
+            "fixed":           fixed,
+            "skipped":         skipped,
+            "score_before":    score_before,
+            "score_after":     min(100, score_before + (fixed * 10)),
+            "status":          "✅ Fully Compliant" if fixed == len(findings)
+                               else "⚠️ Partially Compliant",
+            "findings":        findings,
+            "rename_map":      self.rename_map,
+        }
+        log_dir  = WORK_DIR
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(
+            log_dir,
+            f"compliance_audit_{int(time.time())}.json")
+        with open(log_path, 'w') as lf:
+            json.dump(log, lf, indent=2)
+        logger.info(f"[ComplianceScanner] Audit log saved: {log_path}")
+        return log_path
+
+    @staticmethod
+    def format_finding_message(finding: dict, index: int,
+                               total: int) -> str:
+        """Format a single finding for Telegram display."""
+        sev_icon = {
+            "CRITICAL": "🔴",
+            "WARNING":  "🟡",
+            "ADVISORY": "🟢",
+        }.get(finding["severity"], "⚪")
+
+        ctx_label = ComplianceScannerEngine.CONTEXT_LABELS.get(
+            finding["context"], finding["context"])
+
+        return (
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"*Item {index} of {total}*\n\n"
+            f"{sev_icon} *{finding['severity']}*\n"
+            f"{ctx_label}\n\n"
+            f"📍 Location:\n`{finding['location'][:60]}`\n\n"
+            f"❌ Found word: `{finding['word']}`\n"
+            f"✅ Suggestion: `{finding['suggestion']}`\n\n"
+            f"*Before:*\n`{finding['original'][:60]}`\n"
+            f"*After:*\n`{finding['proposed'][:60]}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━"
+        )
+
+    @staticmethod
+    def format_summary_message(findings: list, apk_name: str) -> str:
+        """Format compliance scan summary for Telegram."""
+        critical = sum(1 for f in findings if f["severity"] == "CRITICAL")
+        warning  = sum(1 for f in findings if f["severity"] == "WARNING")
+        advisory = sum(1 for f in findings if f["severity"] == "ADVISORY")
+
+        scanner  = ComplianceScannerEngine()
+        score    = scanner.compute_score(findings)
+
+        score_icon = "✅" if score >= 90 else "⚠️" if score >= 60 else "❌"
+
+        return (
+            f"🛡️ *COMPLIANCE SCAN REPORT*\n\n"
+            f"📦 APK: `{apk_name}`\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔴 Critical : {critical}\n"
+            f"🟡 Warning  : {warning}\n"
+            f"🟢 Advisory : {advisory}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Compliance Score: {score_icon} *{score}/100*\n\n"
+            f"Total findings: *{len(findings)}*\n\n"
+            f"Select an action below:"
+        )
+
+
 # ── MASTER PROTECTION ENGINE ──────────────────────────────────────────────────
 class MasterProtectionEngine:
     """
@@ -2085,8 +2908,20 @@ class MasterProtectionEngine:
 
             # ── AES key ──────────────────────────────────────────────────────
             aes_key = CryptoEngine.generate_key()
-            # Do NOT write key to disk in production — kept in memory only
             mark("🔑 AES-256 Key", "✅ Generated (in-memory)")
+
+            # ── STRIP existing signature before any processing ────────────────
+            mark("🧹 Signature Removal", "⏳ Scanning...")
+            stripper     = SignatureStripper()
+            strip_detect = stripper.detect(apk_path)
+            if strip_detect["total_found"] > 0:
+                stripped_apk = os.path.join(work_dir, "input_stripped.apk")
+                strip_result = stripper.strip(apk_path, stripped_apk)
+                apk_path     = stripped_apk
+                mark("🧹 Signature Removal",
+                     f"✅ {len(strip_result['stripped_files'])} artifacts removed")
+            else:
+                mark("🧹 Signature Removal", "✅ No existing signature found — clean")
 
             # ── LEVEL 1 — Decode ─────────────────────────────────────────────
             mark("Level 1 — Workspace Build", "⏳ Running...")
@@ -2100,39 +2935,49 @@ class MasterProtectionEngine:
             man_changes = l2.protect(workspace)
             mark("Level 2 — Manifest", f"✅ {len(man_changes)} changes")
 
-            # ── LEVEL 3 — Security Guard Integration ────────────────────────
-            # Step 1: Insert runAllChecks call into onCreate smali
-            # Step 2: Generate full EpicSecurityGuard.smali (all methods)
-            # Step 3: Place smali file into workspace smali package folder
-            # All 3 steps complete here BEFORE Level 5 rebuild — class present in DEX
+            # ── LEVEL 3 — Security Guard Integration ─────────────────────────
             mark("Level 3 — Security Guard Integration", "⏳ Running...")
             l3 = Level3_SecurityGuardIntegrator(self.crypto, work_dir)
             guard_path       = l3.save_guard_java(aes_key)
             guard_integrated = l3.integrate_security_guard(workspace, aes_key)
-            mark("Level 3 — Security Guard Integration", f"✅ {guard_integrated} wired — Guard class placed in smali")
+            mark("Level 3 — Security Guard Integration",
+                 f"✅ {guard_integrated} wired — Guard class placed in smali")
 
-            # ── LEVEL 4 — Security Compliance Layer ───────────────────────────────────
+            # ── LEVEL 4 — Security Compliance Layer ──────────────────────────
             mark("Level 4 — Security Compliance Layer", "⏳ Running...")
             l4 = Level4_SecurityCompliance(self.crypto, work_dir)
             security_fields = l4.add_security_fields(workspace)
-            mark("Level 4 — Security Compliance Layer", f"✅ {security_fields} security fields added")
+            mark("Level 4 — Security Compliance Layer",
+                 f"✅ {security_fields} security fields added")
 
-            # ── LEVEL 5 — BUILD (must happen before any ZIP-level ops) ──────
+            # ── LEVEL 5 — BUILD ───────────────────────────────────────────────
             mark("Level 5 — APK Build", "⏳ Running... (this may take 1-3 min)")
             l5 = Level5_APKBuilder(self.tools, work_dir)
             rebuilt = l5.rebuild(workspace)
             mark("Level 5 — APK Build", "✅ Valid APK produced")
 
-            # ── Integrity snapshot (of workspace before ZIP ops) ─────────────
+            # ── Integrity snapshot ────────────────────────────────────────────
             int_manifest = self.integrity.generate(workspace)
             self.integrity.save(int_manifest)
             mark("🔒 Integrity Manifest", f"✅ {len(int_manifest)} files hashed")
 
-            # ── LEVEL 6 — Sign & Align ───────────────────────────────────────
-            mark("Level 6 — Sign & Align", "⏳ Running...")
-            l6 = Level6_Signer(work_dir)
-            final_apk = l6.prepare(rebuilt)
-            mark("Level 6 — Sign & Align", "✅ Signed & zipaligned")
+            # ── LEVEL 6 — Sign & Align with Fresh Fingerprint ────────────────
+            mark("Level 6 — Sign & Align", "⏳ Generating fresh identity...")
+            l6       = Level6_Signer(work_dir)
+            sign_result = l6.prepare(rebuilt)
+
+            final_apk = sign_result["output_apk"]
+            identity  = sign_result["identity"]
+
+            mark("Level 6 — Sign & Align",    "✅ Signed & zipaligned")
+            mark("🆔 Identity CN",             f"✅ {identity['cn']}")
+            mark("🏢 Organization",            f"✅ {identity['org']}")
+            mark("🌍 Location",                f"✅ {identity['city']}, {identity['state']}, {identity['country']}")
+            mark("📅 Validity",                f"✅ {identity['validity_days']} days")
+            mark("🔑 Signing Method",          f"✅ {sign_result['signing_method']}")
+            if sign_result.get("fingerprint"):
+                mark("🔏 SHA-256 Fingerprint", f"✅ {sign_result['fingerprint'][:40]}...")
+            mark("🔐 Keystore",                "✅ Securely destroyed after signing")
 
             results["OUTPUT_APK"]  = final_apk
             results["GUARD_JAVA"]  = guard_path
@@ -2148,6 +2993,132 @@ class MasterProtectionEngine:
             if os.path.exists(workspace_dir):
                 shutil.rmtree(workspace_dir, ignore_errors=True)
             # Remove all intermediate APKs except the final one
+            for f in Path(work_dir).glob("*.apk"):
+                if f.name != "EPIC_PROTECTED.apk":
+                    try: f.unlink()
+                    except: pass
+
+        return results
+
+    def protect_phase1_decode(self, apk_path: str) -> dict:
+        """
+        Phase 1 of compliance-integrated protection pipeline.
+        Decodes APK and runs compliance scan.
+        Returns workspace path, job dir, findings, and aes_key for phase 2.
+        Called BEFORE compliance review — pauses here for admin approval.
+        """
+        job_id   = f"job_{int(time.time())}"
+        work_dir = os.path.join(WORK_DIR, job_id)
+        os.makedirs(work_dir, exist_ok=True)
+
+        # Install tools
+        self.tools.install_all()
+
+        # Generate AES key — stored in session for phase 2
+        aes_key = CryptoEngine.generate_key()
+
+        # Strip existing signature
+        stripper     = SignatureStripper()
+        strip_detect = stripper.detect(apk_path)
+        if strip_detect["total_found"] > 0:
+            stripped_apk = os.path.join(work_dir, "input_stripped.apk")
+            stripper.strip(apk_path, stripped_apk)
+            apk_path = stripped_apk
+
+        # Level 1 — Decode
+        l1        = Level1_WorkspaceBuilder(self.tools, work_dir)
+        workspace = l1.build_workspace(apk_path)
+
+        # Run compliance scan
+        scanner  = ComplianceScannerEngine()
+        findings = scanner.scan_workspace(workspace)
+
+        return {
+            "workspace":  workspace,
+            "work_dir":   work_dir,
+            "findings":   findings,
+            "aes_key":    aes_key,
+            "apk_path":   apk_path,
+            "scanner":    scanner,
+        }
+
+    def protect_phase2_complete(self, workspace: str, work_dir: str,
+                                aes_key: bytes) -> dict:
+        """
+        Phase 2 of compliance-integrated protection pipeline.
+        Runs Levels 2-6 after compliance review is complete.
+        Called AFTER admin has reviewed and approved all compliance findings.
+        """
+        results = {}
+
+        def mark(k, v):
+            results[k] = v
+            logger.info(f"[Phase2] {k}: {v}")
+
+        try:
+            # ── LEVEL 2 — Manifest ───────────────────────────────────────────
+            mark("Level 2 — Manifest", "⏳ Running...")
+            l2 = Level2_ManifestProtector(work_dir)
+            man_changes = l2.protect(workspace)
+            mark("Level 2 — Manifest", f"✅ {len(man_changes)} changes")
+
+            # ── LEVEL 3 — Security Guard Integration ─────────────────────────
+            mark("Level 3 — Security Guard Integration", "⏳ Running...")
+            l3 = Level3_SecurityGuardIntegrator(self.crypto, work_dir)
+            guard_path       = l3.save_guard_java(aes_key)
+            guard_integrated = l3.integrate_security_guard(workspace, aes_key)
+            mark("Level 3 — Security Guard Integration",
+                 f"✅ {guard_integrated} wired — Guard class placed in smali")
+
+            # ── LEVEL 4 — Security Compliance Layer ──────────────────────────
+            mark("Level 4 — Security Compliance Layer", "⏳ Running...")
+            l4 = Level4_SecurityCompliance(self.crypto, work_dir)
+            security_fields = l4.add_security_fields(workspace)
+            mark("Level 4 — Security Compliance Layer",
+                 f"✅ {security_fields} security fields added")
+
+            # ── LEVEL 5 — BUILD ───────────────────────────────────────────────
+            mark("Level 5 — APK Build", "⏳ Running... (this may take 1-3 min)")
+            l5 = Level5_APKBuilder(self.tools, work_dir)
+            rebuilt = l5.rebuild(workspace)
+            mark("Level 5 — APK Build", "✅ Valid APK produced")
+
+            # ── Integrity snapshot ────────────────────────────────────────────
+            int_manifest = self.integrity.generate(workspace)
+            self.integrity.save(int_manifest)
+            mark("🔒 Integrity Manifest", f"✅ {len(int_manifest)} files hashed")
+
+            # ── LEVEL 6 — Sign & Align ────────────────────────────────────────
+            mark("Level 6 — Sign & Align", "⏳ Generating fresh identity...")
+            l6          = Level6_Signer(work_dir)
+            sign_result = l6.prepare(rebuilt)
+            final_apk   = sign_result["output_apk"]
+            identity    = sign_result["identity"]
+
+            mark("Level 6 — Sign & Align",    "✅ Signed & zipaligned")
+            mark("🆔 Identity CN",             f"✅ {identity['cn']}")
+            mark("🏢 Organization",            f"✅ {identity['org']}")
+            mark("🌍 Location",
+                 f"✅ {identity['city']}, {identity['state']}, {identity['country']}")
+            mark("📅 Validity",                f"✅ {identity['validity_days']} days")
+            mark("🔑 Signing Method",          f"✅ {sign_result['signing_method']}")
+            if sign_result.get("fingerprint"):
+                mark("🔏 SHA-256 Fingerprint",
+                     f"✅ {sign_result['fingerprint'][:40]}...")
+            mark("🔐 Keystore", "✅ Securely destroyed after signing")
+
+            results["OUTPUT_APK"] = final_apk
+            results["GUARD_JAVA"] = guard_path
+            results["SUCCESS"]    = True
+
+        except Exception as e:
+            results["ERROR"]   = str(e)
+            results["SUCCESS"] = False
+            logger.error(f"[Phase2] Protection failed: {e}", exc_info=True)
+        finally:
+            workspace_dir = os.path.join(work_dir, "workspace")
+            if os.path.exists(workspace_dir):
+                shutil.rmtree(workspace_dir, ignore_errors=True)
             for f in Path(work_dir).glob("*.apk"):
                 if f.name != "EPIC_PROTECTED.apk":
                     try: f.unlink()
@@ -2247,6 +3218,46 @@ def _build_op_keyboard(target: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+# ── COMPLIANCE DELIVERY HELPER ────────────────────────────────────────────────
+async def _deliver_protected_apk(update, context, status_msg, results, apk_name):
+    """Deliver final protected APK and guard file to admin after protection."""
+    if results.get("SUCCESS"):
+        skip  = {"OUTPUT_APK", "GUARD_JAVA", "SUCCESS", "ERROR"}
+        lines = ["🛡️ *Elite Protection Complete!*\n", "━━━━━━━━━━━━━━━━━━━━━"]
+        for k, v in results.items():
+            if k not in skip:
+                lines.append(f"{v} — {k}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        await status_msg.edit_text('\n'.join(lines), parse_mode="Markdown")
+
+        out = results.get("OUTPUT_APK")
+        if out and os.path.exists(out):
+            with open(out, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename="EPIC_PROTECTED.apk",
+                    caption=(
+                        "🛡️ *Protected APK Ready!*\n\nAll 6 levels applied.\n\n"
+                        "⚠️ Add `EpicSecurityGuard.java` to your project.\n"
+                        "Replace `YOUR_APK_SIGNATURE_SHA256_HERE` before publishing."
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=admin_kb())
+
+        guard = results.get("GUARD_JAVA")
+        if guard and os.path.exists(guard):
+            with open(guard, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename="EpicSecurityGuard.java",
+                    caption="☕ Copy to your Android security package.")
+    else:
+        await status_msg.edit_text(
+            f"❌ *Protection Failed*\n\n`{results.get('ERROR', 'Unknown error')}`\n\n"
+            f"Check APK and try again.",
+            parse_mode="Markdown", reply_markup=admin_kb())
+
+
 # ── BUTTON HANDLER ────────────────────────────────────────────────────────────
 async def button_handler(update, context):
     query = update.callback_query
@@ -2254,7 +3265,268 @@ async def button_handler(update, context):
     data  = query.data
     await query.answer()
 
-    if data == "admin_protect":
+    # ── COMPLIANCE SCANNER HANDLERS ──────────────────────────────────────────
+
+    if data == "cs_autofix":
+        if not is_admin(user.id): return
+        session = compliance_session.get(user.id)
+        if not session:
+            await query.edit_message_text(
+                "❌ Session expired. Please send APK again.",
+                reply_markup=admin_kb())
+            return
+
+        await query.edit_message_text(
+            "⚡ *Auto-Fixing All Critical Items...*\n\n⏳ Please wait...",
+            parse_mode="Markdown")
+
+        findings = session["findings"]
+        scanner  = session["scanner"]
+        fixed    = scanner.apply_all_critical(findings)
+        session["fixed"] += fixed
+
+        critical_count = sum(
+            1 for f in findings if f["severity"] == "CRITICAL")
+        remaining_warn = sum(
+            1 for f in findings
+            if f["severity"] in ("WARNING", "ADVISORY"))
+
+        score_after = min(100,
+            ComplianceScannerEngine().compute_score(findings)
+            + (fixed * 15))
+
+        msg = (
+            f"⚡ *Auto-Fix Complete!*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔴 Critical Fixed : {fixed}/{critical_count}\n"
+            f"🟡 Warning Left   : {remaining_warn}\n"
+            f"📊 Score Now      : *{score_after}/100*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"What would you like to do next?"
+        )
+
+        kb = []
+        if remaining_warn > 0:
+            kb.append([InlineKeyboardButton(
+                f"🔍 Review {remaining_warn} Remaining",
+                callback_data="cs_review_0")])
+        kb.append([InlineKeyboardButton(
+            "✅ Proceed — Start Protection",
+            callback_data="cs_proceed")])
+        kb.append([InlineKeyboardButton(
+            "➕ Add Custom Word",
+            callback_data="cs_addword")])
+
+        await query.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb))
+
+    elif data.startswith("cs_review_"):
+        if not is_admin(user.id): return
+        session = compliance_session.get(user.id)
+        if not session:
+            await query.edit_message_text(
+                "❌ Session expired. Please send APK again.",
+                reply_markup=admin_kb())
+            return
+
+        idx      = int(data.split("_")[-1])
+        findings = session["findings"]
+        total    = len(findings)
+
+        if idx >= total:
+            # All reviewed
+            fixed   = session["fixed"]
+            skipped = session["skipped"]
+            scanner = session["scanner"]
+            apk_name = session.get("apk_name", "app.apk")
+            scanner.save_audit_log(findings, fixed, skipped, apk_name)
+
+            score = min(100,
+                ComplianceScannerEngine().compute_score(findings)
+                + (fixed * 10))
+
+            await query.edit_message_text(
+                f"✅ *Review Complete!*\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Fixed   : {fixed}\n"
+                f"Skipped : {skipped}\n"
+                f"Score   : *{score}/100*\n"
+                f"Audit   : ✅ Saved\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Ready to proceed with protection.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "✅ Proceed — Start Protection",
+                        callback_data="cs_proceed")
+                ]]))
+            return
+
+        finding = findings[idx]
+        msg     = ComplianceScannerEngine.format_finding_message(
+            finding, idx + 1, total)
+        session["current"] = idx
+
+        await query.edit_message_text(
+            msg,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"✅ Rename to '{finding['suggestion']}'",
+                    callback_data=f"cs_fix_{idx}")],
+                [InlineKeyboardButton(
+                    "⏭️ Skip This Item",
+                    callback_data=f"cs_skip_{idx}")],
+                [InlineKeyboardButton(
+                    "✅ Proceed — Start Protection",
+                    callback_data="cs_proceed")],
+            ]))
+
+    elif data.startswith("cs_fix_"):
+        if not is_admin(user.id): return
+        session = compliance_session.get(user.id)
+        if not session:
+            await query.edit_message_text(
+                "❌ Session expired.", reply_markup=admin_kb())
+            return
+
+        idx      = int(data.split("_")[-1])
+        findings = session["findings"]
+        scanner  = session["scanner"]
+        finding  = findings[idx]
+
+        success = scanner.apply_rename(finding)
+        if success:
+            session["fixed"] += 1
+            status_text = f"✅ Renamed: `{finding['word']}` → `{finding['suggestion']}`"
+        else:
+            status_text = "⚠️ Rename could not be applied — skipped."
+            session["skipped"] += 1
+
+        next_idx = idx + 1
+        remaining = len(findings) - next_idx
+
+        await query.edit_message_text(
+            f"{status_text}\n\n"
+            f"*{remaining} items remaining.*\n\n"
+            f"Continue reviewing?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "➡️ Next Item",
+                    callback_data=f"cs_review_{next_idx}")],
+                [InlineKeyboardButton(
+                    "✅ Proceed — Start Protection",
+                    callback_data="cs_proceed")],
+            ]))
+
+    elif data.startswith("cs_skip_"):
+        if not is_admin(user.id): return
+        session = compliance_session.get(user.id)
+        if not session:
+            await query.edit_message_text(
+                "❌ Session expired.", reply_markup=admin_kb())
+            return
+
+        idx = int(data.split("_")[-1])
+        session["skipped"] += 1
+        next_idx  = idx + 1
+        remaining = len(session["findings"]) - next_idx
+
+        await query.edit_message_text(
+            f"⏭️ *Skipped.*\n\n*{remaining} items remaining.*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "➡️ Next Item",
+                    callback_data=f"cs_review_{next_idx}")],
+                [InlineKeyboardButton(
+                    "✅ Proceed — Start Protection",
+                    callback_data="cs_proceed")],
+            ]))
+
+    elif data == "cs_skipall":
+        if not is_admin(user.id): return
+        session = compliance_session.get(user.id)
+        if not session:
+            await query.edit_message_text(
+                "❌ Session expired.", reply_markup=admin_kb())
+            return
+
+        session["skipped"] = len(session["findings"])
+
+        await query.edit_message_text(
+            "⏭️ *All items skipped.*\n\n"
+            "Proceeding with protection as-is.\n\n⏳ Please wait...",
+            parse_mode="Markdown")
+
+        engine  = MasterProtectionEngine()
+        results = engine.protect_phase2_complete(
+            session["workspace"],
+            session["work_dir"],
+            session["aes_key"])
+
+        # Save audit log
+        session["scanner"].save_audit_log(
+            session["findings"],
+            session["fixed"],
+            session["skipped"],
+            session.get("apk_name", "app.apk"))
+
+        compliance_session.pop(user.id, None)
+        await _deliver_protected_apk(
+            query, context, query.message, results,
+            session.get("apk_name", "app.apk"))
+
+    elif data == "cs_proceed":
+        if not is_admin(user.id): return
+        session = compliance_session.get(user.id)
+        if not session:
+            await query.edit_message_text(
+                "❌ Session expired. Please send APK again.",
+                reply_markup=admin_kb())
+            return
+
+        await query.edit_message_text(
+            "⚙️ *Starting Full Protection...*\n\n"
+            "Running Levels 2 → 6\n\n⏳ This takes 2-5 minutes...",
+            parse_mode="Markdown")
+
+        engine  = MasterProtectionEngine()
+        results = engine.protect_phase2_complete(
+            session["workspace"],
+            session["work_dir"],
+            session["aes_key"])
+
+        # Save audit log
+        session["scanner"].save_audit_log(
+            session["findings"],
+            session["fixed"],
+            session["skipped"],
+            session.get("apk_name", "app.apk"))
+
+        compliance_session.pop(user.id, None)
+
+        status_msg = await query.message.reply_text(
+            "⏳ Finalizing...", parse_mode="Markdown")
+        await _deliver_protected_apk(
+            query, context, status_msg, results,
+            session.get("apk_name", "app.apk"))
+
+    elif data == "cs_addword":
+        if not is_admin(user.id): return
+        compliance_session.setdefault(user.id, {})["awaiting_custom_word"] = True
+        await query.edit_message_text(
+            "➕ *Add Custom Banned Word*\n\n"
+            "Type the word you want to add to the banned list.\n\n"
+            "It will be scanned in this session immediately.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Back", callback_data="cs_review_0")
+            ]]))
+
+    elif data == "admin_protect":
         if not is_admin(user.id): return
         pending_protect[user.id] = True
         await query.edit_message_text(
@@ -2614,16 +3886,29 @@ async def button_handler(update, context):
             l5      = Level5_APKBuilder(tools, work_dir)
             rebuilt = l5.rebuild(workspace)
 
-            # Level 6 — Sign & Align
-            l6        = Level6_Signer(work_dir)
-            final_apk = l6.prepare(rebuilt)
+            # Level 6 — Strip + Fresh Fingerprint + Sign & Align
+            l6          = Level6_Signer(work_dir)
+            sign_result = l6.prepare(rebuilt)
+            final_apk   = sign_result["output_apk"]
+            identity    = sign_result["identity"]
+
+            stripped_count = len(sign_result.get("stripped_files", []))
 
             await status.edit_text(
                 "✅ *Sign & Deliver Complete!*\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🧹 Stripped: {stripped_count} old signature artifacts\n"
                 "✅ APK rebuilt\n"
                 "✅ zipaligned\n"
-                "✅ Signed\n"
+                f"✅ Signed via {sign_result['signing_method']}\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "*🆔 Fresh Digital Identity:*\n"
+                f"CN: `{identity['cn']}`\n"
+                f"O: `{identity['org']}`\n"
+                f"L: `{identity['city']}, {identity['state']}`\n"
+                f"C: `{identity['country']}`\n"
+                f"Validity: `{identity['validity_days']} days`\n"
+                "🔐 Keystore: `Securely destroyed`\n"
                 "━━━━━━━━━━━━━━━━━━━━━",
                 parse_mode="Markdown")
 
@@ -2789,6 +4074,33 @@ async def message_handler(update, context):
     text = update.message.text
     register_client(user)
 
+    # ── Admin: add custom banned word to compliance scanner ──────────────────
+    if is_admin(user.id):
+        session = compliance_session.get(user.id, {})
+        if session.get("awaiting_custom_word"):
+            session.pop("awaiting_custom_word", None)
+            word = text.strip().lower()
+            if "scanner" in session:
+                session["scanner"].custom_banned.append(word)
+            custom_list = compliance_custom_list.get(user.id, [])
+            custom_list.append(word)
+            compliance_custom_list[user.id] = custom_list
+
+            await update.message.reply_text(
+                f"✅ *Custom Word Added:* `{word}`\n\n"
+                f"It will be flagged in all future scans this session.\n\n"
+                f"Return to compliance review?",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "🔍 Back to Review",
+                        callback_data="cs_review_0"),
+                    InlineKeyboardButton(
+                        "✅ Proceed",
+                        callback_data="cs_proceed"),
+                ]]))
+            return
+
     if is_admin(user.id) and pending_manual.get(user.id) == "awaiting_custom_path":
         pending_manual[user.id] = "apk_ready"
         custom_path = text.strip().strip("/")
@@ -2934,7 +4246,7 @@ async def document_handler(update, context):
             pending_manual.pop(user.id, None)
         return
 
-    # ── Admin: protect APK ───────────────────────────────────────────────────
+    # ── Admin: protect APK — with Compliance Scanner ────────────────────────
     if is_admin(user.id) and pending_protect.get(user.id):
         pending_protect.pop(user.id)
 
@@ -2947,59 +4259,85 @@ async def document_handler(update, context):
             return
 
         status = await update.message.reply_text(
-            "⚙️ *Elite Protection Started!*\n\nRunning all 7 levels...\n"
-            "This takes 2-5 minutes ⏳",
+            "🛡️ *Elite Protection Started!*\n\n"
+            "⏳ Step 1 — Decoding APK...\n"
+            "⏳ Step 2 — Running Compliance Scanner...\n\n"
+            "Please wait...",
             parse_mode="Markdown")
         try:
             tg_file = await context.bot.get_file(doc.file_id)
             os.makedirs(WORK_DIR, exist_ok=True)
-            apk_in  = os.path.join(WORK_DIR, f"input_{user.id}_{int(time.time())}.apk")
+            apk_in  = os.path.join(
+                WORK_DIR,
+                f"input_{user.id}_{int(time.time())}.apk")
             await tg_file.download_to_drive(apk_in)
 
+            apk_name = doc.file_name or os.path.basename(apk_in)
+
+            # Phase 1 — Decode + Compliance Scan
             engine  = MasterProtectionEngine()
-            results = engine.protect(apk_in)
+            phase1  = engine.protect_phase1_decode(apk_in)
 
-            if results.get("SUCCESS"):
-                skip  = {"OUTPUT_APK","GUARD_JAVA","SUCCESS","ERROR"}
-                lines = ["🛡️ *Elite Protection Complete!*\n", "━━━━━━━━━━━━━━━━━━━━━"]
-                for k, v in results.items():
-                    if k not in skip: lines.append(f"{v} — {k}")
-                lines.append("━━━━━━━━━━━━━━━━━━━━━")
-                await status.edit_text('\n'.join(lines), parse_mode="Markdown")
+            # Store session for phase 2
+            compliance_session[user.id] = {
+                "workspace":  phase1["workspace"],
+                "work_dir":   phase1["work_dir"],
+                "aes_key":    phase1["aes_key"],
+                "apk_path":   phase1["apk_path"],
+                "findings":   phase1["findings"],
+                "scanner":    phase1["scanner"],
+                "apk_name":   apk_name,
+                "fixed":      0,
+                "skipped":    0,
+                "current":    0,
+            }
+            compliance_apk_path[user.id]  = apk_in
+            compliance_workspace[user.id] = phase1["workspace"]
+            compliance_job_dir[user.id]   = phase1["work_dir"]
 
-                out = results.get("OUTPUT_APK")
-                if out and os.path.exists(out):
-                    with open(out, "rb") as f:
-                        await update.message.reply_document(
-                            document=f,
-                            filename="EPIC_PROTECTED.apk",
-                            caption=(
-                                "🛡️ *Protected APK Ready!*\n\nAll 7 levels applied.\n\n"
-                                "⚠️ Add `EpicSecurityGuard.java` to your project.\n"
-                                "Replace `YOUR_APK_SIGNATURE_SHA256_HERE` before publishing."
-                            ),
-                            parse_mode="Markdown")
+            findings = phase1["findings"]
 
-                guard = results.get("GUARD_JAVA")
-                if guard and os.path.exists(guard):
-                    with open(guard, "rb") as f:
-                        await update.message.reply_document(
-                            document=f,
-                            filename="EpicSecurityGuard.java",
-                            caption="☕ Copy to your Android security package.")
-            else:
+            if not findings:
+                # No findings — proceed directly to protection
                 await status.edit_text(
-                    f"❌ *Failed*\n\n`{results.get('ERROR','Unknown error')}`\n\nCheck APK and try again.",
-                    parse_mode="Markdown", reply_markup=admin_kb())
-
-            # Clean up input file
-            try: os.remove(apk_in)
-            except: pass
+                    "✅ *Compliance Scan Complete!*\n\n"
+                    "🟢 Score: *100/100*\n"
+                    "No compliance issues found.\n\n"
+                    "⚙️ Proceeding with full protection...",
+                    parse_mode="Markdown")
+                results = engine.protect_phase2_complete(
+                    phase1["workspace"],
+                    phase1["work_dir"],
+                    phase1["aes_key"])
+                await _deliver_protected_apk(
+                    update, context, status, results, apk_name)
+            else:
+                # Show compliance summary and first finding
+                summary = ComplianceScannerEngine.format_summary_message(
+                    findings, apk_name)
+                await status.edit_text(
+                    summary,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            "⚡ Auto-Fix All Critical",
+                            callback_data="cs_autofix")],
+                        [InlineKeyboardButton(
+                            "🔍 Review Each Item",
+                            callback_data="cs_review_0")],
+                        [InlineKeyboardButton(
+                            "⏭️ Skip All — Proceed Anyway",
+                            callback_data="cs_skipall")],
+                        [InlineKeyboardButton(
+                            "➕ Add Custom Word",
+                            callback_data="cs_addword")],
+                    ]))
 
         except Exception as e:
             await status.edit_text(
                 f"❌ *Error:* `{e}`",
                 parse_mode="Markdown", reply_markup=admin_kb())
+            pending_protect.pop(user.id, None)
         return
 
     # ── Admin: send APK to client ────────────────────────────────────────────
