@@ -123,6 +123,8 @@ pending_manual    = {}   # tracks admin in manual control panel mode
 manual_apk_path   = {}   # stores uploaded APK path for manual mode
 manual_target     = {}   # stores selected folder target
 manual_operation  = {}   # stores selected operation
+manual_workspace  = {}   # stores decoded workspace path for advisory scan
+manual_scan_result= {}   # stores last scan result for detail view
 
 
 # ── TOOL INSTALLER ───────────────────────────────────────────────────────────
@@ -1514,12 +1516,262 @@ class ManualControlEngine:
         "Custom":    ["Obfuscate", "Encrypt", "Rename", "Compress", "Integrity Verification"],
     }
 
+    # ── Third party prefixes — excluded from advisory scan ───────────────────
+    THIRD_PARTY_PREFIXES = (
+        "com/google/", "com/facebook/", "com/android/",
+        "androidx/", "kotlin/", "kotlinx/", "org/apache/",
+        "org/jetbrains/", "com/squareup/", "io/reactivex/",
+        "com/bumptech/", "okhttp3/", "retrofit2/",
+    )
+
+    # ── Name patterns that indicate high value files ──────────────────────────
+    HIGH_VALUE_NAME_PATTERNS = (
+        "mainactivity", "loginactivity", "splashactivity",
+        "manager", "controller", "handler", "dispatcher",
+        "api", "network", "http", "rest", "retrofit", "client",
+        "auth", "token", "key", "secret", "credential", "password",
+        "database", "db", "dao", "repository", "room",
+        "payment", "billing", "license", "register",
+    )
+
+    MEDIUM_VALUE_NAME_PATTERNS = (
+        "utils", "helper", "common", "base", "core",
+        "service", "receiver", "provider", "fragment",
+        "adapter", "viewmodel", "presenter",
+    )
+
+    LOW_VALUE_NAME_PATTERNS = (
+        "r$", "br$", "buildconfig", "databinding",
+        "generated", "auto_", "_generated",
+    )
+
+    # ── Content signatures that indicate high value ───────────────────────────
+    HIGH_VALUE_CONTENT_SIGNATURES = (
+        b"https://", b"http://",
+        b"password", b"passwd", b"secret",
+        b"Bearer", b"Authorization",
+        b"AES", b"RSA", b"SHA-256",
+        b"SELECT ", b"INSERT ", b"UPDATE ", b"DELETE ",
+        b"api_key", b"apikey", b"private_key",
+    )
+
+    MEDIUM_VALUE_CONTENT_SIGNATURES = (
+        b"const-string",
+        b"SharedPreferences",
+        b"getSystemService",
+    )
+
     def __init__(self, crypto, work_dir):
         self.crypto   = crypto
         self.work_dir = work_dir
 
     def _rname(self, n=6):
         return ''.join(random.choices(string.ascii_lowercase, k=n))
+
+    def _is_third_party(self, rel_path: str) -> bool:
+        """Return True if file belongs to a third party library."""
+        p = rel_path.replace("\\", "/").lower()
+        return any(p.startswith(prefix.lower()) for prefix in self.THIRD_PARTY_PREFIXES)
+
+    def _score_by_name(self, filename: str) -> str:
+        """Return HIGH / MEDIUM / LOW based on filename pattern."""
+        name = filename.lower().replace(".smali", "").replace(".java", "")
+        for pat in self.LOW_VALUE_NAME_PATTERNS:
+            if pat in name:
+                return "LOW"
+        for pat in self.HIGH_VALUE_NAME_PATTERNS:
+            if pat in name:
+                return "HIGH"
+        for pat in self.MEDIUM_VALUE_NAME_PATTERNS:
+            if pat in name:
+                return "MEDIUM"
+        return "LOW"
+
+    def _score_by_content(self, filepath: str) -> str:
+        """
+        Read up to 8KB of file content and scan for
+        sensitive signatures. Returns HIGH / MEDIUM / LOW.
+        """
+        try:
+            with open(filepath, 'rb') as f:
+                chunk = f.read(8192)
+            for sig in self.HIGH_VALUE_CONTENT_SIGNATURES:
+                if sig.lower() in chunk.lower():
+                    return "HIGH"
+            for sig in self.MEDIUM_VALUE_CONTENT_SIGNATURES:
+                if sig in chunk:
+                    return "MEDIUM"
+        except Exception:
+            pass
+        return "LOW"
+
+    def _score_asset(self, filepath: str) -> str:
+        """Score assets/ and lib/ files by extension and name."""
+        name = os.path.basename(filepath).lower()
+        ext  = os.path.splitext(name)[1]
+        if ext in ('.so',):
+            return "HIGH"
+        if ext in ('.json', '.db', '.sqlite', '.key',
+                   '.conf', '.config', '.pem', '.p12', '.keystore'):
+            return "HIGH"
+        if ext in ('.xml', '.properties', '.txt'):
+            return "MEDIUM"
+        return "LOW"
+
+    def run_fast_scan(self, workspace_dir, target) -> dict:
+        """
+        Layer 1 — Fast name-based scan.
+        Scans file and folder names only — no file reads.
+        Returns counts and top file lists per value level.
+        Excludes third party libraries automatically.
+        """
+        target_path = os.path.join(workspace_dir, target)
+        if not os.path.exists(target_path):
+            return {"error": f"Target folder not found: {target}"}
+
+        high   = []
+        medium = []
+        low    = []
+
+        for fp in Path(target_path).rglob("*"):
+            if not fp.is_file():
+                continue
+            try:
+                rel = str(fp.relative_to(target_path))
+            except Exception:
+                continue
+
+            # Skip third party
+            if self._is_third_party(rel):
+                continue
+
+            name = fp.name
+
+            # Score by folder type
+            if target.startswith("smali") or target.startswith("com/"):
+                score = self._score_by_name(name)
+            elif target.startswith("assets") or target.startswith("lib"):
+                score = self._score_asset(str(fp))
+            elif target.startswith("res"):
+                score = "MEDIUM" if "raw" in rel or "values" in rel else "LOW"
+            elif target.startswith("META-INF"):
+                score = "MEDIUM"
+            else:
+                score = self._score_by_name(name)
+
+            if score == "HIGH":
+                high.append(rel)
+            elif score == "MEDIUM":
+                medium.append(rel)
+            else:
+                low.append(rel)
+
+        return {
+            "high":   high,
+            "medium": medium,
+            "low":    low,
+            "scan_type": "fast",
+        }
+
+    def run_deep_scan(self, workspace_dir, target) -> dict:
+        """
+        Layer 1 + Layer 2 — Deep name + content scan.
+        Reads up to 8KB of each file to detect sensitive signatures.
+        Excludes third party libraries automatically.
+        """
+        target_path = os.path.join(workspace_dir, target)
+        if not os.path.exists(target_path):
+            return {"error": f"Target folder not found: {target}"}
+
+        high   = []
+        medium = []
+        low    = []
+
+        for fp in Path(target_path).rglob("*"):
+            if not fp.is_file():
+                continue
+            try:
+                rel = str(fp.relative_to(target_path))
+            except Exception:
+                continue
+
+            # Skip third party
+            if self._is_third_party(rel):
+                continue
+
+            name = fp.name
+
+            # Name score first
+            if target.startswith("assets") or target.startswith("lib"):
+                name_score = self._score_asset(str(fp))
+            else:
+                name_score = self._score_by_name(name)
+
+            # Content score — upgrades name score if higher
+            content_score = self._score_by_content(str(fp))
+
+            score_rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+            final_score = (
+                "HIGH"   if max(score_rank[name_score], score_rank[content_score]) == 3
+                else "MEDIUM" if max(score_rank[name_score], score_rank[content_score]) == 2
+                else "LOW"
+            )
+
+            if final_score == "HIGH":
+                high.append(rel)
+            elif final_score == "MEDIUM":
+                medium.append(rel)
+            else:
+                low.append(rel)
+
+        return {
+            "high":   high,
+            "medium": medium,
+            "low":    low,
+            "scan_type": "deep",
+        }
+
+    def build_advisory_report(self, scan_result: dict, target: str) -> str:
+        """
+        Build formatted advisory report text from scan results.
+        Shows summary counts first, then top 5 files per level.
+        """
+        if "error" in scan_result:
+            return f"❌ Scan failed: {scan_result['error']}"
+
+        high   = scan_result.get("high",   [])
+        medium = scan_result.get("medium", [])
+        low    = scan_result.get("low",    [])
+        stype  = scan_result.get("scan_type", "fast")
+
+        scan_label = "🔍 Deep Scan" if stype == "deep" else "⚡ Fast Scan"
+
+        lines = [
+            f"🧠 *Intelligence Report — {scan_label}*\n",
+            f"📂 Target: `{target}`",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            f"🔴 *High Value: {len(high)} files* → Obfuscate recommended",
+            f"🟡 *Medium Value: {len(medium)} files* → Encrypt recommended",
+            f"🟢 *Low Value: {len(low)} files* → Safe to skip",
+            "━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        if high:
+            lines.append("🔴 *Top High Value Files:*")
+            for f in high[:5]:
+                lines.append(f"  • `{os.path.basename(f)}`")
+            if len(high) > 5:
+                lines.append(f"  _...and {len(high)-5} more_")
+
+        if medium:
+            lines.append("🟡 *Top Medium Value Files:*")
+            for f in medium[:5]:
+                lines.append(f"  • `{os.path.basename(f)}`")
+            if len(medium) > 5:
+                lines.append(f"  _...and {len(medium)-5} more_")
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        return '\n'.join(lines)
 
     def obfuscate_target(self, workspace_dir, target) -> dict:
         """
@@ -1631,8 +1883,17 @@ class ManualControlEngine:
 
     def rename_target(self, workspace_dir, target) -> dict:
         """
-        Rename all files inside the target folder to
-        randomized professional names while preserving extensions.
+        Rename files inside the target folder to randomized
+        professional names while preserving extensions.
+
+        Protected files that are NEVER renamed:
+          - AndroidManifest.xml  — apktool requires exact name
+          - classes*.dex         — DEX loader requires exact name
+          - *.xml inside res/    — resource compiler maps files by
+                                   name from resources.arsc; renaming
+                                   them causes apktool rebuild to fail
+                                   with 'invalid file path' errors
+          - *.xml inside values* — value XML files referenced by name
         """
         target_path = os.path.join(workspace_dir, target)
         if not os.path.exists(target_path):
@@ -1641,14 +1902,40 @@ class ManualControlEngine:
         files_renamed = 0
         files_skipped = 0
 
+        # Detect if target is res/ or a subfolder of res/
+        # XML files inside any res/ path must never be renamed
+        is_res_target = (
+            target.startswith("res") or
+            "res/" in target or
+            target == "res"
+        )
+
         for fp in Path(target_path).rglob("*"):
             if not fp.is_file():
                 continue
-            # Skip AndroidManifest and classes.dex — renaming breaks the APK
+
+            # Always skip — critical APK structure files
             if fp.name in ('AndroidManifest.xml', 'classes.dex',
                            'classes2.dex', 'classes3.dex'):
                 files_skipped += 1
                 continue
+
+            # Skip all XML files inside res/ — resource compiler
+            # requires original names to match resources.arsc references
+            if is_res_target and fp.suffix == '.xml':
+                files_skipped += 1
+                continue
+
+            # Skip XML files anywhere inside a res/ subfolder
+            try:
+                rel = fp.relative_to(target_path)
+                parts = rel.parts
+                if parts and parts[0].startswith('res') and fp.suffix == '.xml':
+                    files_skipped += 1
+                    continue
+            except Exception:
+                pass
+
             try:
                 new_name = self._rname(10) + fp.suffix
                 new_path = fp.parent / new_name
@@ -1937,6 +2224,29 @@ async def start(update, context):
             parse_mode="Markdown", reply_markup=client_kb())
 
 
+# ── HELPER — Build operation keyboard for a given target folder ───────────────
+def _build_op_keyboard(target: str) -> InlineKeyboardMarkup:
+    allowed_ops = ManualControlEngine.FOLDER_OPERATIONS.get(target, [])
+    op_map = {
+        "Obfuscate":              "🔀 Obfuscate",
+        "Encrypt":                "🔐 Encrypt",
+        "Rename":                 "✏️ Rename",
+        "Compress":               "🗜️ Compress",
+        "Integrity Verification": "🔍 Integrity Verify",
+    }
+    rows = []
+    row  = []
+    for op in allowed_ops:
+        row.append(InlineKeyboardButton(op_map.get(op, op), callback_data=f"mo_{op}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="manual_select_target")])
+    return InlineKeyboardMarkup(rows)
+
+
 # ── BUTTON HANDLER ────────────────────────────────────────────────────────────
 async def button_handler(update, context):
     query = update.callback_query
@@ -2009,31 +2319,192 @@ async def button_handler(update, context):
         if not is_admin(user.id): return
         target = data[3:]
         manual_target[user.id] = target
-        allowed_ops = ManualControlEngine.FOLDER_OPERATIONS.get(target, [])
-        op_buttons  = []
-        op_map = {
-            "Obfuscate":             "🔀 Obfuscate",
-            "Encrypt":               "🔐 Encrypt",
-            "Rename":                "✏️ Rename",
-            "Compress":              "🗜️ Compress",
-            "Integrity Verification":"🔍 Integrity Verify",
-        }
-        row = []
-        for op in allowed_ops:
-            row.append(InlineKeyboardButton(op_map.get(op, op), callback_data=f"mo_{op}"))
-            if len(row) == 2:
-                op_buttons.append(row)
+
+        # Check if we have a decoded workspace ready for scanning
+        workspace = manual_workspace.get(user.id)
+
+        if workspace and os.path.exists(workspace):
+            # Workspace ready — run fast scan and show advisory panel
+            status = await query.edit_message_text(
+                f"🧠 *Scanning* `{target}`*...*\n\n⚡ Running fast scan...",
+                parse_mode="Markdown")
+            try:
+                engine      = ManualControlEngine(CryptoEngine(), WORK_DIR)
+                scan_result = engine.run_fast_scan(workspace, target)
+                manual_scan_result[user.id] = scan_result
+
+                report_text = engine.build_advisory_report(scan_result, target)
+
+                # Build recommended action buttons based on findings
+                high_count   = len(scan_result.get("high",   []))
+                medium_count = len(scan_result.get("medium", []))
+
+                action_buttons = []
+                if high_count > 0:
+                    action_buttons.append(
+                        InlineKeyboardButton(
+                            f"🔀 Obfuscate High ({high_count})",
+                            callback_data="mo_Obfuscate"))
+                if medium_count > 0 and target not in ("res/", "META-INF/"):
+                    action_buttons.append(
+                        InlineKeyboardButton(
+                            f"🔐 Encrypt Medium ({medium_count})",
+                            callback_data="mo_Encrypt"))
+
+                kb_rows = []
+                if action_buttons:
+                    kb_rows.append(action_buttons)
+
+                # All available operations for this folder
+                allowed_ops = ManualControlEngine.FOLDER_OPERATIONS.get(target, [])
+                op_map = {
+                    "Obfuscate":              "🔀 Obfuscate",
+                    "Encrypt":                "🔐 Encrypt",
+                    "Rename":                 "✏️ Rename",
+                    "Compress":               "🗜️ Compress",
+                    "Integrity Verification": "🔍 Integrity Verify",
+                }
                 row = []
-        if row:
-            op_buttons.append(row)
-        op_buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="manual_select_target")])
+                for op in allowed_ops:
+                    row.append(InlineKeyboardButton(
+                        op_map.get(op, op), callback_data=f"mo_{op}"))
+                    if len(row) == 2:
+                        kb_rows.append(row)
+                        row = []
+                if row:
+                    kb_rows.append(row)
+
+                kb_rows.append([
+                    InlineKeyboardButton(
+                        "🔍 Deep Scan", callback_data=f"advisory_deep_{target}"),
+                    InlineKeyboardButton(
+                        "📋 Show All Files", callback_data="advisory_details"),
+                ])
+                kb_rows.append([
+                    InlineKeyboardButton("⬅️ Back", callback_data="manual_select_target")
+                ])
+
+                await status.edit_text(
+                    report_text,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(kb_rows))
+
+            except Exception as e:
+                # Scan failed — fall back to operation panel
+                await status.edit_text(
+                    f"🎛️ *Manual Control Panel*\n\n"
+                    f"📂 Selected: `{target}`\n\n"
+                    f"SELECT OPERATION:\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━",
+                    parse_mode="Markdown",
+                    reply_markup=_build_op_keyboard(target))
+        else:
+            # No workspace yet — show operations directly
+            await query.edit_message_text(
+                f"🎛️ *Manual Control Panel*\n\n"
+                f"📂 Selected: `{target}`\n\n"
+                f"SELECT OPERATION:\n"
+                f"━━━━━━━━━━━━━━━━━━━━━",
+                parse_mode="Markdown",
+                reply_markup=_build_op_keyboard(target))
+
+    elif data.startswith("advisory_deep_"):
+        if not is_admin(user.id): return
+        target    = data[len("advisory_deep_"):]
+        workspace = manual_workspace.get(user.id)
+        if not workspace or not os.path.exists(workspace):
+            await query.edit_message_text(
+                "❌ Workspace not available. Please re-send APK.",
+                reply_markup=back_a())
+            return
+        status = await query.edit_message_text(
+            f"🧠 *Deep Scanning* `{target}`*...*\n\n"
+            f"🔍 Reading file contents — this takes a few seconds...",
+            parse_mode="Markdown")
+        try:
+            engine      = ManualControlEngine(CryptoEngine(), WORK_DIR)
+            scan_result = engine.run_deep_scan(workspace, target)
+            manual_scan_result[user.id] = scan_result
+
+            report_text = engine.build_advisory_report(scan_result, target)
+
+            high_count   = len(scan_result.get("high",   []))
+            medium_count = len(scan_result.get("medium", []))
+
+            allowed_ops = ManualControlEngine.FOLDER_OPERATIONS.get(target, [])
+            op_map = {
+                "Obfuscate":              "🔀 Obfuscate",
+                "Encrypt":                "🔐 Encrypt",
+                "Rename":                 "✏️ Rename",
+                "Compress":               "🗜️ Compress",
+                "Integrity Verification": "🔍 Integrity Verify",
+            }
+            kb_rows = []
+            if high_count > 0:
+                kb_rows.append([InlineKeyboardButton(
+                    f"🔀 Obfuscate High ({high_count})",
+                    callback_data="mo_Obfuscate")])
+            if medium_count > 0 and target not in ("res/", "META-INF/"):
+                kb_rows.append([InlineKeyboardButton(
+                    f"🔐 Encrypt Medium ({medium_count})",
+                    callback_data="mo_Encrypt")])
+
+            row = []
+            for op in allowed_ops:
+                row.append(InlineKeyboardButton(
+                    op_map.get(op, op), callback_data=f"mo_{op}"))
+                if len(row) == 2:
+                    kb_rows.append(row)
+                    row = []
+            if row:
+                kb_rows.append(row)
+
+            kb_rows.append([
+                InlineKeyboardButton(
+                    "📋 Show All Files", callback_data="advisory_details"),
+                InlineKeyboardButton(
+                    "⬅️ Back", callback_data="manual_select_target"),
+            ])
+
+            await status.edit_text(
+                report_text,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb_rows))
+
+        except Exception as e:
+            await status.edit_text(
+                f"❌ *Deep Scan Failed:* `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    elif data == "advisory_details":
+        if not is_admin(user.id): return
+        scan_result = manual_scan_result.get(user.id, {})
+        target      = manual_target.get(user.id, "unknown")
+        high        = scan_result.get("high",   [])
+        medium      = scan_result.get("medium", [])
+
+        lines = [f"📋 *Full Advisory Details*\n\n📂 `{target}`\n"]
+        if high:
+            lines.append(f"🔴 *High Value — {len(high)} files:*")
+            for f in high[:20]:
+                lines.append(f"  • `{os.path.basename(f)}`")
+            if len(high) > 20:
+                lines.append(f"  _...and {len(high)-20} more_")
+        if medium:
+            lines.append(f"\n🟡 *Medium Value — {len(medium)} files:*")
+            for f in medium[:20]:
+                lines.append(f"  • `{os.path.basename(f)}`")
+            if len(medium) > 20:
+                lines.append(f"  _...and {len(medium)-20} more_")
+        if not high and not medium:
+            lines.append("🟢 No high or medium value files found.")
+
         await query.edit_message_text(
-            f"🎛️ *Manual Control Panel*\n\n"
-            f"📂 Selected: `{target}`\n\n"
-            f"SELECT OPERATION:\n"
-            f"━━━━━━━━━━━━━━━━━━━━━",
+            '\n'.join(lines),
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(op_buttons))
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Back", callback_data=f"mt_{target}")
+            ]]))
 
     elif data.startswith("mo_"):
         if not is_admin(user.id): return
@@ -2079,6 +2550,9 @@ async def button_handler(update, context):
             # Decode APK to workspace
             l1        = Level1_WorkspaceBuilder(tools, work_dir)
             workspace = l1.build_workspace(apk_path)
+
+            # Store workspace for advisory scan reuse
+            manual_workspace[user.id] = workspace
 
             # Run selected operation
             engine  = ManualControlEngine(CryptoEngine(), work_dir)
@@ -2167,6 +2641,8 @@ async def button_handler(update, context):
             manual_apk_path.pop(user.id, None)
             manual_target.pop(user.id, None)
             manual_operation.pop(user.id, None)
+            manual_workspace.pop(user.id, None)
+            manual_scan_result.pop(user.id, None)
             pending_manual.pop(user.id, None)
 
         except Exception as e:
@@ -2252,7 +2728,8 @@ async def button_handler(update, context):
 
     elif data == "back_admin":
         for d in [pending_protect, pending_broadcast, pending_reply,
-                  pending_send_apk, pending_manual, manual_target, manual_operation]:
+                  pending_send_apk, pending_manual, manual_target,
+                  manual_operation, manual_workspace, manual_scan_result]:
             d.pop(user.id, None)
         await query.edit_message_text(
             "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
@@ -2414,11 +2891,29 @@ async def document_handler(update, context):
             await tg_file.download_to_drive(apk_in)
             manual_apk_path[user.id] = apk_in
 
+            # Pre-decode APK workspace so advisory scan is
+            # available immediately when admin selects a folder
+            try:
+                tools_inst = ToolInstaller()
+                tools_inst.install_all()
+                job_id    = f"manual_{int(time.time())}"
+                work_dir  = os.path.join(WORK_DIR, job_id)
+                os.makedirs(work_dir, exist_ok=True)
+                l1        = Level1_WorkspaceBuilder(tools_inst, work_dir)
+                workspace = l1.build_workspace(apk_in)
+                manual_workspace[user.id] = workspace
+                ws_status = "✅ Workspace ready — Intelligence scan available"
+            except Exception as ws_err:
+                manual_workspace.pop(user.id, None)
+                ws_status = "⚠️ Workspace decode failed — scan unavailable"
+                logger.warning(f"[ManualControl] Pre-decode failed: {ws_err}")
+
             apk_name = doc.file_name or os.path.basename(apk_in)
             await status.edit_text(
                 f"🎛️ *Manual Control Panel*\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📁 Current APK: `{apk_name}`\n\n"
+                f"📁 APK: `{apk_name}`\n"
+                f"{ws_status}\n\n"
                 f"SELECT TARGET FOLDER:\n"
                 f"━━━━━━━━━━━━━━━━━━━━━",
                 parse_mode="Markdown",
