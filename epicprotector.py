@@ -2543,16 +2543,20 @@ async def button_handler(update, context):
             tools = ToolInstaller()
             tools.install_all()
 
-            job_id    = f"manual_{int(time.time())}"
-            work_dir  = os.path.join(WORK_DIR, job_id)
-            os.makedirs(work_dir, exist_ok=True)
+            # Reuse existing workspace from pre-decode if available
+            # Never decode again — avoids passing workspace path to apktool
+            workspace = manual_workspace.get(user.id)
 
-            # Decode APK to workspace
-            l1        = Level1_WorkspaceBuilder(tools, work_dir)
-            workspace = l1.build_workspace(apk_path)
-
-            # Store workspace for advisory scan reuse
-            manual_workspace[user.id] = workspace
+            if not workspace or not os.path.exists(workspace):
+                # Pre-decode was not available — decode now from original APK
+                job_id   = f"manual_{int(time.time())}"
+                work_dir = os.path.join(WORK_DIR, job_id)
+                os.makedirs(work_dir, exist_ok=True)
+                l1        = Level1_WorkspaceBuilder(tools, work_dir)
+                workspace = l1.build_workspace(apk_path)
+                manual_workspace[user.id] = workspace
+            else:
+                work_dir = os.path.dirname(workspace)
 
             # Run selected operation
             engine  = ManualControlEngine(CryptoEngine(), work_dir)
@@ -2573,9 +2577,6 @@ async def button_handler(update, context):
                 lines.append(f"✅ {k.replace('_', ' ').title()}: {v}")
             lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
-            # Store workspace for potential Sign & Deliver
-            manual_apk_path[user.id] = workspace
-
             await status.edit_text(
                 '\n'.join(lines),
                 parse_mode="Markdown",
@@ -2593,7 +2594,7 @@ async def button_handler(update, context):
 
     elif data == "manual_sign":
         if not is_admin(user.id): return
-        workspace = manual_apk_path.get(user.id)
+        workspace = manual_workspace.get(user.id)
         if not workspace or not os.path.exists(workspace):
             await query.edit_message_text(
                 "❌ Workspace not found. Please run an operation first.",
