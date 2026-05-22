@@ -83,12 +83,9 @@ jobs:
       # ── Step 5 — Install Python Dependencies ───────────────────
       - name: Install Python Dependencies
         run: |
-          echo "🐍 Installing Python dependencies..."
+          echo "🐍 Installing Python dependencies from requirements.txt..."
           pip install --upgrade pip --quiet
-          pip install \
-            python-telegram-bot==22.7 \
-            flask==3.1.0 \
-            --quiet
+          pip install -r requirements.txt --quiet
           echo "✅ Python dependencies installed."
           python3 -c "import telegram; print('✅ telegram-bot:', telegram.__version__)"
           python3 -c "import flask; print('✅ flask:', flask.__version__)"
