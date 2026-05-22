@@ -23,15 +23,23 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Dependencies
+      - name: Install System Tools
         run: |
-          pip install python-telegram-bot==20.7 flask
-          echo "✅ Dependencies installed"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq default-jdk zipalign apksigner wget unzip
+          echo "✅ System tools installed"
+
+      - name: Install Python Dependencies
+        run: |
+          pip install python-telegram-bot==22.7 flask==3.1.0
+          echo "✅ Python dependencies installed"
 
       - name: Run Epic Protector
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          KS_PASS: ${{ secrets.KS_PASS }}
+          KS_KEY: ${{ secrets.KS_KEY }}
         run: |
           python3 epicprotector.py 2>&1 | tee bot_log.txt
 
