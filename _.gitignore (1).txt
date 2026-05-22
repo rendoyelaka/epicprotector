@@ -1,0 +1,20 @@
+# EPIC PROTECTOR — Git Ignore
+
+# ⚠️ NEVER commit these — keep them private
+obfuscation_map.json
+obf_dict.txt
+integrity_manifest.json
+resource_manifest.json
+*_PROTECTED/
+apk_extracted/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# OS
+.DS_Store
+Thumbs.db
