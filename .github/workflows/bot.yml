@@ -1,4 +1,24 @@
-name: EPIC PROTECTOR — Bot 24/7
+name: EPIC PROTECTOR — Bot 24/7 Elite
+
+# ══════════════════════════════════════════════════════════════════
+# EPIC PROTECTOR — GitHub Actions Workflow
+# Elite Master Hybrid Edition
+# ══════════════════════════════════════════════════════════════════
+#
+# Triggers:
+#   - Every push to main branch
+#   - Manual trigger via GitHub Actions UI
+#   - Auto-restart every 5 hours (keeps bot alive 24/7)
+#
+# Improvements over base version:
+#   1. Dependency caching — faster startup
+#   2. Environment validation — checks secrets before running
+#   3. Always saves logs — full audit trail
+#   4. Cleaner step naming — professional output
+#   5. Longer retention for logs — 14 days
+#   6. Bot startup confirmation step
+#   7. Consistent tool versions pinned
+# ══════════════════════════════════════════════════════════════════
 
 on:
   push:
@@ -10,43 +30,107 @@ on:
 
 jobs:
   run-bot:
-    name: Run Epic Protector Bot
-    runs-on: ubuntu-latest
+    name: EPIC PROTECTOR — Elite Bot Runner
+    runs-on: ubuntu-22.04
     timeout-minutes: 350
 
     steps:
-      - name: Checkout Code
+
+      # ── Step 1 — Checkout Repository ───────────────────────────
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # ── Step 2 — Set Up Python 3.11 ────────────────────────────
+      - name: Set Up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
+      # ── Step 3 — Validate Required Secrets ─────────────────────
+      - name: Validate Required Secrets
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+        run: |
+          echo "🔍 Validating required secrets..."
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "❌ ERROR: BOT_TOKEN secret is missing."
+            exit 1
+          fi
+          if [ -z "$ADMIN_ID" ]; then
+            echo "❌ ERROR: ADMIN_ID secret is missing."
+            exit 1
+          fi
+          echo "✅ All required secrets are present."
+
+      # ── Step 4 — Install System Tools ──────────────────────────
       - name: Install System Tools
         run: |
+          echo "📦 Installing system tools..."
           sudo apt-get update -qq
-          sudo apt-get install -y -qq default-jdk zipalign apksigner wget unzip
-          echo "✅ System tools installed"
+          sudo apt-get install -y -qq \
+            default-jdk-headless \
+            zipalign \
+            apksigner \
+            wget \
+            unzip \
+            curl
+          echo "✅ System tools installed."
+          java -version
+          echo "✅ Java confirmed."
 
+      # ── Step 5 — Install Python Dependencies ───────────────────
       - name: Install Python Dependencies
         run: |
-          pip install python-telegram-bot==22.7 flask==3.1.0
-          echo "✅ Python dependencies installed"
+          echo "🐍 Installing Python dependencies..."
+          pip install --upgrade pip --quiet
+          pip install \
+            python-telegram-bot==22.7 \
+            flask==3.1.0 \
+            --quiet
+          echo "✅ Python dependencies installed."
+          python3 -c "import telegram; print('✅ telegram-bot:', telegram.__version__)"
+          python3 -c "import flask; print('✅ flask:', flask.__version__)"
 
-      - name: Run Epic Protector
+      # ── Step 6 — Confirm Bot Script Exists ─────────────────────
+      - name: Confirm Bot Script Exists
+        run: |
+          if [ ! -f "epicprotector.py" ]; then
+            echo "❌ ERROR: epicprotector.py not found in repository."
+            exit 1
+          fi
+          echo "✅ epicprotector.py found."
+          echo "📄 Script size: $(wc -l < epicprotector.py) lines"
+
+      # ── Step 7 — Run EPIC PROTECTOR Bot ────────────────────────
+      - name: Run EPIC PROTECTOR Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           KS_PASS: ${{ secrets.KS_PASS }}
           KS_KEY: ${{ secrets.KS_KEY }}
         run: |
+          echo "🚀 Starting EPIC PROTECTOR Elite Bot..."
+          echo "⏰ Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           python3 epicprotector.py 2>&1 | tee bot_log.txt
+          echo "⏰ End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-      - name: Upload Log on Failure
+      # ── Step 8 — Upload Log Always (Success or Failure) ────────
+      - name: Upload Run Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: epic-bot-log-${{ github.run_number }}
+          path: bot_log.txt
+          retention-days: 14
+
+      # ── Step 9 — Upload Crash Report on Failure ─────────────────
+      - name: Upload Crash Report
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: bot-crash-log
-          path: bot_log.txt
-          retention-days: 7
+          name: epic-bot-crash-${{ github.run_number }}
+          path: |
+            bot_log.txt
+          retention-days: 30
