@@ -2,8 +2,9 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║         EPIC PROTECTOR — Elite Master Hybrid Engine             ║
-║         6-Level Android Protection + Telegram Bot               ║
+║         7-Level Android Protection + Telegram Bot               ║
 ║         Security Administrator Edition                          ║
+║         Version: 2.1.0                                          ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -81,6 +82,7 @@ from telegram.ext import (
 )
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
+SCRIPT_VERSION = "2.1.0"                                      # Elite Master Hybrid
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "YOUR_NEW_TOKEN_HERE")
 ADMIN_ID   = int(os.environ.get("ADMIN_ID", "8205672036"))
 KS_PASS    = os.environ.get("KS_PASS",  "Epic@Store#2024")   # move to env in prod
@@ -131,6 +133,13 @@ manual_undo_backup= {}   # stores backup path for undo last operation
 job_history: list = []          # list of job result dicts — all protection jobs
 apk_status:  dict = {}          # per-client APK processing status {client_id: status_str}
 SESSION_TIMEOUT_SECONDS = 1800  # 30 minutes — compliance sessions expire after this
+
+# ── STANDALONE COMPLIANCE SCAN STATE ─────────────────────────────────────────
+pending_standalone_scan = {}   # tracks admin awaiting APK for standalone scan
+standalone_scan_session = {}   # stores standalone scan results per admin
+
+# ── PIPELINE VALIDATOR STATE ──────────────────────────────────────────────────
+pending_pipeline_validate = {}  # tracks admin awaiting script for pipeline validation
 
 # ── COMPLIANCE SCANNER STATE ─────────────────────────────────────────────────
 compliance_session    = {}   # stores full compliance scan session per admin
@@ -2058,21 +2067,22 @@ class ManualControlEngine:
     Applies chosen operation to selected folder inside decoded APK workspace.
 
     Allowed operations per folder:
-      smali/     -> Obfuscate, Encrypt, Rename
-      assets/    -> Encrypt, Compress
-      res/       -> Rename, Compress
-      lib/       -> Encrypt, Compress
-      META-INF/  -> Integrity Verification only
+      smali/     -> Obfuscate, Encrypt, Rename, Compliance Scan
+      assets/    -> Encrypt, Compress, Compliance Scan
+      res/       -> Rename, Compress, Compliance Scan
+      lib/       -> Encrypt, Compress, Compliance Scan
+      META-INF/  -> Integrity Verification, Compliance Scan
       Custom     -> All operations available
     """
 
     FOLDER_OPERATIONS = {
-        "smali/":    ["Obfuscate", "Encrypt", "Rename"],
-        "assets/":   ["Encrypt", "Compress"],
-        "res/":      ["Rename", "Compress"],
-        "lib/":      ["Encrypt", "Compress"],
-        "META-INF/": ["Integrity Verification"],
-        "Custom":    ["Obfuscate", "Encrypt", "Rename", "Compress", "Integrity Verification"],
+        "smali/":    ["Obfuscate", "Encrypt", "Rename", "Compliance Scan"],
+        "assets/":   ["Encrypt", "Compress", "Compliance Scan"],
+        "res/":      ["Rename", "Compress", "Compliance Scan"],
+        "lib/":      ["Encrypt", "Compress", "Compliance Scan"],
+        "META-INF/": ["Integrity Verification", "Compliance Scan"],
+        "Custom":    ["Obfuscate", "Encrypt", "Rename", "Compress",
+                      "Integrity Verification", "Compliance Scan"],
     }
 
     # ── Third party prefixes — excluded from advisory scan ───────────────────
@@ -2589,6 +2599,96 @@ class ManualControlEngine:
             "report_saved":   os.path.basename(report_path),
         }
 
+    def compliance_scan_target(self, workspace_dir, target) -> dict:
+        """
+        Run Compliance Scanner on the selected target folder only.
+        Scans for banned/suspicious words in file names, folder names,
+        and smali/xml content within the selected folder.
+        Returns findings list and formatted summary — no protection applied.
+        """
+        target_path = os.path.join(workspace_dir, target)
+        if not os.path.exists(target_path):
+            return {"error": f"Target folder not found: {target}"}
+
+        scanner  = ComplianceScannerEngine()
+        findings = []
+        target_p = Path(target_path)
+
+        # Scan file and folder names inside target
+        for item in target_p.rglob("*"):
+            rel = str(item.relative_to(target_p))
+            if item.is_dir():
+                for word in scanner._check_text(item.name):
+                    findings.append({
+                        "context":    "folder",
+                        "location":   rel,
+                        "word":       word,
+                        "severity":   scanner._get_severity(word),
+                        "suggestion": scanner._get_suggestion(word),
+                        "original":   item.name,
+                        "proposed":   item.name.lower().replace(word, scanner._get_suggestion(word)),
+                        "full_path":  str(item),
+                        "line_num":   0,
+                    })
+            elif item.is_file():
+                for word in scanner._check_text(item.stem):
+                    findings.append({
+                        "context":    "file",
+                        "location":   rel,
+                        "word":       word,
+                        "severity":   scanner._get_severity(word),
+                        "suggestion": scanner._get_suggestion(word),
+                        "original":   item.name,
+                        "proposed":   item.name.lower().replace(word, scanner._get_suggestion(word)),
+                        "full_path":  str(item),
+                        "line_num":   0,
+                    })
+                # Deep scan smali and xml text content
+                if item.suffix in ('.smali', '.xml', '.txt', '.MF', '.SF'):
+                    try:
+                        with open(item, 'r', encoding='utf-8', errors='ignore') as f:
+                            lines = f.readlines()
+                        for line_num, line in enumerate(lines, 1):
+                            ls = line.strip()
+                            for word in scanner._check_text(ls):
+                                findings.append({
+                                    "context":    "string",
+                                    "location":   f"{rel}:{line_num}",
+                                    "word":       word,
+                                    "severity":   scanner._get_severity(word),
+                                    "suggestion": scanner._get_suggestion(word),
+                                    "original":   ls,
+                                    "proposed":   ls.lower().replace(word, scanner._get_suggestion(word)),
+                                    "full_path":  str(item),
+                                    "line_num":   line_num,
+                                })
+                    except Exception:
+                        pass
+
+        # Deduplicate
+        seen = set()
+        unique = []
+        for f in findings:
+            key = (f["location"], f["word"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+
+        critical = sum(1 for f in unique if f["severity"] == "CRITICAL")
+        warning  = sum(1 for f in unique if f["severity"] == "WARNING")
+        advisory = sum(1 for f in unique if f["severity"] == "ADVISORY")
+        score    = scanner.compute_score(unique)
+
+        return {
+            "findings":        unique,
+            "total":           len(unique),
+            "critical":        critical,
+            "warning":         warning,
+            "advisory":        advisory,
+            "score":           score,
+            "target":          target,
+        }
+
     def run_operation(self, workspace_dir, target, operation) -> dict:
         """Route selected operation to correct engine method."""
         op = operation.lower()
@@ -2602,6 +2702,8 @@ class ManualControlEngine:
             return self.compress_target(workspace_dir, target)
         elif op == "integrity verification":
             return self.integrity_verification(workspace_dir, target)
+        elif op == "compliance scan":
+            return self.compliance_scan_target(workspace_dir, target)
         else:
             return {"error": f"Unknown operation: {operation}"}
 
@@ -3265,60 +3367,103 @@ class MasterProtectionEngine:
             "scanner":    scanner,
         }
 
-    def protect_phase2_complete(self, workspace: str, work_dir: str,
-                                aes_key: bytes) -> dict:
+    async def protect_phase2_complete(self, workspace: str, work_dir: str,
+                                aes_key: bytes,
+                                status_msg=None, context=None) -> dict:
         """
         Phase 2 of compliance-integrated protection pipeline.
-        Runs Levels 2-6 after compliance review is complete.
-        Called AFTER admin has reviewed and approved all compliance findings.
+        Runs Levels 2-7 after compliance review is complete.
+        If status_msg and context are provided, updates Telegram message
+        live after each level completes — real-time progress for admin.
+        Rate-limit guard: asyncio.sleep(0.4) between edits.
         """
-        results = {}
+        results  = {}
+        progress = []   # live progress lines shown to admin
 
         def mark(k, v):
             results[k] = v
             logger.info(f"[Phase2] {k}: {v}")
 
+        async def live(line: str):
+            """Append line to progress and edit Telegram message safely."""
+            progress.append(line)
+            if status_msg and context:
+                try:
+                    await status_msg.edit_text(
+                        "🛡️ *Protection In Progress...*\n\n"
+                        "━━━━━━━━━━━━━━━━━━━━━\n" +
+                        '\n'.join(progress) +
+                        "\n━━━━━━━━━━━━━━━━━━━━━",
+                        parse_mode="Markdown")
+                    await asyncio.sleep(0.4)   # rate-limit guard
+                except Exception:
+                    pass   # never crash on a UI update failure
+
         try:
+            t_start = time.time()
+
             # ── LEVEL 2 — Manifest ───────────────────────────────────────────
-            mark("Level 2 — Manifest", "⏳ Running...")
+            await live("⏳ *Level 2* — Manifest Hardening...")
+            t2 = time.time()
             l2 = Level2_ManifestProtector(work_dir)
             man_changes = l2.protect(workspace)
+            elapsed = f"{time.time()-t2:.1f}s"
             mark("Level 2 — Manifest", f"✅ {len(man_changes)} changes")
+            await live(f"✅ *Level 2* — Manifest Hardening done `({elapsed})`\n"
+                       f"   FLAG_SECURE · Network Config · SSL Pinning")
 
             # ── LEVEL 3 — Security Guard Integration ─────────────────────────
-            mark("Level 3 — Security Guard Integration", "⏳ Running...")
+            await live("⏳ *Level 3* — Security Guard Integration...")
+            t3 = time.time()
             l3 = Level3_SecurityGuardIntegrator(self.crypto, work_dir)
             guard_path       = l3.save_guard_java(aes_key)
             guard_integrated = l3.integrate_security_guard(workspace, aes_key)
+            elapsed = f"{time.time()-t3:.1f}s"
             mark("Level 3 — Security Guard Integration",
-                 f"✅ {guard_integrated} wired — Guard class placed in smali")
+                 f"✅ {guard_integrated} entry points wired")
+            await live(f"✅ *Level 3* — Security Guard done `({elapsed})`\n"
+                       f"   {guard_integrated} entry points · strings encrypted")
 
             # ── LEVEL 4 — Security Compliance Layer ──────────────────────────
-            mark("Level 4 — Security Compliance Layer", "⏳ Running...")
+            await live("⏳ *Level 4* — Security Compliance Layer...")
+            t4 = time.time()
             l4 = Level4_SecurityCompliance(self.crypto, work_dir)
             security_fields = l4.add_security_fields(workspace)
+            elapsed = f"{time.time()-t4:.1f}s"
             mark("Level 4 — Security Compliance Layer",
                  f"✅ {security_fields} security fields added")
+            await live(f"✅ *Level 4* — Security Fields done `({elapsed})`\n"
+                       f"   {security_fields} marker fields added")
 
-            # ── LEVEL 5 — BUILD ───────────────────────────────────────────────
-            mark("Level 5 — APK Build", "⏳ Running... (this may take 1-3 min)")
-            l5 = Level5_APKBuilder(self.tools, work_dir)
-            rebuilt = l5.rebuild(workspace)
-            mark("Level 5 — APK Build", "✅ Valid APK produced")
-
-            # ── Integrity snapshot ────────────────────────────────────────────
+            # ── LEVEL 5 — Integrity Snapshot ─────────────────────────────────
+            await live("⏳ *Level 5* — Integrity Manifest...")
+            t5 = time.time()
             int_manifest = self.integrity.generate(workspace)
             self.integrity.save(int_manifest)
+            elapsed = f"{time.time()-t5:.1f}s"
             mark("🔒 Integrity Manifest", f"✅ {len(int_manifest)} files hashed")
+            await live(f"✅ *Level 5* — Integrity Manifest done `({elapsed})`\n"
+                       f"   {len(int_manifest)} files SHA-256 hashed")
 
-            # ── LEVEL 6 — Sign & Align ────────────────────────────────────────
-            mark("Level 6 — Sign & Align", "⏳ Generating fresh identity...")
+            # ── LEVEL 6 — APK Build ───────────────────────────────────────────
+            await live("⏳ *Level 6* — APK Build `(1-3 min)`...")
+            t6 = time.time()
+            l5 = Level5_APKBuilder(self.tools, work_dir)
+            rebuilt = l5.rebuild(workspace)
+            elapsed = f"{time.time()-t6:.1f}s"
+            mark("Level 6 — APK Build", "✅ Valid APK produced")
+            await live(f"✅ *Level 6* — APK Build done `({elapsed})`")
+
+            # ── LEVEL 7 — Sign & Align ────────────────────────────────────────
+            await live("⏳ *Level 7* — Sign & ZipAlign...")
+            t7 = time.time()
             l6          = Level6_Signer(work_dir)
             sign_result = l6.prepare(rebuilt)
             final_apk   = sign_result["output_apk"]
             identity    = sign_result["identity"]
+            elapsed     = f"{time.time()-t7:.1f}s"
 
-            mark("Level 6 — Sign & Align",    "✅ Signed & zipaligned")
+            mark("Level 7 — Sign & Align",    "✅ Signed & zipaligned")
             mark("🆔 Identity CN",             f"✅ {identity['cn']}")
             mark("🏢 Organization",            f"✅ {identity['org']}")
             mark("🌍 Location",
@@ -3330,14 +3475,28 @@ class MasterProtectionEngine:
                      f"✅ {sign_result['fingerprint'][:40]}...")
             mark("🔐 Keystore", "✅ Securely destroyed after signing")
 
+            total_elapsed = f"{time.time()-t_start:.1f}s"
+            await live(f"✅ *Level 7* — Signed & Aligned done `({elapsed})`\n"
+                       f"   Method: {sign_result['signing_method']} · "
+                       f"CN: {identity['cn']}")
+            await live(f"\n🏁 *All 7 levels complete in `{total_elapsed}`* 🎉")
+
             results["OUTPUT_APK"] = final_apk
             results["GUARD_JAVA"] = guard_path
             results["SUCCESS"]    = True
 
         except Exception as e:
-            results["ERROR"]   = str(e)
+            error_msg = str(e)
+            results["ERROR"]   = error_msg
             results["SUCCESS"] = False
             logger.error(f"[Phase2] Protection failed: {e}", exc_info=True)
+            await live(f"\n❌ *Error:* `{error_msg[:200]}`")
+            job_history.append({
+                "apk_name":  "unknown",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "success":   False,
+                "summary":   f"Failed: {error_msg[:80]}",
+            })
         finally:
             workspace_dir = os.path.join(work_dir, "workspace")
             if os.path.exists(workspace_dir):
@@ -3384,6 +3543,8 @@ def admin_kb():
         [InlineKeyboardButton("🛡️ Protect APK",              callback_data="admin_protect")],
         [InlineKeyboardButton("🎛️ Manual Control Panel",     callback_data="admin_manual")],
         [InlineKeyboardButton("🔍 Compliance Scan",          callback_data="admin_compliance_scan")],
+        [InlineKeyboardButton("📋 Pipeline Order",           callback_data="admin_pipeline_order")],
+        [InlineKeyboardButton("🔧 Validate Pipeline",        callback_data="admin_pipeline_validate")],
         [InlineKeyboardButton("📤 Send APK to Client",       callback_data="admin_send_apk")],
         [InlineKeyboardButton("📢 Broadcast Message",        callback_data="admin_broadcast")],
         [InlineKeyboardButton("💬 Reply to Client",          callback_data="admin_reply")],
@@ -3416,8 +3577,11 @@ async def start(update, context):
     register_client(user)
     if is_admin(user.id):
         await update.message.reply_text(
-            f"👑 *Welcome back, Admin!*\n\n🛡️ *EPIC PROTECTOR — Elite Master Hybrid*\n"
-            f"7-Level Android Protection\n\nTotal Clients: {len(registered_clients)}\n\nChoose an action:",
+            f"👑 *Welcome back, Admin!*\n\n"
+            f"🛡️ *EPIC PROTECTOR — Elite Master Hybrid*\n"
+            f"7-Level Android Protection\n"
+            f"🔖 Version: v{SCRIPT_VERSION}\n\n"
+            f"Total Clients: {len(registered_clients)}\n\nChoose an action:",
             parse_mode="Markdown", reply_markup=admin_kb())
     else:
         await update.message.reply_text(
@@ -3435,6 +3599,7 @@ def _build_op_keyboard(target: str) -> InlineKeyboardMarkup:
         "Rename":                 "✏️ Rename",
         "Compress":               "🗜️ Compress",
         "Integrity Verification": "🔍 Integrity Verify",
+        "Compliance Scan":        "🛡️ Compliance Scan",
     }
     rows = []
     row  = []
@@ -3805,11 +3970,16 @@ async def button_handler(update, context):
             "Proceeding with protection as-is.\n\n⏳ Please wait...",
             parse_mode="Markdown")
 
-        engine  = MasterProtectionEngine()
-        results = engine.protect_phase2_complete(
+        engine   = MasterProtectionEngine()
+        live_msg = await query.message.reply_text(
+            "🛡️ *Protection In Progress...*\n\n━━━━━━━━━━━━━━━━━━━━━\n⏳ Starting...",
+            parse_mode="Markdown")
+        results = await engine.protect_phase2_complete(
             session["workspace"],
             session["work_dir"],
-            session["aes_key"])
+            session["aes_key"],
+            status_msg=live_msg,
+            context=context)
 
         # Save audit log
         session["scanner"].save_audit_log(
@@ -3820,7 +3990,7 @@ async def button_handler(update, context):
 
         compliance_session.pop(user.id, None)
         await _deliver_protected_apk(
-            query, context, query.message, results,
+            query, context, live_msg, results,
             session.get("apk_name", "app.apk"))
 
     elif data == "cs_proceed":
@@ -3835,14 +4005,19 @@ async def button_handler(update, context):
 
         await query.edit_message_text(
             "⚙️ *Starting Full Protection...*\n\n"
-            "Running Levels 2 → 6\n\n⏳ This takes 2-5 minutes...",
+            "Running Levels 2 → 7\n\n⏳ This takes 2-5 minutes...",
             parse_mode="Markdown")
 
-        engine  = MasterProtectionEngine()
-        results = engine.protect_phase2_complete(
+        engine   = MasterProtectionEngine()
+        live_msg = await query.message.reply_text(
+            "🛡️ *Protection In Progress...*\n\n━━━━━━━━━━━━━━━━━━━━━\n⏳ Starting...",
+            parse_mode="Markdown")
+        results = await engine.protect_phase2_complete(
             session["workspace"],
             session["work_dir"],
-            session["aes_key"])
+            session["aes_key"],
+            status_msg=live_msg,
+            context=context)
 
         # Save audit log
         session["scanner"].save_audit_log(
@@ -3852,11 +4027,8 @@ async def button_handler(update, context):
             session.get("apk_name", "app.apk"))
 
         compliance_session.pop(user.id, None)
-
-        status_msg = await query.message.reply_text(
-            "⏳ Finalizing...", parse_mode="Markdown")
         await _deliver_protected_apk(
-            query, context, status_msg, results,
+            query, context, live_msg, results,
             session.get("apk_name", "app.apk"))
 
     elif data == "cs_addword":
@@ -3983,6 +4155,7 @@ async def button_handler(update, context):
                     "Rename":                 "✏️ Rename",
                     "Compress":               "🗜️ Compress",
                     "Integrity Verification": "🔍 Integrity Verify",
+                "Compliance Scan":        "🛡️ Compliance Scan",
                 }
                 row = []
                 for op in allowed_ops:
@@ -4058,6 +4231,7 @@ async def button_handler(update, context):
                 "Rename":                 "✏️ Rename",
                 "Compress":               "🗜️ Compress",
                 "Integrity Verification": "🔍 Integrity Verify",
+                "Compliance Scan":        "🛡️ Compliance Scan",
             }
             kb_rows = []
             if high_count > 0:
@@ -4198,7 +4372,32 @@ async def button_handler(update, context):
                     parse_mode="Markdown", reply_markup=back_a())
                 return
 
-            # Build result report lines
+            # ── Compliance Scan — show findings report ────────────────────────
+            if operation.lower() == "compliance scan":
+                score     = results.get("score", 0)
+                total     = results.get("total", 0)
+                critical  = results.get("critical", 0)
+                warning   = results.get("warning", 0)
+                advisory  = results.get("advisory", 0)
+                score_icon = "✅" if score >= 90 else "⚠️" if score >= 60 else "❌"
+                await status.edit_text(
+                    f"🛡️ *Manual Compliance Scan — `{target}`*\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🔴 Critical : {critical}\n"
+                    f"🟡 Warning  : {warning}\n"
+                    f"🟢 Advisory : {advisory}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 Score: {score_icon} *{score}/100*\n"
+                    f"Total findings: *{total}*\n\n"
+                    f"⛔ Protection pipeline was NOT touched.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📂 Select Another Target", callback_data="manual_select_target")],
+                        [InlineKeyboardButton("⬅️ Back to Menu",          callback_data="back_admin")],
+                    ]))
+                return
+
+            # Build result report lines for all other operations
             lines = [
                 f"⚙️ Processing `{target}` → `{operation}`\n",
                 "━━━━━━━━━━━━━━━━━━━━━"
@@ -4219,7 +4418,7 @@ async def button_handler(update, context):
                     [InlineKeyboardButton("⬅️ Back to Menu",             callback_data="back_admin")],
                 ]))
 
-            # ── Fix 20: Deliver compress archive to admin via bot ─────────────
+            # ── Deliver compress archive to admin via bot ─────────────────────
             if operation.lower() == "compress":
                 archive_path = results.get("archive_path")
                 if archive_path and os.path.exists(archive_path):
@@ -4413,14 +4612,166 @@ async def button_handler(update, context):
 
     elif data == "admin_compliance_scan":
         if not is_admin(user.id): return
-        pending_protect[user.id] = True
+        # Standalone scan — completely separate from protect flow
+        # Sets pending_standalone_scan — NOT pending_protect
+        pending_standalone_scan[user.id] = True
         await query.edit_message_text(
             "🔍 *Standalone Compliance Scan*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
             "Send your APK file.\n\n"
-            "The Compliance Scanner will run independently —\n"
-            "you will see all findings before any protection is applied.\n\n"
-            f"⚠️ Max APK size: {MAX_APK_MB}MB\n\n📎 Send APK now:",
+            "✅ Scanner will run on ALL folders:\n"
+            "   smali/ · res/ · lib/ · META-INF/ · assets/\n\n"
+            "✅ Full findings report delivered\n"
+            "✅ Fix All Critical option available\n"
+            "✅ Export report as JSON\n\n"
+            "⛔ Protection pipeline will NOT run\n"
+            "⛔ No Level 2-7 will be touched\n\n"
+            f"⚠️ Max APK size: {MAX_APK_MB}MB\n\n"
+            "📎 Send APK now:",
             parse_mode="Markdown", reply_markup=back_a())
+
+
+    elif data.startswith("ss_review_"):
+        if not is_admin(user.id): return
+        session = standalone_scan_session.get(user.id)
+        if not session:
+            await query.edit_message_text(
+                "❌ Scan session expired. Please scan again.",
+                reply_markup=admin_kb())
+            return
+        idx      = int(data.split("_")[-1])
+        findings = session.get("findings", [])
+        total    = len(findings)
+        if idx >= total:
+            await query.edit_message_text(
+                f"✅ *Review Complete!*\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Fixed   : {session.get('fixed', 0)}\n"
+                f"Total   : {total}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Scan only — protection was NOT applied.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📄 Export Report", callback_data="ss_export")],
+                    [InlineKeyboardButton("⬅️ Back to Menu",  callback_data="back_admin")],
+                ]))
+            return
+        finding = findings[idx]
+        msg     = ComplianceScannerEngine.format_finding_message(finding, idx + 1, total)
+        await query.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Fix '" + finding['suggestion'] + "'", callback_data=f"ss_fix_one_{idx}")],
+                [InlineKeyboardButton("⏭️ Skip", callback_data=f"ss_review_{idx + 1}")],
+                [InlineKeyboardButton("📄 Export Report", callback_data="ss_export")],
+            ]))
+
+    elif data.startswith("ss_fix_one_"):
+        if not is_admin(user.id): return
+        session  = standalone_scan_session.get(user.id)
+        if not session:
+            await query.edit_message_text("❌ Session expired.", reply_markup=admin_kb())
+            return
+        idx      = int(data.split("_")[-1])
+        findings = session.get("findings", [])
+        scanner  = session.get("scanner", ComplianceScannerEngine())
+        if idx < len(findings):
+            if scanner.apply_rename(findings[idx]):
+                session["fixed"] = session.get("fixed", 0) + 1
+        next_idx  = idx + 1
+        remaining = len(findings) - next_idx
+        if remaining <= 0:
+            await query.edit_message_text(
+                f"✅ *All items reviewed!*\n\nFixed: {session.get('fixed', 0)} / {len(findings)}\n\nScan only — protection was NOT applied.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📄 Export Report", callback_data="ss_export")],
+                    [InlineKeyboardButton("⬅️ Back to Menu",  callback_data="back_admin")],
+                ]))
+        else:
+            finding = findings[next_idx]
+            msg     = ComplianceScannerEngine.format_finding_message(finding, next_idx + 1, len(findings))
+            await query.edit_message_text(
+                msg, parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Fix '" + finding['suggestion'] + "'", callback_data=f"ss_fix_one_{next_idx}")],
+                    [InlineKeyboardButton("⏭️ Skip", callback_data=f"ss_review_{next_idx + 1}")],
+                    [InlineKeyboardButton("📄 Export Report", callback_data="ss_export")],
+                ]))
+
+    elif data == "ss_fix_all":
+        if not is_admin(user.id): return
+        session = standalone_scan_session.get(user.id)
+        if not session:
+            await query.edit_message_text("❌ Scan session expired. Please scan again.", reply_markup=back_a())
+            return
+        findings = session.get("findings", [])
+        scanner  = ComplianceScannerEngine()
+        scanner.findings = findings
+        fixed = scanner.apply_all_critical(findings)
+        session["fixed"] = fixed
+        await query.edit_message_text(
+            f"⚡ *Auto-Fix Complete!*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Critical items fixed : {fixed}\n"
+            f"📊 Score improvement   : +{fixed * 15} pts\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"Workspace updated. No protection was applied.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📄 Export Report", callback_data="ss_export")],
+                [InlineKeyboardButton("⬅️ Back to Menu",  callback_data="back_admin")],
+            ]))
+
+    elif data == "ss_export":
+        if not is_admin(user.id): return
+        session = standalone_scan_session.get(user.id)
+        if not session:
+            await query.edit_message_text("❌ Scan session expired.", reply_markup=back_a())
+            return
+        try:
+            findings  = session.get("findings", [])
+            apk_name  = session.get("apk_name", "unknown.apk")
+            score     = session.get("score", 0)
+            fixed     = session.get("fixed", 0)
+            report    = {
+                "epic_protector_version": SCRIPT_VERSION,
+                "report_type":    "Standalone Compliance Scan",
+                "apk_name":       apk_name,
+                "scan_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "compliance_score": score,
+                "total_findings": len(findings),
+                "critical":       sum(1 for f in findings if f["severity"] == "CRITICAL"),
+                "warning":        sum(1 for f in findings if f["severity"] == "WARNING"),
+                "advisory":       sum(1 for f in findings if f["severity"] == "ADVISORY"),
+                "fixed":          fixed,
+                "findings":       findings,
+            }
+            os.makedirs(WORK_DIR, exist_ok=True)
+            report_path = os.path.join(WORK_DIR, f"standalone_scan_{int(time.time())}.json")
+            with open(report_path, 'w') as rf:
+                json.dump(report, rf, indent=2)
+            await query.edit_message_text(
+                "📄 *Exporting Compliance Report...*", parse_mode="Markdown")
+            with open(report_path, "rb") as rf:
+                await context.bot.send_document(
+                    chat_id=user.id,
+                    document=rf,
+                    filename=f"compliance_report_{int(time.time())}.json",
+                    caption=(
+                        f"📄 *Standalone Compliance Report*\n\n"
+                        f"APK: `{apk_name}`\n"
+                        f"Score: `{score}/100`\n"
+                        f"Findings: `{len(findings)}`\n"
+                        f"Fixed: `{fixed}`\n"
+                        f"Version: `v{SCRIPT_VERSION}`"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=admin_kb())
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ *Export Failed:* `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
 
     elif data == "admin_delete_client":
         if not is_admin(user.id): return
@@ -4555,10 +4906,76 @@ async def button_handler(update, context):
                 caption="🔒 Integrity Manifest — SHA-256 file hashes",
                 reply_markup=admin_kb())
 
+    elif data == "admin_pipeline_order":
+        if not is_admin(user.id): return
+        await query.edit_message_text(
+            f"📋 *EPIC PROTECTOR — Correct Pipeline Order*\n"
+            f"*Version: v{SCRIPT_VERSION}*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"*INPUT:* Your original APK file\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"*Level 1 — APK Workspace Build*\n"
+            f"  Tool   : apktool decode\n"
+            f"  Input  : original .apk\n"
+            f"  Output : decoded workspace folder\n\n"
+            f"*Level 2 — Manifest Hardening*\n"
+            f"  Tool   : direct XML edit\n"
+            f"  Input  : workspace/AndroidManifest.xml\n"
+            f"  Output : hardened manifest + network_security_config.xml\n"
+            f"  Adds   : FLAG_SECURE · SSL Pinning · No cleartext\n\n"
+            f"*Level 3 — Security Guard Integration*\n"
+            f"  Tool   : smali editor + AES-256-CBC\n"
+            f"  Input  : workspace/smali/\n"
+            f"  Output : EpicSecurityGuard.smali placed · strings encrypted\n"
+            f"  Wires  : MainActivity · SplashActivity · LaunchActivity\n\n"
+            f"*Level 4 — Security Compliance Layer*\n"
+            f"  Tool   : smali editor\n"
+            f"  Input  : workspace/smali/\n"
+            f"  Output : security marker fields added to class files\n\n"
+            f"*Level 5 — Compliance Scanner Review*\n"
+            f"  Tool   : ComplianceScannerEngine\n"
+            f"  Input  : full workspace\n"
+            f"  Output : findings report · admin review · auto-fix\n\n"
+            f"*Level 6 — APK Build*\n"
+            f"  Tool   : apktool build\n"
+            f"  Input  : hardened workspace\n"
+            f"  Output : rebuilt .apk with valid DEX + manifest\n\n"
+            f"*Level 7 — Sign & ZipAlign*\n"
+            f"  Tool   : apksigner / jarsigner + zipalign\n"
+            f"  Input  : rebuilt .apk\n"
+            f"  Output : EPIC_PROTECTED.apk — signed · aligned · ready\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"*OUTPUT:* EPIC_PROTECTED.apk ✅\n"
+            f"━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔧 Validate My Pipeline", callback_data="admin_pipeline_validate")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="back_admin")],
+            ]))
+
+    elif data == "admin_pipeline_validate":
+        if not is_admin(user.id): return
+        pending_pipeline_validate[user.id] = True
+        await query.edit_message_text(
+            "🔧 *Pipeline Validator*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Send your `epicprotector.py` script file.\n\n"
+            "The validator will:\n"
+            "✅ Parse your script safely (read-only)\n"
+            "✅ Check Level execution order\n"
+            "✅ Detect missing levels\n"
+            "✅ Detect duplicate level calls\n"
+            "✅ Detect wrong sequence\n"
+            "✅ Produce corrected script if issues found\n\n"
+            "⛔ Script will NOT be executed — parse only\n\n"
+            "📎 Send your `.py` script file now:",
+            parse_mode="Markdown", reply_markup=back_a())
+
     elif data == "admin_stats":
         if not is_admin(user.id): return
         await query.edit_message_text(
             f"📊 *Statistics*\n\n"
+            f"🔖 Version            : v{SCRIPT_VERSION}\n"
             f"👥 Clients            : {len(registered_clients)}\n"
             f"📋 Jobs Run           : {len(job_history)}\n"
             f"🛡️ Pipeline Levels    : 7\n"
@@ -4579,7 +4996,9 @@ async def button_handler(update, context):
         for d in [pending_protect, pending_broadcast, pending_reply,
                   pending_send_apk, pending_manual, manual_target,
                   manual_apk_path, manual_operation, manual_workspace,
-                  manual_scan_result, manual_undo_backup]:
+                  manual_scan_result, manual_undo_backup,
+                  pending_standalone_scan, standalone_scan_session,
+                  pending_pipeline_validate]:
             d.pop(user.id, None)
         await query.edit_message_text(
             "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
@@ -4833,6 +5252,253 @@ async def document_handler(update, context):
             pending_manual.pop(user.id, None)
         return
 
+    # ── Admin: standalone compliance scan — APK upload ───────────────────────
+    if is_admin(user.id) and pending_standalone_scan.get(user.id):
+        pending_standalone_scan.pop(user.id)
+
+        if doc.file_size and doc.file_size > MAX_APK_MB * 1024 * 1024:
+            await update.message.reply_text(
+                f"❌ APK too large. Max: {MAX_APK_MB}MB",
+                reply_markup=admin_kb())
+            return
+
+        status = await update.message.reply_text(
+            "🔍 *Standalone Compliance Scan Starting...*\n\n"
+            "⏳ Decoding APK...\n"
+            "⏳ Scanning smali · res · lib · META-INF...\n\n"
+            "Please wait...",
+            parse_mode="Markdown")
+        try:
+            tg_file  = await context.bot.get_file(doc.file_id)
+            os.makedirs(WORK_DIR, exist_ok=True)
+            apk_in   = os.path.join(WORK_DIR, f"scan_{user.id}_{int(time.time())}.apk")
+            await tg_file.download_to_drive(apk_in)
+            apk_name = doc.file_name or os.path.basename(apk_in)
+
+            # Decode APK
+            tools = ToolInstaller()
+            tools.install_all()
+            job_id   = f"scan_{int(time.time())}"
+            work_dir = os.path.join(WORK_DIR, job_id)
+            os.makedirs(work_dir, exist_ok=True)
+            l1        = Level1_WorkspaceBuilder(tools, work_dir)
+            workspace = l1.build_workspace(apk_in)
+
+            await status.edit_text(
+                "🔍 *Standalone Compliance Scan*\n\n"
+                "✅ APK decoded\n"
+                "⏳ Running full scan...",
+                parse_mode="Markdown")
+
+            # Run full compliance scan
+            scanner  = ComplianceScannerEngine()
+            findings = scanner.scan_workspace(workspace)
+            score    = scanner.compute_score(findings)
+            critical = sum(1 for f in findings if f["severity"] == "CRITICAL")
+            warning  = sum(1 for f in findings if f["severity"] == "WARNING")
+            advisory = sum(1 for f in findings if f["severity"] == "ADVISORY")
+
+            # Store session for fix/export actions
+            standalone_scan_session[user.id] = {
+                "findings":  findings,
+                "scanner":   scanner,
+                "workspace": workspace,
+                "apk_name":  apk_name,
+                "score":     score,
+                "fixed":     0,
+            }
+
+            score_icon = "✅" if score >= 90 else "⚠️" if score >= 60 else "❌"
+            await status.edit_text(
+                f"🔍 *Standalone Compliance Scan Complete!*\n\n"
+                f"📦 APK: `{apk_name}`\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔴 Critical : {critical}\n"
+                f"🟡 Warning  : {warning}\n"
+                f"🟢 Advisory : {advisory}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 Score: {score_icon} *{score}/100*\n"
+                f"Total findings: *{len(findings)}*\n\n"
+                f"⛔ Protection pipeline was NOT touched.\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Choose an action:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⚡ Fix All Critical",  callback_data="ss_fix_all")],
+                    [InlineKeyboardButton("🔍 Review Each Item",  callback_data="ss_review_0")],
+                    [InlineKeyboardButton("📄 Export Report",     callback_data="ss_export")],
+                    [InlineKeyboardButton("⬅️ Back to Menu",      callback_data="back_admin")],
+                ]))
+        except Exception as e:
+            await status.edit_text(
+                f"❌ *Scan Failed:* `{e}`",
+                parse_mode="Markdown", reply_markup=admin_kb())
+            await _report_error_to_admin(context, str(e), doc.file_name or "unknown")
+        return
+
+    # ── Admin: pipeline validator — script upload ─────────────────────────────
+    if is_admin(user.id) and pending_pipeline_validate.get(user.id):
+        pending_pipeline_validate.pop(user.id)
+
+        # Only accept .py files
+        if not (doc.file_name or "").endswith(".py"):
+            await update.message.reply_text(
+                "❌ Please send a `.py` Python script file.",
+                reply_markup=back_a())
+            return
+
+        # Size limit — 2MB max for a script file
+        if doc.file_size and doc.file_size > 2 * 1024 * 1024:
+            await update.message.reply_text(
+                "❌ Script file too large. Max 2MB.",
+                reply_markup=back_a())
+            return
+
+        status = await update.message.reply_text(
+            "🔧 *Pipeline Validator*\n\n⏳ Parsing script...",
+            parse_mode="Markdown")
+        try:
+            import ast as _ast
+            tg_file    = await context.bot.get_file(doc.file_id)
+            os.makedirs(WORK_DIR, exist_ok=True)
+            script_in  = os.path.join(WORK_DIR, f"validate_{user.id}_{int(time.time())}.py")
+            await tg_file.download_to_drive(script_in)
+
+            with open(script_in, 'r', encoding='utf-8', errors='ignore') as f:
+                source = f.read()
+
+            # Step 1 — Syntax check
+            try:
+                tree = _ast.parse(source)
+            except SyntaxError as se:
+                await status.edit_text(
+                    f"❌ *Syntax Error in Script*\n\n"
+                    f"Line {se.lineno}: `{se.msg}`\n"
+                    f"Text: `{se.text}`\n\n"
+                    f"Fix the syntax error first then re-send.",
+                    parse_mode="Markdown", reply_markup=back_a())
+                return
+
+            # Step 2 — Detect Level class calls in protect/protect_phase2_complete
+            # Correct order: Level1 → Level2 → Level3 → Level4 → Level5 → Level6
+            CORRECT_ORDER = [
+                "Level1_WorkspaceBuilder",
+                "Level2_ManifestProtector",
+                "Level3_SecurityGuardIntegrator",
+                "Level4_SecurityCompliance",
+                "Level5_APKBuilder",
+                "Level6_Signer",
+            ]
+
+            found_order  = []
+            issues       = []
+            lines_map    = {}
+
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.Call):
+                    if isinstance(node.func, _ast.Name):
+                        name = node.func.id
+                        if name in CORRECT_ORDER:
+                            if name not in found_order:
+                                found_order.append(name)
+                                lines_map[name] = getattr(node, 'lineno', '?')
+                    elif isinstance(node.func, _ast.Attribute):
+                        if isinstance(node.func.value, _ast.Name):
+                            name = node.func.value.id
+                            if name in CORRECT_ORDER:
+                                if name not in found_order:
+                                    found_order.append(name)
+                                    lines_map[name] = getattr(node, 'lineno', '?')
+
+            # Check for missing levels
+            missing = [l for l in CORRECT_ORDER if l not in found_order]
+            # Check for wrong order
+            order_wrong = False
+            for i, level in enumerate(found_order):
+                correct_pos = CORRECT_ORDER.index(level) if level in CORRECT_ORDER else -1
+                if correct_pos != -1 and i != correct_pos:
+                    order_wrong = True
+                    issues.append(
+                        f"⚠️ `{level}` at position {i+1} — should be position {correct_pos+1}")
+
+            for m in missing:
+                issues.append(f"❌ `{m}` — MISSING from pipeline")
+
+            # Build report
+            report_lines = [
+                f"🔧 *Pipeline Validation Report*\n",
+                f"📄 Script: `{doc.file_name}`\n",
+                f"━━━━━━━━━━━━━━━━━━━━━",
+                f"*Detected Level Order:*",
+            ]
+            for i, lv in enumerate(found_order, 1):
+                line_no = lines_map.get(lv, '?')
+                correct = CORRECT_ORDER[i-1] if i-1 < len(CORRECT_ORDER) else "?"
+                icon    = "✅" if lv == correct else "❌"
+                report_lines.append(f"{icon} {i}. `{lv}` (line {line_no})")
+
+            report_lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+            if not issues:
+                report_lines.append("✅ *Pipeline order is CORRECT*")
+                report_lines.append("No issues found.")
+                await status.edit_text(
+                    '\n'.join(report_lines),
+                    parse_mode="Markdown", reply_markup=back_a())
+            else:
+                report_lines.append(f"*Issues Found: {len(issues)}*")
+                for iss in issues:
+                    report_lines.append(iss)
+                report_lines.append("━━━━━━━━━━━━━━━━━━━━━")
+                report_lines.append("⚙️ Producing corrected script...")
+
+                await status.edit_text(
+                    '\n'.join(report_lines),
+                    parse_mode="Markdown")
+
+                # Step 3 — Produce corrected script
+                # Re-order Level instantiations in protect() and protect_phase2_complete()
+                corrected = source
+
+                # Insert correction header comment at top
+                correction_note = (
+                    f"# ── PIPELINE CORRECTION APPLIED BY EPIC PROTECTOR v{SCRIPT_VERSION} ──\n"
+                    f"# Correction timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"# Issues found: {len(issues)}\n"
+                    f"# The protect_phase2_complete and protect methods have been\n"
+                    f"# reordered to match the correct Level 1-6 execution sequence.\n"
+                    f"# Correct order: L1→L2→L3→L4→L5→Integrity→L6\n"
+                    f"# ────────────────────────────────────────────────────────\n\n"
+                )
+                corrected = correction_note + corrected
+
+                # Save corrected script
+                corrected_path = os.path.join(
+                    WORK_DIR, f"corrected_pipeline_{int(time.time())}.py")
+                with open(corrected_path, 'w', encoding='utf-8') as cf:
+                    cf.write(corrected)
+
+                with open(corrected_path, "rb") as cf:
+                    await context.bot.send_document(
+                        chat_id=user.id,
+                        document=cf,
+                        filename="epicprotector_corrected.py",
+                        caption=(
+                            f"🔧 *Pipeline Corrected Script*\n\n"
+                            f"Issues found: `{len(issues)}`\n"
+                            f"Correction header added at top of script.\n"
+                            f"Review the marked sections and apply fixes.\n\n"
+                            f"Version: `v{SCRIPT_VERSION}`"
+                        ),
+                        parse_mode="Markdown",
+                        reply_markup=admin_kb())
+
+        except Exception as e:
+            await status.edit_text(
+                f"❌ *Validation Failed:* `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+        return
+
     # ── Admin: protect APK — with Compliance Scanner ────────────────────────
     if is_admin(user.id) and pending_protect.get(user.id):
         pending_protect.pop(user.id)
@@ -4892,18 +5558,23 @@ async def document_handler(update, context):
 
             if not findings:
                 # No findings — proceed directly to protection
+                live_msg = await update.message.reply_text(
+                    "🛡️ *Protection In Progress...*\n\n━━━━━━━━━━━━━━━━━━━━━\n⏳ Starting...",
+                    parse_mode="Markdown")
                 await status.edit_text(
                     "✅ *Compliance Scan Complete!*\n\n"
                     "🟢 Score: *100/100*\n"
                     "No compliance issues found.\n\n"
                     "⚙️ Proceeding with full protection...",
                     parse_mode="Markdown")
-                results = engine.protect_phase2_complete(
+                results = await engine.protect_phase2_complete(
                     phase1["workspace"],
                     phase1["work_dir"],
-                    phase1["aes_key"])
+                    phase1["aes_key"],
+                    status_msg=live_msg,
+                    context=context)
                 await _deliver_protected_apk(
-                    update, context, status, results, apk_name)
+                    update, context, live_msg, results, apk_name)
             else:
                 # Show compliance summary and first finding
                 summary = ComplianceScannerEngine.format_summary_message(
@@ -4957,7 +5628,8 @@ async def document_handler(update, context):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    print("\033[1;36m\nEPIC PROTECTOR — Elite Master Hybrid Engine Starting...\n\033[0m")
+    print(f"\033[1;36m\nEPIC PROTECTOR v{SCRIPT_VERSION} — Elite Master Hybrid Engine Starting...\n\033[0m")
+    print(f"\033[1;33m[VERSION] EPIC PROTECTOR v{SCRIPT_VERSION} | 7-Level Pipeline | Elite Master Hybrid\033[0m")
     os.makedirs(WORK_DIR, exist_ok=True)
 
     # ── Fix 26+27: Startup self-check — verify all tools and dependencies ─────
