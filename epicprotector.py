@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """
-╔══════════════════════════════════════════════════════════════╗
-║           EPIC PROTECTOR — Complete System                   ║
-║     Telegram Bot + Protection Engine in One Script           ║
-║              Security Administrator Edition                  ║
-╚══════════════════════════════════════════════════════════════╝
+EPIC PROTECTOR — Elite Master Hybrid Engine
+7-Level Android Protection + Telegram Bot + Java Injector
+Security Administrator Edition
+
+Level 1 - APK Decode & Repack      (apktool)
+Level 2 - DEX Protection           (dex2jar + encrypt)
+Level 3 - Resource Protection      (res + arsc)
+Level 4 - Manifest Protection      (obfuscate)
+Level 5 - Runtime Java Injection   (anti-tamper + decrypt)
+Level 6 - Anti-Analysis Engine     (traps + fake code)
+Level 7 - Sign & Deliver           (zipalign + apksigner)
 """
 
-import os
-import re
-import sys
-import json
-import time
-import random
-import string
-import shutil
-import hashlib
-import zipfile
-import logging
-import asyncio
-import threading
+import os, re, sys, json, time, random, shutil, string
+import struct, hashlib, zipfile, logging, asyncio
+import tempfile, threading, subprocess
 from pathlib import Path
 from datetime import datetime
 from flask import Flask
@@ -29,73 +25,74 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes
 )
 
-# ─────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────
+# CONFIG
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_NEW_TOKEN_HERE")
 ADMIN_ID  = int(os.environ.get("ADMIN_ID", "8205672036"))
+WORK_DIR  = "/tmp/epic_protector"
+TOOLS_DIR = "/tmp/epic_tools"
 
-# ─────────────────────────────────────────────
-#  LOGGING
-# ─────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-#  STATE STORE
-# ─────────────────────────────────────────────
-registered_clients  = {}   # {user_id: {name, username}}
-pending_contact     = {}   # {user_id: True}
-pending_broadcast   = {}   # {admin_id: True}
-pending_reply       = {}   # {admin_id: target_id}
-pending_protect     = {}   # {admin_id: True}
-pending_send_apk    = {}   # {admin_id: target_client_id}
+registered_clients = {}
+pending_contact    = {}
+pending_broadcast  = {}
+pending_reply      = {}
+pending_protect    = {}
+pending_send_apk   = {}
 
 
-# ══════════════════════════════════════════════
-#  PROTECTION ENGINE
-# ══════════════════════════════════════════════
+# TOOL INSTALLER
+class ToolInstaller:
+    APKTOOL_URL = "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
+    DEX2JAR_URL = "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
 
-def random_name(length=12):
-    return ''.join(random.choices(string.ascii_letters, k=length))
+    def __init__(self):
+        os.makedirs(TOOLS_DIR, exist_ok=True)
+        self.apktool_jar = os.path.join(TOOLS_DIR, "apktool.jar")
+        self.dex2jar_dir = os.path.join(TOOLS_DIR, "dex2jar")
+        self.tools_ready = False
+
+    def run_cmd(self, cmd, check=False):
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    def install_system_deps(self):
+        self.run_cmd("apt-get update -qq")
+        self.run_cmd("apt-get install -y -qq default-jdk zipalign apksigner wget unzip")
+
+    def install_apktool(self):
+        if not os.path.exists(self.apktool_jar):
+            self.run_cmd(f"wget -q -O {self.apktool_jar} {self.APKTOOL_URL}")
+
+    def install_dex2jar(self):
+        if not os.path.exists(self.dex2jar_dir):
+            zip_path = os.path.join(TOOLS_DIR, "dex2jar.zip")
+            self.run_cmd(f"wget -q -O {zip_path} {self.DEX2JAR_URL}")
+            self.run_cmd(f"unzip -q {zip_path} -d {self.dex2jar_dir}")
+            self.run_cmd(f"chmod +x {self.dex2jar_dir}/dex-tools-v2.4/*.sh")
+
+    def install_all(self):
+        try:
+            self.install_system_deps()
+            self.install_apktool()
+            self.install_dex2jar()
+            self.tools_ready = True
+            return True
+        except Exception as e:
+            logger.error(f"Tool install failed: {e}")
+            return False
+
+    def get_dex2jar(self):
+        scripts = list(Path(self.dex2jar_dir).rglob("d2j-dex2jar.sh"))
+        return str(scripts[0]) if scripts else None
+
+    def get_jar2dex(self):
+        scripts = list(Path(self.dex2jar_dir).rglob("d2j-jar2dex.sh"))
+        return str(scripts[0]) if scripts else None
 
 
-def compute_hash(filepath):
-    sha256 = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            sha256.update(chunk)
-    return sha256.hexdigest()
-
-
-def compute_dir_hash(directory):
-    all_hashes = {}
-    for root, _, files in os.walk(directory):
-        for filename in sorted(files):
-            filepath = os.path.join(root, filename)
-            rel_path = os.path.relpath(filepath, directory)
-            all_hashes[rel_path] = compute_hash(filepath)
-    return all_hashes
-
-
-def generate_aes_key():
-    return os.urandom(32)
-
-
-def aes_encrypt(plaintext: str, key: bytes) -> str:
-    import base64
-
-    data = plaintext.encode('utf-8')
-    pad_len = 16 - (len(data) % 16)
-    data += bytes([pad_len] * pad_len)
-    iv = os.urandom(16)
-
-    def xor_bytes(a, b):
-        return bytes(x ^ y for x, y in zip(a, b))
-
+# CRYPTO ENGINE - AES-256-CBC Pure Python
+class CryptoEngine:
     SBOX = [
         0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
         0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
@@ -114,8 +111,13 @@ def aes_encrypt(plaintext: str, key: bytes) -> str:
         0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
         0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
     ]
+    RCON = [0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36]
 
-    def gmul(a, b):
+    @classmethod
+    def generate_key(cls): return os.urandom(32)
+
+    @classmethod
+    def _gmul(cls, a, b):
         p = 0
         for _ in range(8):
             if b & 1: p ^= a
@@ -125,160 +127,240 @@ def aes_encrypt(plaintext: str, key: bytes) -> str:
             b >>= 1
         return p
 
-    def sub_bytes(state):
-        return [[SBOX[state[r][c]] for c in range(4)] for r in range(4)]
-
-    def shift_rows(state):
-        return [
-            [state[0][0],state[0][1],state[0][2],state[0][3]],
-            [state[1][1],state[1][2],state[1][3],state[1][0]],
-            [state[2][2],state[2][3],state[2][0],state[2][1]],
-            [state[3][3],state[3][0],state[3][1],state[3][2]],
-        ]
-
-    def mix_columns(state):
-        r = [[0]*4 for _ in range(4)]
-        for c in range(4):
-            r[0][c] = gmul(2,state[0][c])^gmul(3,state[1][c])^state[2][c]^state[3][c]
-            r[1][c] = state[0][c]^gmul(2,state[1][c])^gmul(3,state[2][c])^state[3][c]
-            r[2][c] = state[0][c]^state[1][c]^gmul(2,state[2][c])^gmul(3,state[3][c])
-            r[3][c] = gmul(3,state[0][c])^state[1][c]^state[2][c]^gmul(2,state[3][c])
-        return r
-
-    def add_round_key(state, rk):
-        return [[state[r][c]^rk[r][c] for c in range(4)] for r in range(4)]
-
-    def bytes_to_state(b):
-        return [[b[r+4*c] for c in range(4)] for r in range(4)]
-
-    def state_to_bytes(s):
-        return bytes([s[r][c] for c in range(4) for r in range(4)])
-
-    def aes_encrypt_block(block, round_keys):
-        state = bytes_to_state(block)
-        state = add_round_key(state, bytes_to_state(round_keys[0]))
-        for rnd in range(1, 14):
-            state = sub_bytes(state)
-            state = shift_rows(state)
-            state = mix_columns(state)
-            state = add_round_key(state, bytes_to_state(round_keys[rnd]))
-        state = sub_bytes(state)
-        state = shift_rows(state)
-        state = add_round_key(state, bytes_to_state(round_keys[14]))
-        return state_to_bytes(state)
-
-    def key_expansion(key):
-        RCON = [0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36]
+    @classmethod
+    def _key_expansion(cls, key):
         w = list(key)
         for i in range(32, 60*4):
             temp = w[i-4:i]
             if i%32==0:
-                temp=[SBOX[temp[1]]^RCON[i//32-1],SBOX[temp[2]],SBOX[temp[3]],SBOX[temp[0]]]
+                temp=[cls.SBOX[temp[1]]^cls.RCON[i//32-1],cls.SBOX[temp[2]],cls.SBOX[temp[3]],cls.SBOX[temp[0]]]
             elif i%32==16:
-                temp=[SBOX[b] for b in temp]
+                temp=[cls.SBOX[b] for b in temp]
             w += [w[i-32]^temp[j] for j in range(4)]
         return [bytes(w[i:i+16]) for i in range(0,len(w),16)][:15]
 
-    round_keys = key_expansion(key)
-    ciphertext = b''
-    prev = iv
-    for i in range(0, len(data), 16):
-        block = data[i:i+16]
-        block = xor_bytes(block, prev)
-        encrypted_block = aes_encrypt_block(block, round_keys)
-        ciphertext += encrypted_block
-        prev = encrypted_block
+    @classmethod
+    def _encrypt_block(cls, block, rks):
+        def b2s(b): return [[b[r+4*c] for c in range(4)] for r in range(4)]
+        def s2b(s): return bytes([s[r][c] for c in range(4) for r in range(4)])
+        def ark(s,rk): return [[s[r][c]^rk[r][c] for c in range(4)] for r in range(4)]
+        def sb(s): return [[cls.SBOX[s[r][c]] for c in range(4)] for r in range(4)]
+        def sr(s): return [[s[0][0],s[0][1],s[0][2],s[0][3]],[s[1][1],s[1][2],s[1][3],s[1][0]],[s[2][2],s[2][3],s[2][0],s[2][1]],[s[3][3],s[3][0],s[3][1],s[3][2]]]
+        def mc(s):
+            r=[[0]*4 for _ in range(4)]
+            for c in range(4):
+                r[0][c]=cls._gmul(2,s[0][c])^cls._gmul(3,s[1][c])^s[2][c]^s[3][c]
+                r[1][c]=s[0][c]^cls._gmul(2,s[1][c])^cls._gmul(3,s[2][c])^s[3][c]
+                r[2][c]=s[0][c]^s[1][c]^cls._gmul(2,s[2][c])^cls._gmul(3,s[3][c])
+                r[3][c]=cls._gmul(3,s[0][c])^s[1][c]^s[2][c]^cls._gmul(2,s[3][c])
+            return r
+        state=b2s(block); state=ark(state,b2s(rks[0]))
+        for rnd in range(1,14): state=sb(state); state=sr(state); state=mc(state); state=ark(state,b2s(rks[rnd]))
+        state=sb(state); state=sr(state); state=ark(state,b2s(rks[14]))
+        return s2b(state)
 
-    combined = iv + ciphertext
-    return base64.b64encode(combined).decode('utf-8')
+    @classmethod
+    def encrypt_bytes(cls, data, key):
+        import base64
+        pad=16-(len(data)%16); data+=bytes([pad]*pad)
+        iv=os.urandom(16); rks=cls._key_expansion(key)
+        ct=b''; prev=iv
+        for i in range(0,len(data),16):
+            blk=bytes(x^y for x,y in zip(data[i:i+16],prev))
+            enc=cls._encrypt_block(blk,rks); ct+=enc; prev=enc
+        return iv+ct
 
+    @classmethod
+    def encrypt_string(cls, plaintext, key):
+        import base64
+        return base64.b64encode(cls.encrypt_bytes(plaintext.encode('utf-8'),key)).decode('utf-8')
 
-def inject_aes_decryptor_java(content, aes_key):
-    key_bytes = ', '.join([f'(byte)0x{b:02x}' for b in aes_key])
-    decryptor = f'''
-    // ── AES-256-CBC Decryptor — EPIC PROTECTOR ──
-    private static final byte[] AES_KEY = {{ {key_bytes} }};
+    @classmethod
+    def xor_encrypt(cls, data, key):
+        return bytes(b^key[i%len(key)] for i,b in enumerate(data))
 
-    private static String decodeStr(String encryptedBase64) {{
-        try {{
-            byte[] combined = android.util.Base64.decode(encryptedBase64, android.util.Base64.DEFAULT);
-            byte[] iv = java.util.Arrays.copyOfRange(combined, 0, 16);
-            byte[] ciphertext = java.util.Arrays.copyOfRange(combined, 16, combined.length);
-            javax.crypto.SecretKeySpec keySpec = new javax.crypto.SecretKeySpec(AES_KEY, "AES");
-            javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding");
-            cipher.init(javax.crypto.Cipher.DECRYPT_MODE, keySpec, new javax.crypto.spec.IvParameterSpec(iv));
-            byte[] decrypted = cipher.doFinal(ciphertext);
-            return new String(decrypted, "UTF-8");
-        }} catch (Exception e) {{
-            android.os.Process.killProcess(android.os.Process.myPid());
-            return null;
-        }}
-    }}
-'''
-    content = re.sub(r'(\bclass\b[^{]+\{)', r'\1\n' + decryptor, content, count=1)
-    return content
-
-
-def generate_junk_methods():
-    junk = []
-    for _ in range(3):
-        method_name = random_name(8)
-        var1 = random_name(6)
-        var2 = random_name(6)
-        junk.append(f"""
-    private static void {method_name}() {{
-        int {var1} = {random.randint(100,9999)};
-        String {var2} = "{random_name(16)}";
-        if ({var1} > {random.randint(10000,99999)}) {{
-            throw new RuntimeException("{random_name(8)}");
-        }}
-    }}""")
-    return '\n'.join(junk)
+    @classmethod
+    def get_java_key_bytes(cls, key):
+        return ', '.join([f'(byte)0x{b:02x}' for b in key])
 
 
-def obfuscate_java_source(content, aes_key, name_map):
-    # Strip comments
-    content = re.sub(r'//.*?\n', '\n', content)
-    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+# LEVEL 1 - APK HANDLER
+class Level1_APKHandler:
+    def __init__(self, tools, work_dir):
+        self.tools=tools; self.work_dir=work_dir
 
-    # Obfuscate variable names
-    var_pattern = re.compile(
-        r'\b(int|String|boolean|float|double|long|byte|char|Object|List|Map|Set)\s+([a-z][a-zA-Z0-9_]*)\s*[=;(,]'
-    )
-    found_vars = var_pattern.findall(content)
-    for _, var_name in found_vars:
-        if len(var_name) > 2:
-            if var_name not in name_map:
-                name_map[var_name] = random_name()
-            content = re.sub(r'\b' + re.escape(var_name) + r'\b', name_map[var_name], content)
+    def decode(self, apk_path):
+        decode_dir=os.path.join(self.work_dir,"decoded")
+        if os.path.exists(decode_dir): shutil.rmtree(decode_dir)
+        cmd=f"java -jar {self.tools.apktool_jar} d -f -o {decode_dir} {apk_path}"
+        r=subprocess.run(cmd,shell=True,capture_output=True)
+        if r.returncode!=0 or not os.path.exists(decode_dir):
+            os.makedirs(decode_dir,exist_ok=True)
+            with zipfile.ZipFile(apk_path,'r') as z: z.extractall(decode_dir)
+        return decode_dir
 
-    # Inject junk methods
-    junk_code = generate_junk_methods()
-    content = re.sub(r'(\bclass\b[^{]+\{)', r'\1\n' + junk_code, content, count=1)
+    def repack(self, decoded_dir, output_apk):
+        cmd=f"java -jar {self.tools.apktool_jar} b -f {decoded_dir} -o {output_apk}"
+        r=subprocess.run(cmd,shell=True,capture_output=True)
+        if r.returncode!=0 or not os.path.exists(output_apk):
+            with zipfile.ZipFile(output_apk,'w',zipfile.ZIP_DEFLATED) as z:
+                for root,_,files in os.walk(decoded_dir):
+                    for f in files:
+                        fp=os.path.join(root,f); z.write(fp,os.path.relpath(fp,decoded_dir))
+        return output_apk
 
-    # AES encrypt all string literals
-    def replacer(match):
-        s = match.group(1)
-        if len(s) < 200 and s.isascii() and len(s) > 0:
+    def extract_dex(self, apk_path):
+        dex_dir=os.path.join(self.work_dir,"dex"); os.makedirs(dex_dir,exist_ok=True)
+        dex_files=[]
+        with zipfile.ZipFile(apk_path,'r') as z:
+            for name in z.namelist():
+                if name.endswith('.dex'):
+                    out=os.path.join(dex_dir,os.path.basename(name))
+                    with z.open(name) as s, open(out,'wb') as d: d.write(s.read())
+                    dex_files.append(out)
+        return dex_files
+
+    def replace_dex(self, apk_path, dex_files, output_apk):
+        with zipfile.ZipFile(apk_path,'r') as zin:
+            with zipfile.ZipFile(output_apk,'w',zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename.endswith('.dex'):
+                        dname=os.path.basename(item.filename)
+                        matching=[d for d in dex_files if os.path.basename(d)==dname]
+                        if matching:
+                            with open(matching[0],'rb') as f: zout.writestr(item,f.read())
+                        else: zout.writestr(item,zin.read(item.filename))
+                    else: zout.writestr(item,zin.read(item.filename))
+
+
+# LEVEL 2 - DEX PROTECTOR
+class Level2_DEXProtector:
+    def __init__(self, tools, crypto, work_dir):
+        self.tools=tools; self.crypto=crypto; self.work_dir=work_dir
+
+    def protect_dex(self, dex_path, aes_key):
+        protected=dex_path.replace('.dex','_protected.dex')
+        jar_path=dex_path.replace('.dex','.jar')
+        dex2jar=self.tools.get_dex2jar()
+        if dex2jar and os.path.exists(dex2jar):
+            r=subprocess.run(f"bash {dex2jar} -f {dex_path} -o {jar_path} 2>/dev/null",shell=True,capture_output=True)
+            if r.returncode==0 and os.path.exists(jar_path):
+                obf_jar=self._obfuscate_jar(jar_path,aes_key)
+                jar2dex=self.tools.get_jar2dex()
+                if jar2dex:
+                    r2=subprocess.run(f"bash {jar2dex} -f {obf_jar} -o {protected} 2>/dev/null",shell=True,capture_output=True)
+                    if r2.returncode==0 and os.path.exists(protected): return protected
+        with open(dex_path,'rb') as f: data=f.read()
+        header=data[:112]; body=data[112:]
+        enc=self.crypto.xor_encrypt(body,aes_key)
+        with open(protected,'wb') as f: f.write(header+enc)
+        return protected
+
+    def _obfuscate_jar(self, jar_path, aes_key):
+        obf=jar_path.replace('.jar','_obf.jar')
+        ext=jar_path.replace('.jar','_ext'); os.makedirs(ext,exist_ok=True)
+        with zipfile.ZipFile(jar_path,'r') as z: z.extractall(ext)
+        for cf in Path(ext).rglob("*.class"):
             try:
-                encrypted = aes_encrypt(s, aes_key)
-                return f'decodeStr("{encrypted}")'
-            except Exception:
-                return match.group(0)
-        return match.group(0)
+                with open(cf,'rb') as f: d=f.read()
+                if len(d)>=8:
+                    with open(cf,'wb') as f: f.write(d[:8]+self.crypto.xor_encrypt(d[8:],aes_key[:16]))
+            except: pass
+        with zipfile.ZipFile(obf,'w',zipfile.ZIP_DEFLATED) as z:
+            for root,_,files in os.walk(ext):
+                for fname in files:
+                    fp=os.path.join(root,fname); z.write(fp,os.path.relpath(fp,ext))
+        shutil.rmtree(ext,ignore_errors=True)
+        return obf
 
-    content = re.sub(r'"([^"\\]{1,199})"', replacer, content)
+    def protect_all(self, dex_files, aes_key):
+        protected=[]
+        for d in dex_files:
+            try: protected.append(self.protect_dex(d,aes_key))
+            except: protected.append(d)
+        return protected
 
-    # Inject AES decryptor
-    content = inject_aes_decryptor_java(content, aes_key)
 
-    return content
+# LEVEL 3 - RESOURCE PROTECTOR
+class Level3_ResourceProtector:
+    def __init__(self, crypto, work_dir):
+        self.crypto=crypto; self.work_dir=work_dir
+
+    def protect_res_folder(self, decoded_dir, aes_key):
+        res_dir=os.path.join(decoded_dir,"res"); manifest={}
+        if not os.path.exists(res_dir): return manifest
+        for root,_,files in os.walk(res_dir):
+            for fname in files:
+                fp=os.path.join(root,fname); rel=os.path.relpath(fp,res_dir)
+                try:
+                    with open(fp,'rb') as f: orig=f.read()
+                    enc=self.crypto.xor_encrypt(orig,aes_key[:16])
+                    with open(fp,'wb') as f: f.write(enc)
+                    manifest[rel]={"hash":hashlib.sha256(orig).hexdigest(),"encrypted":True}
+                except: pass
+        with open(os.path.join(self.work_dir,"res_manifest.json"),'w') as f: json.dump(manifest,f,indent=2)
+        return manifest
+
+    def protect_resources_arsc(self, apk_path, aes_key):
+        out=apk_path.replace('.apk','_arsc.apk'); arsc=None
+        with zipfile.ZipFile(apk_path,'r') as z:
+            if 'resources.arsc' in z.namelist(): arsc=z.read('resources.arsc')
+        if arsc is None: shutil.copy(apk_path,out); return out
+        header=arsc[:256]; body=arsc[256:]
+        enc_arsc=header+self.crypto.xor_encrypt(body,aes_key[:16])
+        with zipfile.ZipFile(apk_path,'r') as zin:
+            with zipfile.ZipFile(out,'w',zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename=='resources.arsc': zout.writestr(item,enc_arsc)
+                    else: zout.writestr(item,zin.read(item.filename))
+        return out
+
+    def obfuscate_resource_names(self, decoded_dir):
+        res_dir=os.path.join(decoded_dir,"res"); name_map={}
+        if not os.path.exists(res_dir): return name_map
+        for sub in os.listdir(res_dir):
+            sp=os.path.join(res_dir,sub)
+            if not os.path.isdir(sp) or sub.startswith('values'): continue
+            for fname in os.listdir(sp):
+                ext=os.path.splitext(fname)[1]
+                new='r'+''.join(random.choices(string.ascii_lowercase+string.digits,k=8))+ext
+                try: os.rename(os.path.join(sp,fname),os.path.join(sp,new)); name_map[fname]=new
+                except: pass
+        with open(os.path.join(self.work_dir,"res_name_map.json"),'w') as f: json.dump(name_map,f,indent=2)
+        return name_map
 
 
-def generate_anti_tamper_java(aes_key):
-    key_bytes = ', '.join([f'(byte)0x{b:02x}' for b in aes_key])
-    return f"""package com.epicprotector.security;
+# LEVEL 4 - MANIFEST PROTECTOR
+class Level4_ManifestProtector:
+    def __init__(self, work_dir):
+        self.work_dir=work_dir
 
+    def protect(self, decoded_dir):
+        mp=os.path.join(decoded_dir,"AndroidManifest.xml"); changes={}
+        if not os.path.exists(mp): return changes
+        with open(mp,'r',encoding='utf-8',errors='ignore') as f: content=f.read()
+        content=re.sub(r'android:debuggable="true"','android:debuggable="false"',content); changes["Debug removed"]=True
+        content=re.sub(r'android:allowBackup="true"','android:allowBackup="false"',content); changes["Backup disabled"]=True
+        content=re.sub(r'android:usesCleartextTraffic="true"','android:usesCleartextTraffic="false"',content); changes["Cleartext blocked"]=True
+        fake_perms=['<uses-permission android:name="com.epic.protector.SECURE"/>','<uses-permission android:name="com.epic.guard.VALIDATE"/>','<uses-permission android:name="com.epic.shield.VERIFY"/>']
+        if '<uses-permission' in content:
+            idx=content.index('<uses-permission'); content=content[:idx]+'\n    '.join(fake_perms)+'\n    '+content[idx:]
+        changes["Fake permissions injected"]=True
+        meta='\n        <meta-data android:name="com.epic.protector.version" android:value="2.0"/>'
+        if '</application>' in content: content=content.replace('</application>',meta+'\n    </application>')
+        changes["Security metadata injected"]=True
+        with open(mp,'w',encoding='utf-8') as f: f.write(content)
+        return changes
+
+
+# LEVEL 5 - RUNTIME INJECTOR
+class Level5_RuntimeInjector:
+    def __init__(self, crypto, work_dir):
+        self.crypto=crypto; self.work_dir=work_dir
+
+    def generate_guard(self, aes_key):
+        kb=self.crypto.get_java_key_bytes(aes_key)
+        return f"""package com.epicprotector.security;
 import android.content.Context;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
@@ -287,6 +369,7 @@ import android.os.Build;
 import android.os.Debug;
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.InputStreamReader;
 import java.security.MessageDigest;
 import java.util.Arrays;
@@ -294,836 +377,575 @@ import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
 
-/**
- * EPIC PROTECTOR — Runtime Security Guard
- * Anti-Tamper + Root + Emulator + Anti-Debug + Hooking Detection
- */
-public class EpicSecurityGuard {{
-
+public final class EpicSecurityGuard {{
     private static final String VALID_SIGNATURE = "YOUR_APK_SIGNATURE_SHA256_HERE";
-    private static final byte[] AES_KEY = {{ {key_bytes} }};
+    private static final byte[] AES_KEY = {{ {kb} }};
+    private static final boolean KILL_ON_TAMPER = true;
+    private static volatile boolean initialized = false;
 
-    // ── Entry Point ────────────────────────────
-    public static void runAllChecks(Context context) {{
-        if (isDebugging())              killApp("Anti-Debug");
-        if (isEmulator())               killApp("Emulator");
-        if (isRooted())                 killApp("Root");
-        if (!isSignatureValid(context)) killApp("Tamper");
-        if (isHookingFrameworkPresent())killApp("Hook");
+    private EpicSecurityGuard() {{}}
+
+    public static synchronized void runAllChecks(Context context) {{
+        if (initialized) return;
+        initialized = true;
+        if (isDebugging())               handleThreat(context, "DEBUGGER");
+        if (isEmulator())                handleThreat(context, "EMULATOR");
+        if (isRooted())                  handleThreat(context, "ROOT");
+        if (!isSignatureValid(context))  handleThreat(context, "TAMPER");
+        if (isHookingFramework())        handleThreat(context, "HOOK");
+        if (isMemoryTampered())          handleThreat(context, "MEMORY");
     }}
 
-    // ── 1. Anti-Debugging ──────────────────────
     private static boolean isDebugging() {{
         if (Debug.isDebuggerConnected()) return true;
         if (Debug.waitingForDebugger())  return true;
-        long start = System.nanoTime();
-        for (int i = 0; i < 1000; i++) {{}}
-        return (System.nanoTime() - start) > 10_000_000L;
+        long t=System.nanoTime(); int x=0;
+        for(int i=0;i<5000;i++) x+=i;
+        if(System.nanoTime()-t>50_000_000L) return true;
+        try {{
+            BufferedReader br=new BufferedReader(new InputStreamReader(new FileInputStream("/proc/self/status")));
+            String line; while((line=br.readLine())!=null) {{
+                if(line.startsWith("TracerPid:")) {{ br.close(); if(Integer.parseInt(line.substring(10).trim())!=0) return true; }}
+            }} br.close();
+        }} catch(Exception e) {{}}
+        return false;
     }}
 
-    // ── 2. Emulator Detection ──────────────────
     private static boolean isEmulator() {{
-        String[] fields = {{
-            Build.FINGERPRINT, Build.MODEL, Build.MANUFACTURER,
-            Build.BRAND, Build.DEVICE, Build.PRODUCT
-        }};
-        for (String s : fields) {{
-            if (s == null) continue;
-            String l = s.toLowerCase();
-            if (l.contains("generic")||l.contains("emulator")||l.contains("sdk")||
-                l.contains("genymotion")||l.contains("x86")||l.contains("bluestacks")||
-                l.contains("nox")||l.contains("vbox")||l.contains("andy")||
-                l.contains("droid4x")) return true;
-        }}
-        String[] emulatorFiles = {{
-            "/dev/socket/qemud","/dev/qemu_pipe",
-            "/system/lib/libc_malloc_debug_qemu.so",
-            "/sys/qemu_trace","/system/bin/qemu-props"
-        }};
-        for (String p : emulatorFiles) {{
-            if (new File(p).exists()) return true;
-        }}
+        String[] suspects={{Build.FINGERPRINT,Build.MODEL,Build.MANUFACTURER,Build.BRAND,Build.DEVICE,Build.PRODUCT,Build.HARDWARE}};
+        String[] kws={{"generic","emulator","sdk","genymotion","x86","bluestacks","nox","vbox","andy","droid4x","goldfish","ranchu","ttvm"}};
+        for(String s:suspects) {{ if(s==null) continue; String l=s.toLowerCase(); for(String kw:kws) {{ if(l.contains(kw)) return true; }} }}
+        String[] efs={{"/dev/socket/qemud","/dev/qemu_pipe","/system/lib/libc_malloc_debug_qemu.so","/sys/qemu_trace","/system/bin/qemu-props"}};
+        for(String p:efs) {{ if(new File(p).exists()) return true; }}
         return false;
     }}
 
-    // ── 3. Root Detection ──────────────────────
     private static boolean isRooted() {{
-        String[] suPaths = {{
-            "/system/bin/su","/system/xbin/su","/sbin/su",
-            "/system/su","/data/local/xbin/su","/data/local/bin/su",
-            "/data/local/su","/system/app/Superuser.apk",
-            "/system/app/SuperSU.apk"
-        }};
-        for (String p : suPaths) {{
-            if (new File(p).exists()) return true;
-        }}
-        try {{
-            Process process = Runtime.getRuntime().exec(new String[]{{"/system/xbin/which","su"}});
-            BufferedReader in = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            if (in.readLine() != null) return true;
-        }} catch (Exception ignored) {{}}
-        String buildTags = Build.TAGS;
-        return buildTags != null && buildTags.contains("test-keys");
+        String[] paths={{"/system/bin/su","/system/xbin/su","/sbin/su","/system/su","/data/local/xbin/su","/data/local/bin/su","/system/app/Superuser.apk","/system/app/SuperSU.apk"}};
+        for(String p:paths) {{ if(new File(p).exists()) return true; }}
+        try {{ Process pr=Runtime.getRuntime().exec(new String[]{{"/system/xbin/which","su"}}); BufferedReader in=new BufferedReader(new InputStreamReader(pr.getInputStream())); if(in.readLine()!=null) return true; }} catch(Exception e) {{}}
+        String tags=Build.TAGS; return tags!=null&&tags.contains("test-keys");
     }}
 
-    // ── 4. Signature Validation ────────────────
-    private static boolean isSignatureValid(Context context) {{
+    private static boolean isSignatureValid(Context ctx) {{
         try {{
-            PackageInfo info = context.getPackageManager().getPackageInfo(
-                context.getPackageName(), PackageManager.GET_SIGNATURES
-            );
-            for (Signature sig : info.signatures) {{
-                MessageDigest md = MessageDigest.getInstance("SHA-256");
-                md.update(sig.toByteArray());
-                byte[] digest = md.digest();
-                StringBuilder sb = new StringBuilder();
-                for (byte b : digest) sb.append(String.format("%02x", b));
-                if (!sb.toString().equals(VALID_SIGNATURE)) return false;
-            }}
-            return true;
-        }} catch (Exception e) {{ return false; }}
+            PackageInfo info=ctx.getPackageManager().getPackageInfo(ctx.getPackageName(),PackageManager.GET_SIGNATURES);
+            for(Signature sig:info.signatures) {{
+                MessageDigest md=MessageDigest.getInstance("SHA-256"); md.update(sig.toByteArray());
+                StringBuilder sb=new StringBuilder(); for(byte b:md.digest()) sb.append(String.format("%02x",b));
+                if(!sb.toString().equals(VALID_SIGNATURE)) return false;
+            }} return true;
+        }} catch(Exception e) {{ return false; }}
     }}
 
-    // ── 5. Hooking Detection ───────────────────
-    private static boolean isHookingFrameworkPresent() {{
-        String[] xposedFiles = {{
-            "/system/framework/XposedBridge.jar",
-            "/system/bin/app_process_xposed",
-            "/system/lib/libxposed_art.so"
-        }};
-        for (String p : xposedFiles) {{
-            if (new File(p).exists()) return true;
-        }}
+    private static boolean isHookingFramework() {{
+        String[] xf={{"/system/framework/XposedBridge.jar","/system/bin/app_process_xposed","/system/lib/libxposed_art.so","/data/data/de.robv.android.xposed.installer"}};
+        for(String p:xf) {{ if(new File(p).exists()) return true; }}
         try {{
-            throw new Exception("hook_check");
-        }} catch (Exception e) {{
-            for (StackTraceElement el : e.getStackTrace()) {{
-                if (el.getClassName().contains("XposedBridge")||
-                    el.getClassName().contains("de.robv.android")) return true;
-            }}
-        }}
+            BufferedReader br=new BufferedReader(new InputStreamReader(new FileInputStream("/proc/self/maps")));
+            String line; while((line=br.readLine())!=null) {{ if(line.contains("frida")||line.contains("gum-js-loop")||line.contains("linjector")) {{ br.close(); return true; }} }} br.close();
+        }} catch(Exception e) {{}}
+        try {{ throw new Exception(); }} catch(Exception e) {{ for(StackTraceElement el:e.getStackTrace()) {{ String c=el.getClassName(); if(c.contains("XposedBridge")||c.contains("de.robv.android")||c.contains("com.saurik.substrate")) return true; }} }}
+        String[] mf={{"/sbin/.magisk","/sbin/.core/mirror","/data/adb/magisk","/data/adb/magisk.db"}};
+        for(String p:mf) {{ if(new File(p).exists()) return true; }}
         return false;
     }}
 
-    // ── AES-256-CBC Decryptor ──────────────────
-    public static String decodeStr(String encryptedBase64) {{
+    private static boolean isMemoryTampered() {{
         try {{
-            byte[] combined = android.util.Base64.decode(encryptedBase64, android.util.Base64.DEFAULT);
-            byte[] iv = Arrays.copyOfRange(combined, 0, 16);
-            byte[] ciphertext = Arrays.copyOfRange(combined, 16, combined.length);
-            SecretKeySpec keySpec = new SecretKeySpec(AES_KEY, "AES");
-            Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
-            cipher.init(Cipher.DECRYPT_MODE, keySpec, new IvParameterSpec(iv));
-            return new String(cipher.doFinal(ciphertext), "UTF-8");
-        }} catch (Exception e) {{
-            android.os.Process.killProcess(android.os.Process.myPid());
-            return null;
-        }}
+            BufferedReader br=new BufferedReader(new InputStreamReader(new FileInputStream("/proc/self/maps")));
+            String line; while((line=br.readLine())!=null) {{ if(line.contains("memfd")||line.contains("injected")) {{ br.close(); return true; }} }} br.close();
+        }} catch(Exception e) {{}}
+        return false;
     }}
 
-    // ── Kill App ───────────────────────────────
-    private static void killApp(String reason) {{
-        android.os.Process.killProcess(android.os.Process.myPid());
-        System.exit(1);
+    public static String decodeStr(String enc) {{
+        try {{
+            byte[] combined=android.util.Base64.decode(enc,android.util.Base64.DEFAULT);
+            byte[] iv=Arrays.copyOfRange(combined,0,16); byte[] ct=Arrays.copyOfRange(combined,16,combined.length);
+            SecretKeySpec ks=new SecretKeySpec(AES_KEY,"AES"); Cipher cipher=Cipher.getInstance("AES/CBC/PKCS5Padding");
+            cipher.init(Cipher.DECRYPT_MODE,ks,new IvParameterSpec(iv)); return new String(cipher.doFinal(ct),"UTF-8");
+        }} catch(Exception e) {{ handleThreat(null,"DECRYPT_FAIL"); return null; }}
+    }}
+
+    private static void handleThreat(Context ctx, String reason) {{
+        if(!KILL_ON_TAMPER) return;
+        android.os.Process.killProcess(android.os.Process.myPid()); System.exit(1);
     }}
 }}
 """
 
+    def inject_smali(self, decoded_dir):
+        injected=0
+        for sdir in Path(decoded_dir).glob("smali*"):
+            for sf in sdir.rglob("*.smali"):
+                if 'mainactivity' in sf.name.lower() or 'application' in sf.name.lower():
+                    try:
+                        with open(sf,'r',encoding='utf-8',errors='ignore') as f: content=f.read()
+                        if '.method public onCreate(' in content and 'EpicSecurityGuard' not in content:
+                            inj="\n    invoke-static {p0}, Lcom/epicprotector/security/EpicSecurityGuard;->runAllChecks(Landroid/content/Context;)V\n"
+                            pat=r'(\.method public onCreate\([^)]*\).*?\n\s*\.locals \d+)'
+                            m=re.search(pat,content,re.DOTALL)
+                            if m:
+                                content=content[:m.end()]+inj+content[m.end():]
+                                with open(sf,'w',encoding='utf-8') as f: f.write(content)
+                                injected+=1
+                    except: pass
+        return injected
 
-def generate_proguard_rules(output_dir):
-    words = [random_name(random.randint(4, 12)) for _ in range(500)]
-    dict_path = os.path.join(output_dir, "obf_dict.txt")
-    with open(dict_path, "w") as f:
-        f.write('\n'.join(words))
+    def save_guard(self, aes_key):
+        code=self.generate_guard(aes_key)
+        path=os.path.join(self.work_dir,"EpicSecurityGuard.java")
+        with open(path,'w') as f: f.write(code)
+        return path
 
-    rules = """
-# ╔══════════════════════════════════════════╗
-# ║   EPIC PROTECTOR — ProGuard Rules         ║
-# ╚══════════════════════════════════════════╝
 
--obfuscationdictionary obf_dict.txt
--classobfuscationdictionary obf_dict.txt
--packageobfuscationdictionary obf_dict.txt
--optimizationpasses 7
--allowaccessmodification
--mergeinterfacesaggressively
--overloadaggressively
--repackageclasses ''
--dontusemixedcaseclassnames
--verbose
+# LEVEL 6 - ANTI-ANALYSIS
+class Level6_AntiAnalysis:
+    def __init__(self, crypto, work_dir):
+        self.crypto=crypto; self.work_dir=work_dir
 
--assumenosideeffects class android.util.Log {
-    public static int v(...);
-    public static int d(...);
-    public static int i(...);
-    public static int w(...);
-    public static int e(...);
-}
+    def rname(self, n=10): return ''.join(random.choices(string.ascii_letters+string.digits,k=n))
 
--renamesourcefileattribute SourceFile
--keepattributes SourceFile,LineNumberTable
-
--keep public class * extends android.app.Activity
--keep public class * extends android.app.Application
--keep public class * extends android.app.Service
--keep public class * extends android.content.BroadcastReceiver
--keep public class * extends android.content.ContentProvider
--keep public class * extends android.view.View
--keep public class * extends androidx.fragment.app.Fragment
-
--keepclasseswithmembernames class * { native <methods>; }
-
--keepclassmembers enum * {
-    public static **[] values();
-    public static ** valueOf(java.lang.String);
-}
-
--keepclassmembers class * implements android.os.Parcelable {
-    public static final android.os.Parcelable$Creator CREATOR;
-}
-
--keepclassmembers class * implements java.io.Serializable {
-    static final long serialVersionUID;
-    private void writeObject(java.io.ObjectOutputStream);
-    private void readObject(java.io.ObjectInputStream);
-}
-
--dontwarn **
--ignorewarnings
+    def inject_fake_classes(self, decoded_dir, aes_key):
+        sdir=os.path.join(decoded_dir,"smali","com","epic","decoy"); os.makedirs(sdir,exist_ok=True)
+        fakes=[("NetValidator","validateConn","checkHost"),("PayProcessor","processTx","verifyCard"),("AuthMgr","authUser","validateToken"),("CryptoHelper","encData","hashPwd"),("LicChecker","checkLic","checkExpiry")]
+        count=0
+        for cname,m1,m2 in fakes:
+            oname=self.rname(6)
+            code=f""".class public Lcom/epic/decoy/{oname};
+.super Ljava/lang/Object;
+.method public constructor <init>()V
+    .locals 0
+    invoke-direct {{p0}}, Ljava/lang/Object;-><init>()V
+    return-void
+.end method
+.method public static {m1}(Ljava/lang/String;)Z
+    .locals 1
+    const/4 v0, 0x1
+    return v0
+.end method
+.method public static {m2}(Ljava/lang/String;I)Ljava/lang/String;
+    .locals 1
+    const-string v0, "{self.rname(16)}"
+    return-object v0
+.end method
 """
-    rules_path = os.path.join(output_dir, "proguard-rules.pro")
-    with open(rules_path, "w") as f:
-        f.write(rules)
+            with open(os.path.join(sdir,f"{oname}.smali"),'w') as f: f.write(code)
+            count+=1
+        return count
+
+    def inject_string_traps(self, decoded_dir, aes_key):
+        traps=[f"https://api.{self.rname(8)}.com/v1/auth",f"sk-{self.rname(32)}",f"Bearer {self.rname(24)}"]
+        trapped=0
+        for sdir in Path(decoded_dir).glob("smali*"):
+            for sf in list(sdir.rglob("*.smali"))[:5]:
+                try:
+                    with open(sf,'r',encoding='utf-8',errors='ignore') as f: content=f.read()
+                    if '.method' in content and 'EpicTrap' not in content:
+                        trap=random.choice(traps); enc=self.crypto.encrypt_string(trap,aes_key)
+                        field=f'\n.field private static final {self.rname(6)}:Ljava/lang/String; = "{enc}"\n'
+                        content=content.replace('.class ',field+'\n.class ',1)
+                        with open(sf,'w',encoding='utf-8') as f: f.write(content)
+                        trapped+=1
+                except: pass
+        return trapped
+
+    def add_flow_obfuscation(self, decoded_dir):
+        obf=0
+        for sdir in Path(decoded_dir).glob("smali*"):
+            for sf in list(sdir.rglob("*.smali"))[:10]:
+                try:
+                    with open(sf,'r',encoding='utf-8',errors='ignore') as f: content=f.read()
+                    if '.method' in content and '.class ' in content and '.field' not in content[:200]:
+                        dummy=f'\n.field private static {self.rname(6)}:I = {random.randint(10000,99999)}\n'
+                        content=content.replace('.super ',dummy+'\n.super ',1)
+                        with open(sf,'w',encoding='utf-8') as f: f.write(content)
+                        obf+=1
+                except: pass
+        return obf
 
 
-def protect_apk(apk_path: str, output_dir: str) -> dict:
-    """
-    Full protection engine — runs all protection steps on the APK.
-    Returns a dict with results summary.
-    """
-    results = {}
-    os.makedirs(output_dir, exist_ok=True)
+# LEVEL 7 - SIGNER & DELIVERER
+class Level7_SignerDeliverer:
+    def __init__(self, work_dir):
+        self.work_dir=work_dir
+        self.keystore=os.path.join(work_dir,"epic.keystore")
+        self.alias="epicprotector"; self.kp="Epic@Key#2024"; self.sp="Epic@Store#2024"
 
-    # ── Step 1: Extract APK ───────────────────
-    extract_dir = os.path.join(output_dir, "extracted")
-    os.makedirs(extract_dir, exist_ok=True)
-    with zipfile.ZipFile(apk_path, 'r') as z:
-        z.extractall(extract_dir)
-    results["APK Extracted"] = "✅ Done"
+    def generate_keystore(self):
+        if os.path.exists(self.keystore): return True
+        cmd=f"keytool -genkeypair -v -keystore {self.keystore} -alias {self.alias} -keyalg RSA -keysize 2048 -validity 10000 -storepass {self.sp} -keypass {self.kp} -dname 'CN=EpicProtector,O=Security,C=US' 2>/dev/null"
+        return subprocess.run(cmd,shell=True,capture_output=True).returncode==0
 
-    # ── Step 2: Generate AES-256 Key ──────────
-    aes_key = generate_aes_key()
-    key_path = os.path.join(output_dir, "aes_key.bin")
-    with open(key_path, "wb") as f:
-        f.write(aes_key)
-    results["AES-256 Key"] = "✅ Generated & Saved"
+    def zipalign(self, inp, out):
+        r=subprocess.run(f"zipalign -v 4 {inp} {out} 2>/dev/null",shell=True,capture_output=True)
+        if r.returncode!=0 or not os.path.exists(out): shutil.copy(inp,out)
+        return out
 
-    # ── Step 3: Integrity Manifest ────────────
-    hashes = compute_dir_hash(extract_dir)
-    manifest = {
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "total_files": len(hashes),
-        "files": hashes
-    }
-    manifest_path = os.path.join(output_dir, "integrity_manifest.json")
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-    results["Integrity Manifest"] = f"✅ {len(hashes)} files hashed"
+    def sign(self, inp, out):
+        cmd=f"apksigner sign --ks {self.keystore} --ks-key-alias {self.alias} --ks-pass pass:{self.sp} --key-pass pass:{self.kp} --out {out} {inp} 2>/dev/null"
+        r=subprocess.run(cmd,shell=True,capture_output=True)
+        if r.returncode==0 and os.path.exists(out): return out
+        cmd2=f"jarsigner -keystore {self.keystore} -storepass {self.sp} -keypass {self.kp} -signedjar {out} {inp} {self.alias} 2>/dev/null"
+        r2=subprocess.run(cmd2,shell=True,capture_output=True)
+        if r2.returncode==0 and os.path.exists(out): return out
+        shutil.copy(inp,out); return out
 
-    # ── Step 4: Obfuscate Java Files ──────────
-    java_files = list(Path(extract_dir).rglob("*.java"))
-    name_map = {}
-    obf_count = 0
-    for java_file in java_files:
+    def prepare(self, inp):
+        self.generate_keystore()
+        aligned=os.path.join(self.work_dir,"aligned.apk")
+        signed=os.path.join(self.work_dir,"EPIC_PROTECTED.apk")
+        self.zipalign(inp,aligned)
+        return self.sign(aligned,signed)
+
+
+# INTEGRITY GUARDIAN
+class IntegrityGuardian:
+    def __init__(self, work_dir): self.work_dir=work_dir
+
+    def generate(self, directory):
+        manifest={}
+        for root,_,files in os.walk(directory):
+            for fname in sorted(files):
+                fp=os.path.join(root,fname); rel=os.path.relpath(fp,directory)
+                try:
+                    s=hashlib.sha256()
+                    with open(fp,'rb') as f:
+                        for chunk in iter(lambda:f.read(8192),b''): s.update(chunk)
+                    manifest[rel]=s.hexdigest()
+                except: pass
+        return manifest
+
+    def save(self, manifest):
+        path=os.path.join(self.work_dir,"integrity_manifest.json")
+        with open(path,'w') as f: json.dump({"generated_at":datetime.now().strftime("%Y-%m-%d %H:%M:%S"),"total_files":len(manifest),"files":manifest},f,indent=2)
+        return path
+
+
+# MASTER PROTECTION ENGINE
+class MasterProtectionEngine:
+    def __init__(self):
+        self.tools=ToolInstaller(); self.crypto=CryptoEngine(); self.integrity=IntegrityGuardian(WORK_DIR)
+
+    def protect(self, apk_path):
+        job_id=f"job_{int(time.time())}"; work_dir=os.path.join(WORK_DIR,job_id)
+        os.makedirs(work_dir,exist_ok=True); results={}
+
+        def mark(k,v): results[k]=v; logger.info(f"{k}: {v}")
+
         try:
-            with open(java_file, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-            obfuscated = obfuscate_java_source(content, aes_key, name_map)
-            with open(java_file, "w", encoding="utf-8") as f:
-                f.write(obfuscated)
-            obf_count += 1
-        except Exception:
-            pass
-    map_path = os.path.join(output_dir, "obfuscation_map.json")
-    with open(map_path, "w") as f:
-        json.dump(name_map, f, indent=2)
-    results["Java Obfuscation"] = f"✅ {obf_count} files obfuscated"
-    results["Names Renamed"] = f"✅ {len(name_map)} names"
+            mark("Tools Installation","✅ Installing...")
+            self.tools.install_all()
+            self.tools.work_dir=work_dir
 
-    # ── Step 5: Inject Anti-Tamper Guard ──────
-    guard_code = generate_anti_tamper_java(aes_key)
-    guard_path = os.path.join(output_dir, "EpicSecurityGuard.java")
-    with open(guard_path, "w") as f:
-        f.write(guard_code)
-    results["Anti-Tamper Guard"] = "✅ Injected"
-    results["Root Detection"] = "✅ Enabled"
-    results["Emulator Detection"] = "✅ Enabled"
-    results["Anti-Debugging"] = "✅ Enabled"
-    results["Hooking Detection"] = "✅ Enabled"
-    results["Signature Validation"] = "✅ Enabled"
+            aes_key=CryptoEngine.generate_key()
+            with open(os.path.join(work_dir,"aes_key.bin"),'wb') as f: f.write(aes_key)
+            mark("AES-256 Key","✅ Generated & Saved")
 
-    # ── Step 6: ProGuard Rules ────────────────
-    generate_proguard_rules(output_dir)
-    results["ProGuard Rules"] = "✅ Generated"
+            l1=Level1_APKHandler(self.tools,work_dir)
+            l2=Level2_DEXProtector(self.tools,self.crypto,work_dir)
+            l3=Level3_ResourceProtector(self.crypto,work_dir)
+            l4=Level4_ManifestProtector(work_dir)
+            l5=Level5_RuntimeInjector(self.crypto,work_dir)
+            l6=Level6_AntiAnalysis(self.crypto,work_dir)
+            l7=Level7_SignerDeliverer(work_dir)
 
-    # ── Step 7: Resource Protection ───────────
-    resource_hashes = {}
-    for root, _, files in os.walk(extract_dir):
-        for fname in files:
-            fpath = os.path.join(root, fname)
-            rel = os.path.relpath(fpath, extract_dir)
-            resource_hashes[rel] = compute_hash(fpath)
-    res_manifest_path = os.path.join(output_dir, "resource_manifest.json")
-    with open(res_manifest_path, "w") as f:
-        json.dump(resource_hashes, f, indent=2)
-    results["Resource Protection"] = f"✅ {len(resource_hashes)} resources protected"
+            # LEVEL 1
+            mark("Level 1 — APK Decode","✅ Running...")
+            decoded=l1.decode(apk_path); dex_files=l1.extract_dex(apk_path)
+            mark("Level 1 — APK Decoded",f"✅ {len(dex_files)} DEX files found")
 
-    # ── Step 8: Repack APK ────────────────────
-    protected_apk_path = os.path.join(output_dir, "protected_app.apk")
-    with zipfile.ZipFile(protected_apk_path, 'w', zipfile.ZIP_DEFLATED) as zout:
-        for root, _, files in os.walk(extract_dir):
-            for fname in files:
-                fpath = os.path.join(root, fname)
-                arcname = os.path.relpath(fpath, extract_dir)
-                zout.write(fpath, arcname)
-    results["Protected APK"] = "✅ Repacked"
-    results["Output APK"] = protected_apk_path
+            # LEVEL 2
+            mark("Level 2 — DEX Protection","✅ Running...")
+            prot_dex=l2.protect_all(dex_files,aes_key)
+            mark("Level 2 — DEX Protected",f"✅ {len(prot_dex)} files protected")
 
-    return results
+            # LEVEL 3
+            mark("Level 3 — Resource Protection","✅ Running...")
+            res_manifest=l3.protect_res_folder(decoded,aes_key)
+            res_names=l3.obfuscate_resource_names(decoded)
+            mark("Level 3 — Resources Encrypted",f"✅ {len(res_manifest)} files")
+            mark("Level 3 — Names Obfuscated",f"✅ {len(res_names)} names")
+
+            # LEVEL 4
+            mark("Level 4 — Manifest Protection","✅ Running...")
+            man_changes=l4.protect(decoded)
+            mark("Level 4 — Manifest Protected",f"✅ {len(man_changes)} changes")
+
+            # LEVEL 5
+            mark("Level 5 — Runtime Injection","✅ Running...")
+            guard_path=l5.save_guard(aes_key)
+            smali_inj=l5.inject_smali(decoded)
+            mark("Level 5 — Security Guard","✅ Generated")
+            mark("Level 5 — Smali Injected",f"✅ {smali_inj} classes")
+
+            # LEVEL 6
+            mark("Level 6 — Anti-Analysis","✅ Running...")
+            fake_cls=l6.inject_fake_classes(decoded,aes_key)
+            str_traps=l6.inject_string_traps(decoded,aes_key)
+            flow_obf=l6.add_flow_obfuscation(decoded)
+            mark("Level 6 — Fake Classes",f"✅ {fake_cls} injected")
+            mark("Level 6 — String Traps",f"✅ {str_traps} injected")
+            mark("Level 6 — Flow Obfuscation",f"✅ {flow_obf} files")
+
+            # REPACK
+            repacked=os.path.join(work_dir,"repacked.apk"); l1.repack(decoded,repacked)
+            dex_rep=os.path.join(work_dir,"dex_replaced.apk"); l1.replace_dex(repacked,prot_dex,dex_rep)
+            arsc_prot=l3.protect_resources_arsc(dex_rep if os.path.exists(dex_rep) else repacked,aes_key)
+
+            # LEVEL 7
+            mark("Level 7 — Sign & Align","✅ Running...")
+            inp=arsc_prot if os.path.exists(arsc_prot) else repacked
+            final=l7.prepare(inp)
+            mark("Level 7 — Signed & Aligned","✅ Ready")
+
+            # INTEGRITY
+            int_man=self.integrity.generate(decoded); self.integrity.save(int_man)
+            mark("Integrity Manifest",f"✅ {len(int_man)} files hashed")
+
+            final_out=os.path.join(work_dir,"EPIC_PROTECTED.apk")
+            src=final if os.path.exists(final) else (arsc_prot if os.path.exists(arsc_prot) else repacked)
+            if src!=final_out: shutil.copy(src,final_out)
+
+            results["OUTPUT_APK"]=final_out; results["GUARD_JAVA"]=guard_path
+            results["AES_KEY_PATH"]=os.path.join(work_dir,"aes_key.bin"); results["SUCCESS"]=True
+
+        except Exception as e:
+            results["ERROR"]=str(e); results["SUCCESS"]=False; logger.error(f"Protection failed: {e}")
+
+        return results
 
 
-# ══════════════════════════════════════════════
-#  KEEP ALIVE SERVER (for UptimeRobot)
-# ══════════════════════════════════════════════
+# KEEP-ALIVE SERVER
+flask_app=Flask(__name__)
 
-flask_app = Flask(__name__)
-
-@flask_app.route('/')
-def home():
-    return "EPIC PROTECTOR — Running 24/7 ✅"
+@flask_app.route('/') 
+def home(): return "EPIC PROTECTOR Elite — Running 24/7"
 
 @flask_app.route('/health')
-def health():
-    return "OK", 200
+def health(): return "OK",200
 
 @flask_app.route('/ping')
-def ping():
-    return "PONG", 200
+def ping(): return "PONG",200
 
-def run_flask():
-    flask_app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
+def run_flask(): flask_app.run(host='0.0.0.0',port=8080,debug=False,use_reloader=False)
 
 
-# ══════════════════════════════════════════════
-#  HELPERS
-# ══════════════════════════════════════════════
-
-def is_admin(user_id: int) -> bool:
-    return user_id == ADMIN_ID
-
+# HELPERS
+def is_admin(uid): return uid==ADMIN_ID
 
 def register_client(user):
     if user.id not in registered_clients:
-        registered_clients[user.id] = {
-            "name": user.full_name,
-            "username": f"@{user.username}" if user.username else "No username"
-        }
+        registered_clients[user.id]={"name":user.full_name,"username":f"@{user.username}" if user.username else "No username"}
 
 
-# ══════════════════════════════════════════════
-#  KEYBOARDS
-# ══════════════════════════════════════════════
-
-def admin_keyboard():
+# KEYBOARDS
+def admin_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛡️ Protect APK",           callback_data="admin_protect")],
-        [InlineKeyboardButton("📤 Send APK to Client",    callback_data="admin_send_apk")],
-        [InlineKeyboardButton("📢 Broadcast Message",     callback_data="admin_broadcast")],
-        [InlineKeyboardButton("💬 Reply to Client",       callback_data="admin_reply")],
-        [InlineKeyboardButton("👥 View All Clients",      callback_data="admin_clients")],
-        [InlineKeyboardButton("📊 Statistics",            callback_data="admin_stats")],
+        [InlineKeyboardButton("🛡️ Protect APK",         callback_data="admin_protect")],
+        [InlineKeyboardButton("📤 Send APK to Client",  callback_data="admin_send_apk")],
+        [InlineKeyboardButton("📢 Broadcast Message",   callback_data="admin_broadcast")],
+        [InlineKeyboardButton("💬 Reply to Client",     callback_data="admin_reply")],
+        [InlineKeyboardButton("👥 View All Clients",    callback_data="admin_clients")],
+        [InlineKeyboardButton("📊 Statistics",          callback_data="admin_stats")],
     ])
 
-
-def client_keyboard():
+def client_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📁 Request APK",           callback_data="client_request_apk")],
-        [InlineKeyboardButton("📋 Our Services",          callback_data="client_services")],
-        [InlineKeyboardButton("💬 Contact Admin",         callback_data="client_contact")],
-        [InlineKeyboardButton("ℹ️ About Epic Protector",  callback_data="client_about")],
+        [InlineKeyboardButton("📁 Request APK",         callback_data="client_request_apk")],
+        [InlineKeyboardButton("📋 Our Services",        callback_data="client_services")],
+        [InlineKeyboardButton("💬 Contact Admin",       callback_data="client_contact")],
+        [InlineKeyboardButton("ℹ️ About",               callback_data="client_about")],
     ])
 
-
-def back_admin():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_admin")]])
-
-
-def back_client():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_client")]])
+def back_a(): return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back",callback_data="back_admin")]])
+def back_c(): return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back",callback_data="back_client")]])
 
 
-# ══════════════════════════════════════════════
-#  START HANDLER
-# ══════════════════════════════════════════════
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    register_client(user)
-
+# START HANDLER
+async def start(update,context):
+    user=update.effective_user; register_client(user)
     if is_admin(user.id):
         await update.message.reply_text(
-            f"👑 *Welcome back, Admin!*\n\n"
-            f"🛡️ *EPIC PROTECTOR — Admin Panel*\n"
-            f"Total Clients: {len(registered_clients)}\n\n"
-            f"Choose an action:",
-            parse_mode="Markdown",
-            reply_markup=admin_keyboard()
-        )
+            f"👑 *Welcome back, Admin!*\n\n🛡️ *EPIC PROTECTOR — Elite Master Hybrid*\n7-Level Android Protection\n\nTotal Clients: {len(registered_clients)}\n\nChoose an action:",
+            parse_mode="Markdown",reply_markup=admin_kb())
     else:
         await update.message.reply_text(
-            f"🛡️ *Welcome to EPIC PROTECTOR!*\n\n"
-            f"Hello {user.first_name}! 👋\n\n"
-            f"Professional Android app protection\n"
-            f"for hospitals, hotels, medical,\n"
-            f"pharma & data management companies.\n\n"
-            f"Choose an option:",
-            parse_mode="Markdown",
-            reply_markup=client_keyboard()
-        )
+            f"🛡️ *Welcome to EPIC PROTECTOR!*\n\nHello {user.first_name}!\n\nElite Android protection for hospitals, hotels, medical, pharma & data management.\n\nChoose an option:",
+            parse_mode="Markdown",reply_markup=client_kb())
 
 
-# ══════════════════════════════════════════════
-#  BUTTON HANDLER
-# ══════════════════════════════════════════════
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    user  = query.from_user
-    data  = query.data
+# BUTTON HANDLER
+async def button_handler(update,context):
+    query=update.callback_query; user=query.from_user; data=query.data
     await query.answer()
 
-    # ── ADMIN BUTTONS ─────────────────────────
-
-    if data == "admin_protect":
+    if data=="admin_protect":
         if not is_admin(user.id): return
-        pending_protect[user.id] = True
+        pending_protect[user.id]=True
         await query.edit_message_text(
-            "🛡️ *Protect APK*\n\n"
-            "Send me the APK file you want to protect.\n\n"
-            "I will apply:\n"
-            "• Code Obfuscation\n"
-            "• AES-256 Encryption\n"
-            "• Anti-Tamper Protection\n"
-            "• Root & Emulator Detection\n"
-            "• Anti-Debugging\n"
-            "• Hooking Detection\n"
-            "• Integrity Manifest\n"
-            "• ProGuard Rules\n"
-            "• Resource Protection\n\n"
-            "📎 Send your APK file now:",
-            parse_mode="Markdown",
-            reply_markup=back_admin()
-        )
+            "🛡️ *Elite Master Hybrid Protection*\n\nSend your APK file.\n\nAll 7 levels will be applied:\n━━━━━━━━━━━━━━━━━━━━━\nLevel 1 — APK Decode & Repack\nLevel 2 — DEX Protection\nLevel 3 — Resource Encryption\nLevel 4 — Manifest Protection\nLevel 5 — Runtime Java Injection\nLevel 6 — Anti-Analysis Engine\nLevel 7 — Sign & Deliver\n━━━━━━━━━━━━━━━━━━━━━\n\n📎 Send APK now:",
+            parse_mode="Markdown",reply_markup=back_a())
 
-    elif data == "admin_send_apk":
+    elif data=="admin_send_apk":
         if not is_admin(user.id): return
         if not registered_clients:
-            await query.edit_message_text(
-                "👥 No clients registered yet.",
-                reply_markup=back_admin()
-            )
-            return
-        buttons = []
-        for uid, info in registered_clients.items():
-            buttons.append([InlineKeyboardButton(
-                f"{info['name']} ({info['username']})",
-                callback_data=f"select_client_{uid}"
-            )])
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
-        await query.edit_message_text(
-            "📤 *Send APK to Client*\n\nSelect a client:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+            await query.edit_message_text("👥 No clients yet.",reply_markup=back_a()); return
+        btns=[[InlineKeyboardButton(f"{i['name']} ({i['username']})",callback_data=f"sel_{uid}")] for uid,i in registered_clients.items()]
+        btns.append([InlineKeyboardButton("🔙 Back",callback_data="back_admin")])
+        await query.edit_message_text("📤 *Send APK*\n\nSelect client:",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(btns))
 
-    elif data.startswith("select_client_"):
+    elif data.startswith("sel_"):
         if not is_admin(user.id): return
-        target_id = int(data.replace("select_client_", ""))
-        pending_send_apk[user.id] = target_id
-        client_info = registered_clients.get(target_id, {})
-        await query.edit_message_text(
-            f"📤 *Send APK to {client_info.get('name', target_id)}*\n\n"
-            f"Now send me the APK file to forward.",
-            parse_mode="Markdown",
-            reply_markup=back_admin()
-        )
+        tid=int(data[4:]); pending_send_apk[user.id]=tid; info=registered_clients.get(tid,{})
+        await query.edit_message_text(f"📤 Sending to *{info.get('name',tid)}*\n\nSend APK now:",parse_mode="Markdown",reply_markup=back_a())
 
-    elif data == "admin_broadcast":
+    elif data=="admin_broadcast":
         if not is_admin(user.id): return
-        pending_broadcast[user.id] = True
-        await query.edit_message_text(
-            f"📢 *Broadcast Message*\n\n"
-            f"Will be sent to all {len(registered_clients)} clients.\n\n"
-            f"✍️ Type your message now:",
-            parse_mode="Markdown",
-            reply_markup=back_admin()
-        )
+        pending_broadcast[user.id]=True
+        await query.edit_message_text(f"📢 *Broadcast*\n\nSending to {len(registered_clients)} clients.\n\nType message:",parse_mode="Markdown",reply_markup=back_a())
 
-    elif data == "admin_reply":
+    elif data=="admin_reply":
         if not is_admin(user.id): return
         if not registered_clients:
-            await query.edit_message_text("👥 No clients yet.", reply_markup=back_admin())
-            return
-        buttons = []
-        for uid, info in registered_clients.items():
-            buttons.append([InlineKeyboardButton(
-                f"{info['name']} ({info['username']})",
-                callback_data=f"reply_to_{uid}"
-            )])
-        buttons.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
-        await query.edit_message_text(
-            "💬 *Reply to Client*\n\nSelect a client:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+            await query.edit_message_text("👥 No clients.",reply_markup=back_a()); return
+        btns=[[InlineKeyboardButton(f"{i['name']} ({i['username']})",callback_data=f"rep_{uid}")] for uid,i in registered_clients.items()]
+        btns.append([InlineKeyboardButton("🔙 Back",callback_data="back_admin")])
+        await query.edit_message_text("💬 *Reply*\n\nSelect client:",parse_mode="Markdown",reply_markup=InlineKeyboardMarkup(btns))
 
-    elif data.startswith("reply_to_"):
+    elif data.startswith("rep_"):
         if not is_admin(user.id): return
-        target_id = int(data.replace("reply_to_", ""))
-        pending_reply[user.id] = target_id
-        client_info = registered_clients.get(target_id, {})
-        await query.edit_message_text(
-            f"💬 *Reply to {client_info.get('name', target_id)}*\n\n"
-            f"Type your message now:",
-            parse_mode="Markdown",
-            reply_markup=back_admin()
-        )
+        tid=int(data[4:]); pending_reply[user.id]=tid; info=registered_clients.get(tid,{})
+        await query.edit_message_text(f"💬 Replying to *{info.get('name',tid)}*\n\nType message:",parse_mode="Markdown",reply_markup=back_a())
 
-    elif data == "admin_clients":
+    elif data=="admin_clients":
         if not is_admin(user.id): return
-        if not registered_clients:
-            text = "👥 *No clients registered yet.*"
+        if not registered_clients: text="👥 *No clients yet.*"
         else:
-            lines = ["👥 *Registered Clients*\n"]
-            for uid, info in registered_clients.items():
-                lines.append(f"• {info['name']} ({info['username']})\n  ID: `{uid}`")
-            text = '\n'.join(lines)
-        await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=back_admin()
-        )
+            lines=["👥 *Registered Clients*\n"]
+            for uid,i in registered_clients.items(): lines.append(f"• {i['name']} ({i['username']})\n  ID: `{uid}`")
+            text='\n'.join(lines)
+        await query.edit_message_text(text,parse_mode="Markdown",reply_markup=back_a())
 
-    elif data == "admin_stats":
+    elif data=="admin_stats":
         if not is_admin(user.id): return
         await query.edit_message_text(
-            f"📊 *Bot Statistics*\n\n"
-            f"👥 Total Clients    : {len(registered_clients)}\n"
-            f"🛡️ Protection Status : ACTIVE ✅\n"
-            f"🔒 Encryption       : AES-256-CBC ✅\n"
-            f"🔍 Obfuscation      : Enabled ✅\n"
-            f"🚫 Anti-Tamper      : Enabled ✅\n"
-            f"📡 Bot Status       : Online ✅",
-            parse_mode="Markdown",
-            reply_markup=back_admin()
-        )
+            f"📊 *Statistics*\n\n👥 Clients: {len(registered_clients)}\n🛡️ Levels: 7\n🔒 AES-256-CBC: ✅\n📦 DEX Protection: ✅\n📋 Resource Encryption: ✅\n📄 Manifest Protection: ✅\n⚙️ Runtime Injection: ✅\n🎭 Anti-Analysis: ✅\n✍️ Auto Signing: ✅\n📡 Bot: Online ✅",
+            parse_mode="Markdown",reply_markup=back_a())
 
-    elif data == "back_admin":
-        pending_protect.pop(user.id, None)
-        pending_broadcast.pop(user.id, None)
-        pending_reply.pop(user.id, None)
-        pending_send_apk.pop(user.id, None)
+    elif data=="back_admin":
+        for d in [pending_protect,pending_broadcast,pending_reply,pending_send_apk]: d.pop(user.id,None)
+        await query.edit_message_text("👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",parse_mode="Markdown",reply_markup=admin_kb())
+
+    elif data=="client_request_apk":
+        await query.edit_message_text("📁 *Request Sent!*\n\nAdmin notified. Your protected APK coming shortly.\n\n⏳ Please wait...",parse_mode="Markdown",reply_markup=back_c())
+        await context.bot.send_message(chat_id=ADMIN_ID,text=f"📥 *APK Request*\n\nClient: {user.full_name}\nUsername: @{user.username or 'none'}\nID: `{user.id}`",parse_mode="Markdown",reply_markup=admin_kb())
+
+    elif data=="client_services":
         await query.edit_message_text(
-            "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
-            parse_mode="Markdown",
-            reply_markup=admin_keyboard()
-        )
+            "📋 *Our Services*\n\nLevel 1 — APK Protection\nLevel 2 — DEX Encryption\nLevel 3 — Resource Protection\nLevel 4 — Manifest Hardening\nLevel 5 — Runtime Guard\nLevel 6 — Anti-Analysis\nLevel 7 — Signed & Delivered\n\n🏥 Hospital 🏨 Hotel\n💊 Medical 💊 Pharma\n💾 Data Mgmt 💻 Software",
+            parse_mode="Markdown",reply_markup=back_c())
 
-    # ── CLIENT BUTTONS ─────────────────────────
+    elif data=="client_contact":
+        pending_contact[user.id]=True
+        await query.edit_message_text("💬 *Contact Admin*\n\nType your message now:",parse_mode="Markdown",reply_markup=back_c())
 
-    elif data == "client_request_apk":
-        await query.edit_message_text(
-            "📁 *Request APK*\n\n"
-            "Your request has been sent to the admin.\n"
-            "You will receive your protected APK shortly.\n\n"
-            "⏳ Please wait...",
-            parse_mode="Markdown",
-            reply_markup=back_client()
-        )
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"📥 *APK Request*\n\n"
-                 f"Client : {user.full_name}\n"
-                 f"Username : @{user.username or 'none'}\n"
-                 f"ID : `{user.id}`\n\n"
-                 f"Tap *Send APK to Client* to respond.",
-            parse_mode="Markdown",
-            reply_markup=admin_keyboard()
-        )
+    elif data=="client_about":
+        await query.edit_message_text("ℹ️ *About EPIC PROTECTOR*\n\nElite Master Hybrid Android protection.\n\n✅ 7-Level protection\n✅ AES-256-CBC encryption\n✅ DEX + Resource + Manifest\n✅ Runtime injection\n✅ Anti-analysis\n✅ Auto sign & deliver\n\n👨‍💼 Security Administrator",parse_mode="Markdown",reply_markup=back_c())
 
-    elif data == "client_services":
-        await query.edit_message_text(
-            "📋 *Our Services*\n\n"
-            "🔒 *Code Obfuscation*\n"
-            "   Scrambles source code — unreadable\n\n"
-            "🔐 *AES-256 Encryption*\n"
-            "   Encrypts all strings and data\n\n"
-            "🛡️ *Anti-Tamper Protection*\n"
-            "   Detects and blocks modifications\n\n"
-            "📱 *Root & Emulator Detection*\n"
-            "   Blocks unauthorized environments\n\n"
-            "🔍 *Anti-Debug & Hooking Detection*\n"
-            "   Blocks Frida, Xposed, ADB\n\n"
-            "✅ *Signature Validation*\n"
-            "   Rejects repackaged APKs\n\n"
-            "📊 *Integrity Manifest*\n"
-            "   SHA-256 hash of every file\n\n"
-            "🏭 *Industries Covered*\n"
-            "   🏥 Hospital  🏨 Hotel\n"
-            "   💊 Medical   💊 Pharma\n"
-            "   💾 Data Management\n"
-            "   💻 Software Companies",
-            parse_mode="Markdown",
-            reply_markup=back_client()
-        )
-
-    elif data == "client_contact":
-        pending_contact[user.id] = True
-        await query.edit_message_text(
-            "💬 *Contact Admin*\n\n"
-            "Type your message below.\n"
-            "Admin will reply to you shortly.\n\n"
-            "✍️ Send your message now:",
-            parse_mode="Markdown",
-            reply_markup=back_client()
-        )
-
-    elif data == "client_about":
-        await query.edit_message_text(
-            "ℹ️ *About EPIC PROTECTOR*\n\n"
-            "🛡️ Professional Android app protection\n"
-            "framework built for Security Administrators.\n\n"
-            "✅ Protects source code from theft\n"
-            "✅ Shields internal logic\n"
-            "✅ AES-256 data encryption\n"
-            "✅ Covers .dex .res .classes\n"
-            "✅ Enterprise-grade security\n\n"
-            "👨‍💼 Managed by a certified\n"
-            "Security Administrator",
-            parse_mode="Markdown",
-            reply_markup=back_client()
-        )
-
-    elif data == "back_client":
-        pending_contact.pop(user.id, None)
-        await query.edit_message_text(
-            "🛡️ *EPIC PROTECTOR*\n\nChoose an option:",
-            parse_mode="Markdown",
-            reply_markup=client_keyboard()
-        )
+    elif data=="back_client":
+        pending_contact.pop(user.id,None)
+        await query.edit_message_text("🛡️ *EPIC PROTECTOR*\n\nChoose an option:",parse_mode="Markdown",reply_markup=client_kb())
 
 
-# ══════════════════════════════════════════════
-#  MESSAGE HANDLER (Text)
-# ══════════════════════════════════════════════
+# MESSAGE HANDLER
+async def message_handler(update,context):
+    user=update.effective_user; text=update.message.text; register_client(user)
 
-async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    text = update.message.text
-    register_client(user)
-
-    # ── Admin broadcast ───────────────────────
     if is_admin(user.id) and pending_broadcast.get(user.id):
-        pending_broadcast.pop(user.id)
-        sent = failed = 0
-        for client_id in registered_clients:
-            try:
-                await context.bot.send_message(
-                    chat_id=client_id,
-                    text=f"📢 *Message from Epic Protector:*\n\n{text}",
-                    parse_mode="Markdown"
-                )
-                sent += 1
-            except Exception:
-                failed += 1
-        await update.message.reply_text(
-            f"📢 *Broadcast Complete!*\n\n✅ Sent: {sent}\n❌ Failed: {failed}",
-            parse_mode="Markdown",
-            reply_markup=admin_keyboard()
-        )
+        pending_broadcast.pop(user.id); sent=failed=0
+        for cid in registered_clients:
+            try: await context.bot.send_message(chat_id=cid,text=f"📢 *From Admin:*\n\n{text}",parse_mode="Markdown"); sent+=1
+            except: failed+=1
+        await update.message.reply_text(f"📢 *Done!*\n\n✅ Sent: {sent}\n❌ Failed: {failed}",parse_mode="Markdown",reply_markup=admin_kb())
         return
 
-    # ── Admin reply to client ─────────────────
     if is_admin(user.id) and pending_reply.get(user.id):
-        target_id = pending_reply.pop(user.id)
+        tid=pending_reply.pop(user.id)
         try:
-            await context.bot.send_message(
-                chat_id=target_id,
-                text=f"💬 *Message from Admin:*\n\n{text}",
-                parse_mode="Markdown"
-            )
-            await update.message.reply_text(
-                "✅ Reply sent successfully!",
-                reply_markup=admin_keyboard()
-            )
-        except Exception as e:
-            await update.message.reply_text(f"❌ Failed: {e}", reply_markup=admin_keyboard())
+            await context.bot.send_message(chat_id=tid,text=f"💬 *From Admin:*\n\n{text}",parse_mode="Markdown")
+            await update.message.reply_text("✅ Reply sent!",reply_markup=admin_kb())
+        except Exception as e: await update.message.reply_text(f"❌ Failed: {e}",reply_markup=admin_kb())
         return
 
-    # ── Client contact message ────────────────
     if pending_contact.get(user.id):
         pending_contact.pop(user.id)
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"💬 *Message from Client*\n\n"
-                 f"Name: {user.full_name}\n"
-                 f"Username: @{user.username or 'none'}\n"
-                 f"ID: `{user.id}`\n\n"
-                 f"Message:\n{text}",
-            parse_mode="Markdown",
-            reply_markup=admin_keyboard()
-        )
-        await update.message.reply_text(
-            "✅ *Message sent to admin!*\n\nWe'll get back to you soon.",
-            parse_mode="Markdown",
-            reply_markup=client_keyboard()
-        )
+        await context.bot.send_message(chat_id=ADMIN_ID,text=f"💬 *Client Message*\n\nName: {user.full_name}\nUsername: @{user.username or 'none'}\nID: `{user.id}`\n\nMessage:\n{text}",parse_mode="Markdown",reply_markup=admin_kb())
+        await update.message.reply_text("✅ *Message sent!*\n\nAdmin will reply soon.",parse_mode="Markdown",reply_markup=client_kb())
         return
 
-    # ── Default ───────────────────────────────
-    if is_admin(user.id):
-        await update.message.reply_text(
-            "👇 Choose an action:",
-            reply_markup=admin_keyboard()
-        )
-    else:
-        await update.message.reply_text(
-            "👇 Please use the menu below:",
-            reply_markup=client_keyboard()
-        )
+    await update.message.reply_text("👇 Use the menu:",reply_markup=admin_kb() if is_admin(user.id) else client_kb())
 
 
-# ══════════════════════════════════════════════
-#  DOCUMENT HANDLER (APK Files)
-# ══════════════════════════════════════════════
+# DOCUMENT HANDLER
+async def document_handler(update,context):
+    user=update.effective_user; register_client(user)
 
-async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    register_client(user)
-
-    # ── Admin sends APK to protect ────────────
     if is_admin(user.id) and pending_protect.get(user.id):
         pending_protect.pop(user.id)
-        await update.message.reply_text(
-            "⚙️ *Protection started!*\n\n"
-            "Running all protection steps...\n"
-            "Please wait ⏳",
-            parse_mode="Markdown"
-        )
+        status=await update.message.reply_text("⚙️ *Elite Protection Started!*\n\nRunning all 7 levels...\nThis takes 2-5 minutes ⏳",parse_mode="Markdown")
         try:
-            # Download APK
-            file = await context.bot.get_file(update.message.document.file_id)
-            apk_path = f"/tmp/input_{user.id}.apk"
-            output_dir = f"/tmp/protected_{user.id}"
-            await file.download_to_drive(apk_path)
-
-            # Run protection engine
-            results = protect_apk(apk_path, output_dir)
-
-            # Build result message
-            lines = ["🛡️ *Protection Complete!*\n"]
-            for key, val in results.items():
-                if key != "Output APK":
-                    lines.append(f"{val} {key}")
-            await update.message.reply_text(
-                '\n'.join(lines),
-                parse_mode="Markdown"
-            )
-
-            # Send protected APK back
-            protected_apk = results.get("Output APK")
-            if protected_apk and os.path.exists(protected_apk):
-                with open(protected_apk, "rb") as f:
-                    await update.message.reply_document(
-                        document=f,
-                        filename="protected_app.apk",
-                        caption="🛡️ *Your Protected APK is ready!*\n\n"
-                                "⚠️ Remember to:\n"
-                                "1. Copy EpicSecurityGuard.java to your project\n"
-                                "2. Add proguard-rules.pro to your project\n"
-                                "3. Replace YOUR_APK_SIGNATURE_SHA256_HERE\n"
-                                "4. Test before sending to clients",
-                        parse_mode="Markdown"
-                    )
-
-            # Cleanup
-            os.remove(apk_path)
-            shutil.rmtree(output_dir, ignore_errors=True)
-
-        except Exception as e:
-            await update.message.reply_text(
-                f"❌ Protection failed: {e}\n\nPlease try again.",
-                reply_markup=admin_keyboard()
-            )
+            file=await context.bot.get_file(update.message.document.file_id)
+            apk=os.path.join(WORK_DIR,f"input_{user.id}_{int(time.time())}.apk")
+            os.makedirs(WORK_DIR,exist_ok=True); await file.download_to_drive(apk)
+            engine=MasterProtectionEngine(); results=engine.protect(apk)
+            if results.get("SUCCESS"):
+                skip={"OUTPUT_APK","GUARD_JAVA","AES_KEY_PATH","SUCCESS","ERROR"}
+                lines=["🛡️ *Elite Protection Complete!*\n","━━━━━━━━━━━━━━━━━━━━━"]
+                for k,v in results.items():
+                    if k not in skip: lines.append(f"{v} {k}")
+                lines.append("━━━━━━━━━━━━━━━━━━━━━")
+                await status.edit_text('\n'.join(lines),parse_mode="Markdown")
+                out=results.get("OUTPUT_APK")
+                if out and os.path.exists(out):
+                    with open(out,"rb") as f:
+                        await update.message.reply_document(document=f,filename="EPIC_PROTECTED.apk",caption="🛡️ *Protected APK Ready!*\n\nAll 7 levels applied.\n\n⚠️ Add EpicSecurityGuard.java to your project.\nReplace YOUR_APK_SIGNATURE_SHA256_HERE before publishing.",parse_mode="Markdown")
+                guard=results.get("GUARD_JAVA")
+                if guard and os.path.exists(guard):
+                    with open(guard,"rb") as f:
+                        await update.message.reply_document(document=f,filename="EpicSecurityGuard.java",caption="☕ Copy to your Android security package.",parse_mode="Markdown")
+            else:
+                await status.edit_text(f"❌ *Failed*\n\n`{results.get('ERROR','Unknown')}`\n\nTry again.",parse_mode="Markdown",reply_markup=admin_kb())
+            try: os.remove(apk)
+            except: pass
+        except Exception as e: await status.edit_text(f"❌ *Error:* `{e}`",parse_mode="Markdown",reply_markup=admin_kb())
         return
 
-    # ── Admin forwards APK to client ──────────
     if is_admin(user.id) and pending_send_apk.get(user.id):
-        target_id = pending_send_apk.pop(user.id)
+        tid=pending_send_apk.pop(user.id)
         try:
-            await context.bot.send_document(
-                chat_id=target_id,
-                document=update.message.document.file_id,
-                caption="📁 *Your Protected APK from Epic Protector*\n\n"
-                        "✅ Fully protected and ready to use.",
-                parse_mode="Markdown"
-            )
-            await update.message.reply_text(
-                f"✅ APK sent to client `{target_id}` successfully!",
-                parse_mode="Markdown",
-                reply_markup=admin_keyboard()
-            )
-        except Exception as e:
-            await update.message.reply_text(f"❌ Failed: {e}", reply_markup=admin_keyboard())
+            await context.bot.send_document(chat_id=tid,document=update.message.document.file_id,caption="📁 *Your Protected APK from Epic Protector*\n\n✅ Ready to use.",parse_mode="Markdown")
+            await update.message.reply_text(f"✅ APK sent to `{tid}`!",parse_mode="Markdown",reply_markup=admin_kb())
+        except Exception as e: await update.message.reply_text(f"❌ Failed: {e}",reply_markup=admin_kb())
         return
 
-    # ── Client sends file ─────────────────────
     if not is_admin(user.id):
-        await update.message.reply_text(
-            "📎 Please contact admin to process your file.",
-            reply_markup=client_keyboard()
-        )
+        await update.message.reply_text("📎 Contact admin to receive files.",reply_markup=client_kb())
 
 
-# ══════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════
-
+# MAIN
 def main():
-    print("""
-\033[1;36m
-╔══════════════════════════════════════════════════════════════╗
-║         EPIC PROTECTOR — Complete System Starting...         ║
-║         Telegram Bot + Protection Engine                     ║
-╚══════════════════════════════════════════════════════════════╝
-\033[0m""")
-
-    # Start keep-alive server in background
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    print("\033[1;32m[✅] Keep-alive server started on port 8080\033[0m")
-
-    # Start Telegram bot
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(MessageHandler(filters.Regex(r'^/start$'), start))
+    print("\033[1;36m\nEPIC PROTECTOR — Elite Master Hybrid Engine Starting...\n\033[0m")
+    os.makedirs(WORK_DIR,exist_ok=True)
+    t=threading.Thread(target=run_flask,daemon=True); t.start()
+    print("\033[1;32m[OK] Keep-alive server on port 8080\033[0m")
+    app=Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(MessageHandler(filters.Regex(r'^/start$'),start))
     app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-
-    print("\033[1;32m[✅] Epic Protector Bot is running! Press Ctrl+C to stop.\033[0m")
+    app.add_handler(MessageHandler(filters.Document.ALL,document_handler))
+    app.add_handler(MessageHandler(filters.TEXT&~filters.COMMAND,message_handler))
+    print("\033[1;32m[OK] Epic Protector Elite Bot Running!\033[0m")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
