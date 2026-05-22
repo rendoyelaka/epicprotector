@@ -1,0 +1,156 @@
+name: EPIC PROTECTOR — Bot 24/7
+
+# ── Triggers ──────────────────────────────────
+on:
+  push:
+    branches:
+      - main        # Auto deploy when you update code
+  workflow_dispatch: # Manual start from GitHub Actions tab
+  schedule:
+    - cron: '0 */5 * * *'  # Auto restart every 5 hours as backup
+
+# ── Jobs ──────────────────────────────────────
+jobs:
+  run-bot:
+    name: Run Epic Protector Bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # Run for ~5h 50min then auto restart
+
+    steps:
+
+      # ── Step 1: Get your code from GitHub ───
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ── Step 2: Install Python ───────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── Step 3: Install bot dependencies ────
+      - name: Install Dependencies
+        run: |
+          pip install python-telegram-bot==20.7
+          pip install flask
+          echo "✅ Dependencies installed successfully"
+
+      # ── Step 4: Write token from GitHub Secrets into bot safely ──
+      - name: Configure Bot Token Securely
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+        run: |
+          # Replace placeholder token in bot.py with real secret token
+          sed -i "s|YOUR_NEW_TOKEN_HERE|${BOT_TOKEN}|g" bot.py
+          sed -i "s|8205672036|${ADMIN_ID}|g" bot.py
+          echo "✅ Bot configured securely from GitHub Secrets"
+
+      # ── Step 5: Start keep-alive ping server for UptimeRobot ──
+      - name: Start Keep-Alive Server
+        run: |
+          cat > keep_alive.py << 'EOF'
+          from flask import Flask
+          import threading
+
+          app = Flask(__name__)
+
+          @app.route('/')
+          def home():
+              return "EPIC PROTECTOR BOT — Running 24/7 ✅"
+
+          @app.route('/health')
+          def health():
+              return "OK", 200
+
+          @app.route('/ping')
+          def ping():
+              return "PONG", 200
+
+          def run_server():
+              app.run(host='0.0.0.0', port=8080, debug=False)
+
+          def keep_alive():
+              t = threading.Thread(target=run_server)
+              t.daemon = True
+              t.start()
+
+          if __name__ == '__main__':
+              keep_alive()
+          EOF
+          echo "✅ Keep-alive server ready"
+
+      # ── Step 6: Start bot with auto restart + error logging ──
+      - name: Run Bot with Auto Restart
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+        run: |
+          cat > run_bot.py << 'EOF'
+          import subprocess
+          import time
+          import sys
+          import os
+          from datetime import datetime
+
+          def log(msg):
+              timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+              print(f"[{timestamp}] {msg}", flush=True)
+
+          # Start keep alive server first
+          import keep_alive
+          keep_alive.keep_alive()
+          log("✅ Keep-alive server started on port 8080")
+
+          restart_count = 0
+          max_restarts = 999  # Effectively unlimited restarts
+
+          while restart_count < max_restarts:
+              try:
+                  log(f"🚀 Starting Epic Protector Bot (attempt {restart_count + 1})")
+
+                  process = subprocess.Popen(
+                      [sys.executable, "bot.py"],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      universal_newlines=True,
+                      bufsize=1
+                  )
+
+                  # Stream logs in real time
+                  for line in process.stdout:
+                      print(line, end='', flush=True)
+
+                  process.wait()
+                  exit_code = process.returncode
+
+                  if exit_code == 0:
+                      log("✅ Bot stopped cleanly.")
+                      break
+                  else:
+                      restart_count += 1
+                      log(f"⚠️ Bot crashed with exit code {exit_code}. Restarting in 5 seconds... (restart #{restart_count})")
+                      time.sleep(5)
+
+              except KeyboardInterrupt:
+                  log("🛑 Bot stopped manually.")
+                  break
+              except Exception as e:
+                  restart_count += 1
+                  log(f"❌ Error: {e}. Restarting in 5 seconds... (restart #{restart_count})")
+                  time.sleep(5)
+
+          log("🏁 Bot runner finished.")
+          EOF
+
+          echo "✅ Bot runner ready"
+          python3 run_bot.py 2>&1 | tee bot_log.txt
+
+      # ── Step 7: Upload error log if bot crashes ──
+      - name: Upload Bot Log on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-crash-log
+          path: bot_log.txt
+          retention-days: 7
