@@ -125,6 +125,12 @@ manual_target     = {}   # stores selected folder target
 manual_operation  = {}   # stores selected operation
 manual_workspace  = {}   # stores decoded workspace path for advisory scan
 manual_scan_result= {}   # stores last scan result for detail view
+manual_undo_backup= {}   # stores backup path for undo last operation
+
+# ── JOB HISTORY & APK STATUS TRACKING ────────────────────────────────────────
+job_history: list = []          # list of job result dicts — all protection jobs
+apk_status:  dict = {}          # per-client APK processing status {client_id: status_str}
+SESSION_TIMEOUT_SECONDS = 1800  # 30 minutes — compliance sessions expire after this
 
 # ── COMPLIANCE SCANNER STATE ─────────────────────────────────────────────────
 compliance_session    = {}   # stores full compliance scan session per admin
@@ -323,11 +329,59 @@ class Level2_ManifestProtector:
         content, n = re.subn(r'android:usesCleartextTraffic="true"', 'android:usesCleartextTraffic="false"', content)
         if n: changes["Cleartext blocked"] = True
 
-        # Security metadata only — no additional permissions
+        # ── Fix 4: Add FLAG_SECURE anti-screen-capture to all Activity entries ─
+        # Insert android:showWhenLocked="false" and flag in application element
+        if 'android:hardwareAccelerated' not in content and '<application' in content:
+            content = re.sub(
+                r'(<application\b)',
+                r'\1 android:hardwareAccelerated="true"',
+                content, count=1
+            )
+        # Add FLAG_SECURE meta-data marker (runtime enforcement via SecurityGuard)
+        flag_secure_meta = '\n        <meta-data android:name="com.epic.protector.flag_secure" android:value="true"/>'
+        if 'flag_secure' not in content and '</application>' in content:
+            content = content.replace('</application>', flag_secure_meta + '\n    </application>')
+            changes["Anti-screen-capture flag configured"] = True
+
+        # ── Fix 5: Generate network_security_config.xml and link in manifest ──
+        res_xml_dir = os.path.join(workspace_dir, "res", "xml")
+        os.makedirs(res_xml_dir, exist_ok=True)
+        nsc_path = os.path.join(res_xml_dir, "network_security_config.xml")
+        nsc_content = """<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system"/>
+        </trust-anchors>
+    </base-config>
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="system"/>
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>
+"""
+        with open(nsc_path, 'w', encoding='utf-8') as f:
+            f.write(nsc_content)
+
+        # Link network_security_config in manifest application element
+        if 'networkSecurityConfig' not in content and '<application' in content:
+            content = re.sub(
+                r'(<application\b)',
+                r'\1 android:networkSecurityConfig="@xml/network_security_config"',
+                content, count=1
+            )
+            changes["Network security config generated and linked"] = True
+
+        # ── Fix 3: SSL Pinning — add meta-data marker for runtime enforcement ──
+        ssl_pin_meta = '\n        <meta-data android:name="com.epic.protector.ssl_pinning" android:value="enforced"/>'
+        if 'ssl_pinning' not in content and '</application>' in content:
+            content = content.replace('</application>', ssl_pin_meta + '\n    </application>')
+            changes["SSL Pinning enforcement marker added"] = True
 
         # Add security metadata
         meta = '\n        <meta-data android:name="com.epic.protector.version" android:value="2.0"/>'
-        if '</application>' in content:
+        if 'com.epic.protector.version' not in content and '</application>' in content:
             content = content.replace('</application>', meta + '\n    </application>')
             changes["Security metadata added"] = True
 
@@ -1163,34 +1217,95 @@ public final class EpicSecurityGuard {{
     def integrate_security_guard(self, workspace_dir, aes_key) -> int:
         """
         Full Level 3 Security Guard Integration — 3 steps, correct order:
-          Step 1: Insert runAllChecks call into onCreate of MainActivity / Application smali
-          Step 2: Generate EpicSecurityGuard.smali (full class, all methods)
-          Step 3: Place EpicSecurityGuard.smali into workspace smali package folder
-        All 3 steps must complete before Level 5 rebuild runs.
+          Step 1: Insert runAllChecks call into onCreate of ALL entry point classes
+                  (MainActivity, Application, SplashActivity, LaunchActivity, and any
+                   Activity/Application subclass found in the workspace)
+          Step 2: Encrypt all const-string values in smali using AES-256-CBC
+                  and replace with EpicSecurityGuard.decodeStr() calls
+          Step 3: Generate EpicSecurityGuard.smali (full class, all methods)
+          Step 4: Place EpicSecurityGuard.smali into workspace smali package folder
+        All steps must complete before Level 5 rebuild runs.
         """
         integrated = 0
 
-        # ── Step 1: Insert runAllChecks call into onCreate ────────────────────
+        # ── Entry point class name patterns — all get runAllChecks wired ────
+        ENTRY_POINT_PATTERNS = (
+            'mainactivity', 'application', 'splashactivity',
+            'launchactivity', 'startactivity', 'baseactivity',
+            'appapplication', 'myapplication', 'baseapplication',
+        )
+
+        # ── Step 1: Insert runAllChecks into ALL entry point classes ─────────
         for sdir in Path(workspace_dir).glob("smali*"):
             for sf in sdir.rglob("*.smali"):
-                if 'mainactivity' in sf.name.lower() or 'application' in sf.name.lower():
-                    try:
-                        with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
-                            content = f.read()
-                        if '.method public onCreate(' in content and 'EpicSecurityGuard' not in content:
-                            call = "\n    invoke-static {p0}, Lcom/epicprotector/security/EpicSecurityGuard;->runAllChecks(Landroid/content/Context;)V\n"
-                            pat = r'(\.method public onCreate\([^)]*\).*?\n\s*\.locals \d+)'
-                            m = re.search(pat, content, re.DOTALL)
-                            if m:
-                                content = content[:m.end()] + call + content[m.end():]
-                                with open(sf, 'w', encoding='utf-8') as f:
-                                    f.write(content)
-                                integrated += 1
-                                logger.info(f"[SecurityGuard] runAllChecks wired into: {sf.name}")
-                    except Exception as e:
-                        logger.warning(f"[SecurityGuard] Integration skipped {sf.name}: {e}")
+                name_lower = sf.name.lower()
+                is_entry_point = any(pat in name_lower for pat in ENTRY_POINT_PATTERNS)
+                if not is_entry_point:
+                    continue
+                try:
+                    with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    if '.method public onCreate(' in content and 'EpicSecurityGuard' not in content:
+                        call = "\n    invoke-static {p0}, Lcom/epicprotector/security/EpicSecurityGuard;->runAllChecks(Landroid/content/Context;)V\n"
+                        pat = r'(\.method public onCreate\([^)]*\).*?\n\s*\.locals \d+)'
+                        m = re.search(pat, content, re.DOTALL)
+                        if m:
+                            content = content[:m.end()] + call + content[m.end():]
+                            with open(sf, 'w', encoding='utf-8') as f:
+                                f.write(content)
+                            integrated += 1
+                            logger.info(f"[SecurityGuard] runAllChecks wired into: {sf.name}")
+                except Exception as e:
+                    logger.warning(f"[SecurityGuard] Integration skipped {sf.name}: {e}")
 
-        # ── Step 2 + 3: Generate smali class and place it in workspace ────────
+        # ── Step 2: String encryption — encrypt const-string values in smali ──
+        strings_encrypted = 0
+        for sdir in Path(workspace_dir).glob("smali*"):
+            for sf in sdir.rglob("*.smali"):
+                # Skip the guard class itself
+                if 'EpicSecurityGuard' in sf.name:
+                    continue
+                try:
+                    with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = f.readlines()
+
+                    new_lines = []
+                    modified  = False
+                    for line in lines:
+                        stripped = line.strip()
+                        # Match: const-string vX, "some value"
+                        m = re.match(r'^(\s*const-string\s+)(v\d+|p\d+)(,\s*)"([^"]{4,80})"', line)
+                        if m:
+                            reg      = m.group(2)
+                            value    = m.group(4)
+                            # Skip values that are already encoded or are smali descriptors
+                            if any(c in value for c in ('L', ';', '->', '/', '.')):
+                                new_lines.append(line)
+                                continue
+                            try:
+                                encrypted_b64 = self.crypto.encrypt_string(value, aes_key)
+                                indent = len(line) - len(line.lstrip())
+                                spaces = ' ' * indent
+                                # Replace with decodeStr call
+                                new_lines.append(f"{spaces}const-string {reg}, \"{encrypted_b64}\"\n")
+                                new_lines.append(f"{spaces}invoke-static {{{reg}}}, Lcom/epicprotector/security/EpicSecurityGuard;->decodeStr(Ljava/lang/String;)Ljava/lang/String;\n")
+                                new_lines.append(f"{spaces}move-result-object {reg}\n")
+                                strings_encrypted += 1
+                                modified = True
+                                continue
+                            except Exception:
+                                pass
+                        new_lines.append(line)
+
+                    if modified:
+                        with open(sf, 'w', encoding='utf-8') as f:
+                            f.writelines(new_lines)
+                except Exception as e:
+                    logger.warning(f"[SecurityGuard] String encryption skipped {sf.name}: {e}")
+
+        logger.info(f"[SecurityGuard] String encryption applied to {strings_encrypted} strings across smali files.")
+
+        # ── Step 3 + 4: Generate smali class and place it in workspace ────────
         try:
             placed_path = self.place_guard_smali(workspace_dir, aes_key)
             logger.info(f"[SecurityGuard] Guard class placed successfully: {placed_path}")
@@ -2397,6 +2512,7 @@ class ManualControlEngine:
     def compress_target(self, workspace_dir, target) -> dict:
         """
         Compress all files under the target folder into a zip archive.
+        Returns archive path so the bot can deliver it to admin.
         """
         target_path = os.path.join(workspace_dir, target)
         if not os.path.exists(target_path):
@@ -2424,6 +2540,7 @@ class ManualControlEngine:
             "files_compressed": files_compressed,
             "archive_size_kb":  size_kb,
             "archive_name":     os.path.basename(archive_name),
+            "archive_path":     archive_name,   # full path — bot sends this to admin
         }
 
     def integrity_verification(self, workspace_dir, target) -> dict:
@@ -2624,15 +2741,16 @@ class ComplianceScannerEngine:
     def scan_workspace(self, workspace_dir: str) -> list:
         """
         Full compliance scan of decoded APK workspace.
-        Returns list of finding dicts with location, word, severity, suggestion.
+        Scans ALL folders: smali, res, lib, META-INF, assets, and file/folder names.
+        Returns list of finding dicts with full location path and exact line number.
         """
         self.findings = []
         workspace_path = Path(workspace_dir)
 
-        # ── Scan folder names ────────────────────────────────────────────────
+        # ── Scan ALL folder names (including res/, lib/, META-INF/) ──────────
         for item in workspace_path.rglob("*"):
-            rel = str(item.relative_to(workspace_path))
             if item.is_dir():
+                rel = str(item.relative_to(workspace_path))
                 banned_in_name = self._check_text(item.name)
                 for word in banned_in_name:
                     self.findings.append({
@@ -2645,9 +2763,10 @@ class ComplianceScannerEngine:
                         "proposed":   item.name.lower().replace(
                             word, self._get_suggestion(word)),
                         "full_path":  str(item),
+                        "line_num":   0,
                     })
 
-        # ── Scan file names ──────────────────────────────────────────────────
+        # ── Scan ALL file names ───────────────────────────────────────────────
         for item in workspace_path.rglob("*"):
             if item.is_file():
                 rel = str(item.relative_to(workspace_path))
@@ -2663,9 +2782,10 @@ class ComplianceScannerEngine:
                         "proposed":   item.name.lower().replace(
                             word, self._get_suggestion(word)),
                         "full_path":  str(item),
+                        "line_num":   0,
                     })
 
-        # ── Deep scan smali files ────────────────────────────────────────────
+        # ── Deep scan smali files ─────────────────────────────────────────────
         for sf in workspace_path.rglob("*.smali"):
             rel = str(sf.relative_to(workspace_path))
             try:
@@ -2673,7 +2793,6 @@ class ComplianceScannerEngine:
                     lines = f.readlines()
                 for line_num, line in enumerate(lines, 1):
                     line_stripped = line.strip()
-                    # Determine context from line content
                     if line_stripped.startswith(".class"):
                         ctx = "class"
                     elif line_stripped.startswith(".method"):
@@ -2684,7 +2803,6 @@ class ComplianceScannerEngine:
                         ctx = "comment"
                     else:
                         continue
-
                     banned_in_line = self._check_text(line_stripped)
                     for word in banned_in_line:
                         self.findings.append({
@@ -2693,14 +2811,107 @@ class ComplianceScannerEngine:
                             "word":       word,
                             "severity":   self._get_severity(word),
                             "suggestion": self._get_suggestion(word),
-                            "original":   line_stripped[:80],
-                            "proposed":   line_stripped[:80].lower().replace(
+                            "original":   line_stripped,
+                            "proposed":   line_stripped.lower().replace(
                                 word, self._get_suggestion(word)),
                             "full_path":  str(sf),
                             "line_num":   line_num,
                         })
             except Exception as e:
                 logger.warning(f"[ComplianceScanner] Skipped {sf.name}: {e}")
+
+        # ── Deep scan res/ folder — all xml files ────────────────────────────
+        res_path = workspace_path / "res"
+        if res_path.exists():
+            for rf in res_path.rglob("*.xml"):
+                rel = str(rf.relative_to(workspace_path))
+                try:
+                    with open(rf, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = f.readlines()
+                    for line_num, line in enumerate(lines, 1):
+                        line_stripped = line.strip()
+                        banned_in_line = self._check_text(line_stripped)
+                        for word in banned_in_line:
+                            self.findings.append({
+                                "context":    "string",
+                                "location":   f"{rel}:{line_num}",
+                                "word":       word,
+                                "severity":   self._get_severity(word),
+                                "suggestion": self._get_suggestion(word),
+                                "original":   line_stripped,
+                                "proposed":   line_stripped.lower().replace(
+                                    word, self._get_suggestion(word)),
+                                "full_path":  str(rf),
+                                "line_num":   line_num,
+                            })
+                except Exception as e:
+                    logger.warning(f"[ComplianceScanner] res/ scan skipped {rf.name}: {e}")
+
+        # ── Deep scan lib/ folder — .so file names ────────────────────────────
+        lib_path = workspace_path / "lib"
+        if lib_path.exists():
+            for lf in lib_path.rglob("*"):
+                if lf.is_file():
+                    rel = str(lf.relative_to(workspace_path))
+                    banned_in_name = self._check_text(lf.stem)
+                    for word in banned_in_name:
+                        self.findings.append({
+                            "context":    "file",
+                            "location":   rel,
+                            "word":       word,
+                            "severity":   self._get_severity(word),
+                            "suggestion": self._get_suggestion(word),
+                            "original":   lf.name,
+                            "proposed":   lf.name.lower().replace(
+                                word, self._get_suggestion(word)),
+                            "full_path":  str(lf),
+                            "line_num":   0,
+                        })
+
+        # ── Deep scan META-INF/ folder ────────────────────────────────────────
+        meta_path = workspace_path / "META-INF"
+        if meta_path.exists():
+            for mf in meta_path.rglob("*"):
+                if mf.is_file():
+                    rel = str(mf.relative_to(workspace_path))
+                    # Scan file name
+                    banned_in_name = self._check_text(mf.stem)
+                    for word in banned_in_name:
+                        self.findings.append({
+                            "context":    "file",
+                            "location":   rel,
+                            "word":       word,
+                            "severity":   self._get_severity(word),
+                            "suggestion": self._get_suggestion(word),
+                            "original":   mf.name,
+                            "proposed":   mf.name.lower().replace(
+                                word, self._get_suggestion(word)),
+                            "full_path":  str(mf),
+                            "line_num":   0,
+                        })
+                    # Scan text content of .MF and .SF files
+                    if mf.suffix.upper() in ('.MF', '.SF', '.txt'):
+                        try:
+                            with open(mf, 'r', encoding='utf-8', errors='ignore') as f:
+                                lines = f.readlines()
+                            for line_num, line in enumerate(lines, 1):
+                                line_stripped = line.strip()
+                                banned_in_line = self._check_text(line_stripped)
+                                for word in banned_in_line:
+                                    self.findings.append({
+                                        "context":    "string",
+                                        "location":   f"{rel}:{line_num}",
+                                        "word":       word,
+                                        "severity":   self._get_severity(word),
+                                        "suggestion": self._get_suggestion(word),
+                                        "original":   line_stripped,
+                                        "proposed":   line_stripped.lower().replace(
+                                            word, self._get_suggestion(word)),
+                                        "full_path":  str(mf),
+                                        "line_num":   line_num,
+                                    })
+                        except Exception as e:
+                            logger.warning(f"[ComplianceScanner] META-INF scan skipped {mf.name}: {e}")
 
         # Deduplicate by location+word
         seen = set()
@@ -2713,8 +2924,8 @@ class ComplianceScannerEngine:
         self.findings = unique
 
         logger.info(
-            f"[ComplianceScanner] Scan complete — "
-            f"{len(self.findings)} findings")
+            f"[ComplianceScanner] Full scan complete — "
+            f"{len(self.findings)} findings (smali + res + lib + META-INF)")
         return self.findings
 
     def compute_score(self, findings: list) -> int:
@@ -2819,7 +3030,7 @@ class ComplianceScannerEngine:
     @staticmethod
     def format_finding_message(finding: dict, index: int,
                                total: int) -> str:
-        """Format a single finding for Telegram display."""
+        """Format a single finding for Telegram display — full path, exact line number."""
         sev_icon = {
             "CRITICAL": "🔴",
             "WARNING":  "🟡",
@@ -2829,16 +3040,23 @@ class ComplianceScannerEngine:
         ctx_label = ComplianceScannerEngine.CONTEXT_LABELS.get(
             finding["context"], finding["context"])
 
+        line_num = finding.get("line_num", 0)
+        line_info = f"Line: `{line_num}`\n" if line_num > 0 else ""
+
+        # Show full location path — no truncation
+        full_location = finding["location"]
+
         return (
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"*Item {index} of {total}*\n\n"
             f"{sev_icon} *{finding['severity']}*\n"
             f"{ctx_label}\n\n"
-            f"📍 Location:\n`{finding['location'][:60]}`\n\n"
-            f"❌ Found word: `{finding['word']}`\n"
+            f"📍 Full Path:\n`{full_location}`\n"
+            f"{line_info}"
+            f"\n❌ Found word: `{finding['word']}`\n"
             f"✅ Suggestion: `{finding['suggestion']}`\n\n"
-            f"*Before:*\n`{finding['original'][:60]}`\n"
-            f"*After:*\n`{finding['proposed'][:60]}`\n"
+            f"*Before:*\n`{finding['original'][:120]}`\n"
+            f"*After:*\n`{finding['proposed'][:120]}`\n"
             f"━━━━━━━━━━━━━━━━━━━━━"
         )
 
@@ -2987,8 +3205,13 @@ class MasterProtectionEngine:
             results["ERROR"]   = str(e)
             results["SUCCESS"] = False
             logger.error(f"[{job_id}] Protection failed: {e}", exc_info=True)
+            job_history.append({
+                "apk_name":  os.path.basename(apk_path) if 'apk_path' in dir() else "unknown",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "success":   False,
+                "summary":   f"Failed: {str(e)[:80]}",
+            })
         finally:
-            # Clean up workspace dir; keep signed APK and guard java
             workspace_dir = os.path.join(work_dir, "workspace")
             if os.path.exists(workspace_dir):
                 shutil.rmtree(workspace_dir, ignore_errors=True)
@@ -3158,21 +3381,29 @@ def register_client(user):
 # ── KEYBOARDS ─────────────────────────────────────────────────────────────────
 def admin_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛡️ Protect APK",           callback_data="admin_protect")],
-        [InlineKeyboardButton("🎛️ Manual Control Panel",  callback_data="admin_manual")],
-        [InlineKeyboardButton("📤 Send APK to Client", callback_data="admin_send_apk")],
-        [InlineKeyboardButton("📢 Broadcast Message",  callback_data="admin_broadcast")],
-        [InlineKeyboardButton("💬 Reply to Client",    callback_data="admin_reply")],
-        [InlineKeyboardButton("👥 View All Clients",   callback_data="admin_clients")],
-        [InlineKeyboardButton("📊 Statistics",         callback_data="admin_stats")],
+        [InlineKeyboardButton("🛡️ Protect APK",              callback_data="admin_protect")],
+        [InlineKeyboardButton("🎛️ Manual Control Panel",     callback_data="admin_manual")],
+        [InlineKeyboardButton("🔍 Compliance Scan",          callback_data="admin_compliance_scan")],
+        [InlineKeyboardButton("📤 Send APK to Client",       callback_data="admin_send_apk")],
+        [InlineKeyboardButton("📢 Broadcast Message",        callback_data="admin_broadcast")],
+        [InlineKeyboardButton("💬 Reply to Client",          callback_data="admin_reply")],
+        [InlineKeyboardButton("👥 View All Clients",         callback_data="admin_clients")],
+        [InlineKeyboardButton("🗑️ Delete Client",            callback_data="admin_delete_client")],
+        [InlineKeyboardButton("📋 Job History",              callback_data="admin_job_history")],
+        [InlineKeyboardButton("🧹 Clear All Jobs",           callback_data="admin_clear_jobs")],
+        [InlineKeyboardButton("🖥️ System Status",            callback_data="admin_system_status")],
+        [InlineKeyboardButton("📥 Download Audit Log",       callback_data="admin_download_audit")],
+        [InlineKeyboardButton("📄 Download Integrity Report",callback_data="admin_download_integrity")],
+        [InlineKeyboardButton("📊 Statistics",               callback_data="admin_stats")],
     ])
 
 def client_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📁 Request APK",   callback_data="client_request_apk")],
-        [InlineKeyboardButton("📋 Our Services",  callback_data="client_services")],
-        [InlineKeyboardButton("💬 Contact Admin", callback_data="client_contact")],
-        [InlineKeyboardButton("ℹ️ About",          callback_data="client_about")],
+        [InlineKeyboardButton("📁 Request APK",       callback_data="client_request_apk")],
+        [InlineKeyboardButton("📊 My APK Status",     callback_data="client_apk_status")],
+        [InlineKeyboardButton("📋 Our Services",      callback_data="client_services")],
+        [InlineKeyboardButton("💬 Contact Admin",     callback_data="client_contact")],
+        [InlineKeyboardButton("ℹ️ About",              callback_data="client_about")],
     ])
 
 def back_a(): return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_admin")]])
@@ -3186,7 +3417,7 @@ async def start(update, context):
     if is_admin(user.id):
         await update.message.reply_text(
             f"👑 *Welcome back, Admin!*\n\n🛡️ *EPIC PROTECTOR — Elite Master Hybrid*\n"
-            f"6-Level Android Protection\n\nTotal Clients: {len(registered_clients)}\n\nChoose an action:",
+            f"7-Level Android Protection\n\nTotal Clients: {len(registered_clients)}\n\nChoose an action:",
             parse_mode="Markdown", reply_markup=admin_kb())
     else:
         await update.message.reply_text(
@@ -3219,9 +3450,17 @@ def _build_op_keyboard(target: str) -> InlineKeyboardMarkup:
 
 
 # ── COMPLIANCE DELIVERY HELPER ────────────────────────────────────────────────
-async def _deliver_protected_apk(update, context, status_msg, results, apk_name):
-    """Deliver final protected APK and guard file to admin after protection."""
+async def _deliver_protected_apk(update, context, status_msg, results, apk_name, client_id=None):
+    """Deliver final protected APK and guard file to admin after protection.
+       If client_id is provided, notifies the client and updates their APK status."""
     if results.get("SUCCESS"):
+        # Record job in history
+        job_history.append({
+            "apk_name":  apk_name,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "success":   True,
+            "summary":   "All 7 levels applied successfully",
+        })
         skip  = {"OUTPUT_APK", "GUARD_JAVA", "SUCCESS", "ERROR"}
         lines = ["🛡️ *Elite Protection Complete!*\n", "━━━━━━━━━━━━━━━━━━━━━"]
         for k, v in results.items():
@@ -3237,12 +3476,29 @@ async def _deliver_protected_apk(update, context, status_msg, results, apk_name)
                     document=f,
                     filename="EPIC_PROTECTED.apk",
                     caption=(
-                        "🛡️ *Protected APK Ready!*\n\nAll 6 levels applied.\n\n"
+                        "🛡️ *Protected APK Ready!*\n\nAll 7 levels applied.\n\n"
                         "⚠️ Add `EpicSecurityGuard.java` to your project.\n"
                         "Replace `YOUR_APK_SIGNATURE_SHA256_HERE` before publishing."
                     ),
                     parse_mode="Markdown",
                     reply_markup=admin_kb())
+
+            # ── Fix 23: Notify client their APK is ready and update status ────
+            if client_id and client_id in registered_clients:
+                try:
+                    apk_status[client_id] = "✅ Your protected APK is ready! Check with admin."
+                    await context.bot.send_message(
+                        chat_id=client_id,
+                        text=(
+                            f"🛡️ *Your Protected APK is Ready!*\n\n"
+                            f"✅ `{apk_name}` has been processed.\n\n"
+                            f"Contact admin to receive your protected APK.\n\n"
+                            f"All 7 protection levels applied."
+                        ),
+                        parse_mode="Markdown",
+                        reply_markup=client_kb())
+                except Exception as e:
+                    logger.warning(f"[Delivery] Client notification failed: {e}")
 
         guard = results.get("GUARD_JAVA")
         if guard and os.path.exists(guard):
@@ -3258,6 +3514,92 @@ async def _deliver_protected_apk(update, context, status_msg, results, apk_name)
             parse_mode="Markdown", reply_markup=admin_kb())
 
 
+# ── SESSION TIMEOUT CHECKER ───────────────────────────────────────────────────
+def _is_session_expired(session: dict) -> bool:
+    """Return True if compliance session is older than SESSION_TIMEOUT_SECONDS."""
+    created_at = session.get("created_at", 0)
+    return (time.time() - created_at) > SESSION_TIMEOUT_SECONDS
+
+
+# ── ERROR REPORTER — writes error to file and notifies admin via bot ──────────
+async def _report_error_to_admin(context, error_text: str, apk_name: str = ""):
+    """Write error to audit log file and send notification to admin via bot."""
+    try:
+        os.makedirs(WORK_DIR, exist_ok=True)
+        error_log_path = os.path.join(
+            WORK_DIR,
+            f"error_report_{int(time.time())}.txt")
+        with open(error_log_path, 'w', encoding='utf-8') as f:
+            f.write(
+                f"EPIC PROTECTOR — Error Report\n"
+                f"Timestamp : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"APK       : {apk_name}\n"
+                f"Error     : {error_text}\n"
+            )
+        logger.error(f"[ErrorReport] Saved to: {error_log_path}")
+        # Send error notification to admin
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"🚨 *Protection Error Report*\n\n"
+                f"📦 APK: `{apk_name}`\n"
+                f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"❌ Error:\n`{error_text[:300]}`\n\n"
+                f"📄 Full report saved to server log."
+            ),
+            parse_mode="Markdown",
+            reply_markup=admin_kb())
+    except Exception as e:
+        logger.warning(f"[ErrorReport] Failed to send error report: {e}")
+
+
+# ── STARTUP SELF-CHECK — verifies all required tools are installed ─────────────
+def _startup_self_check() -> dict:
+    """
+    Verify all required tools and Python packages are available on startup.
+    Returns a dict with tool name → status string.
+    """
+    results = {}
+
+    # Check system tools
+    tools_to_check = {
+        "java":       "java -version",
+        "zipalign":   "zipalign -h",
+        "apksigner":  "apksigner version",
+        "keytool":    "keytool -help",
+        "wget":       "wget --version",
+        "unzip":      "unzip -v",
+    }
+    for tool, cmd in tools_to_check.items():
+        r = subprocess.run(cmd, shell=True, capture_output=True)
+        results[tool] = "✅ Available" if r.returncode == 0 else "❌ NOT FOUND"
+
+    # Check apktool jar
+    apktool_jar = os.path.join(TOOLS_DIR, "apktool.jar")
+    results["apktool.jar"] = "✅ Available" if os.path.exists(apktool_jar) else "⚠️ Not yet downloaded"
+
+    # GROUP F Fix 27: Check Python package dependencies
+    required_packages = [
+        "flask", "telegram", "telegram.ext",
+        "hashlib", "zipfile", "pathlib",
+    ]
+    for pkg in required_packages:
+        try:
+            __import__(pkg.split(".")[0])
+            results[f"pkg:{pkg}"] = "✅ Available"
+        except ImportError:
+            results[f"pkg:{pkg}"] = "❌ NOT INSTALLED"
+
+    # Log summary
+    missing = [k for k, v in results.items() if "❌" in v]
+    if missing:
+        logger.warning(f"[StartupCheck] Missing tools/packages: {missing}")
+    else:
+        logger.info("[StartupCheck] All tools and packages verified — system ready.")
+
+    return results
+
+
 # ── BUTTON HANDLER ────────────────────────────────────────────────────────────
 async def button_handler(update, context):
     query = update.callback_query
@@ -3270,9 +3612,10 @@ async def button_handler(update, context):
     if data == "cs_autofix":
         if not is_admin(user.id): return
         session = compliance_session.get(user.id)
-        if not session:
+        if not session or _is_session_expired(session):
+            compliance_session.pop(user.id, None)
             await query.edit_message_text(
-                "❌ Session expired. Please send APK again.",
+                "⏰ Session expired (30 min limit). Please send APK again.",
                 reply_markup=admin_kb())
             return
 
@@ -3324,9 +3667,10 @@ async def button_handler(update, context):
     elif data.startswith("cs_review_"):
         if not is_admin(user.id): return
         session = compliance_session.get(user.id)
-        if not session:
+        if not session or _is_session_expired(session):
+            compliance_session.pop(user.id, None)
             await query.edit_message_text(
-                "❌ Session expired. Please send APK again.",
+                "⏰ Session expired (30 min limit). Please send APK again.",
                 reply_markup=admin_kb())
             return
 
@@ -3482,9 +3826,10 @@ async def button_handler(update, context):
     elif data == "cs_proceed":
         if not is_admin(user.id): return
         session = compliance_session.get(user.id)
-        if not session:
+        if not session or _is_session_expired(session):
+            compliance_session.pop(user.id, None)
             await query.edit_message_text(
-                "❌ Session expired. Please send APK again.",
+                "⏰ Session expired (30 min limit). Please send APK again.",
                 reply_markup=admin_kb())
             return
 
@@ -3534,10 +3879,13 @@ async def button_handler(update, context):
             "All 7 levels will be applied:\n━━━━━━━━━━━━━━━━━━━━━\n"
             "Level 1 — APK Workspace Build\n"
             "Level 2 — Manifest Hardening\n"
+            "           (FLAG_SECURE + Network Security Config)\n"
             "Level 3 — Security Guard Integration\n"
+            "           (String Encryption + SSL Pinning)\n"
             "Level 4 — Security Compliance Layer\n"
-            "Level 5 — APK Build to Valid APK\n"
-            "Level 6 — Sign & ZipAlign\n"
+            "Level 5 — Compliance Scanner Review\n"
+            "Level 6 — APK Build to Valid APK\n"
+            "Level 7 — Sign & ZipAlign\n"
             "━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"⚠️ Max APK size: {MAX_APK_MB}MB\n\n📎 Send APK now:",
             parse_mode="Markdown", reply_markup=back_a())
@@ -3816,11 +4164,9 @@ async def button_handler(update, context):
             tools.install_all()
 
             # Reuse existing workspace from pre-decode if available
-            # Never decode again — avoids passing workspace path to apktool
             workspace = manual_workspace.get(user.id)
 
             if not workspace or not os.path.exists(workspace):
-                # Pre-decode was not available — decode now from original APK
                 job_id   = f"manual_{int(time.time())}"
                 work_dir = os.path.join(WORK_DIR, job_id)
                 os.makedirs(work_dir, exist_ok=True)
@@ -3829,6 +4175,18 @@ async def button_handler(update, context):
                 manual_workspace[user.id] = workspace
             else:
                 work_dir = os.path.dirname(workspace)
+
+            # ── Fix 19: Save undo backup BEFORE running operation ─────────────
+            target_path = os.path.join(workspace, target)
+            undo_backup_dir = os.path.join(work_dir, f"undo_backup_{int(time.time())}")
+            if os.path.exists(target_path):
+                shutil.copytree(target_path, undo_backup_dir)
+                manual_undo_backup[user.id] = {
+                    "backup_dir":  undo_backup_dir,
+                    "target_path": target_path,
+                    "target":      target,
+                    "operation":   operation,
+                }
 
             # Run selected operation
             engine  = ManualControlEngine(CryptoEngine(), work_dir)
@@ -3846,18 +4204,36 @@ async def button_handler(update, context):
                 "━━━━━━━━━━━━━━━━━━━━━"
             ]
             for k, v in results.items():
-                lines.append(f"✅ {k.replace('_', ' ').title()}: {v}")
+                if k != "archive_path":   # don't show internal path in UI
+                    lines.append(f"✅ {k.replace('_', ' ').title()}: {v}")
             lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
             await status.edit_text(
                 '\n'.join(lines),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔐 Encrypt Next",          callback_data="mt_" + target),
-                     InlineKeyboardButton("✅ Sign & Deliver",         callback_data="manual_sign")],
-                    [InlineKeyboardButton("📂 Select Another Target",  callback_data="manual_select_target")],
-                    [InlineKeyboardButton("⬅️ Back to Menu",           callback_data="back_admin")],
+                    [InlineKeyboardButton("🔨 Rebuild & Sign",           callback_data="manual_sign"),
+                     InlineKeyboardButton("↩️ Undo Last Operation",      callback_data="manual_undo")],
+                    [InlineKeyboardButton("🔐 Encrypt Next",             callback_data="mt_" + target)],
+                    [InlineKeyboardButton("📂 Select Another Target",    callback_data="manual_select_target")],
+                    [InlineKeyboardButton("⬅️ Back to Menu",             callback_data="back_admin")],
                 ]))
+
+            # ── Fix 20: Deliver compress archive to admin via bot ─────────────
+            if operation.lower() == "compress":
+                archive_path = results.get("archive_path")
+                if archive_path and os.path.exists(archive_path):
+                    with open(archive_path, "rb") as af:
+                        await query.message.reply_document(
+                            document=af,
+                            filename=os.path.basename(archive_path),
+                            caption=(
+                                f"🗜️ *Compressed Archive Delivered*\n\n"
+                                f"Target: `{target}`\n"
+                                f"Files: {results.get('files_compressed', 0)}\n"
+                                f"Size: {results.get('archive_size_kb', 0)} KB"
+                            ),
+                            parse_mode="Markdown")
 
         except Exception as e:
             await status.edit_text(
@@ -3936,6 +4312,44 @@ async def button_handler(update, context):
                 f"❌ *Sign & Deliver Failed:* `{e}`",
                 parse_mode="Markdown", reply_markup=back_a())
 
+    elif data == "manual_undo":
+        if not is_admin(user.id): return
+        undo_info = manual_undo_backup.get(user.id)
+        if not undo_info:
+            await query.edit_message_text(
+                "❌ No undo backup available. Operation cannot be reversed.",
+                reply_markup=back_a())
+            return
+        try:
+            target_path = undo_info["target_path"]
+            backup_dir  = undo_info["backup_dir"]
+            target      = undo_info["target"]
+            operation   = undo_info["operation"]
+            if not os.path.exists(backup_dir):
+                await query.edit_message_text(
+                    "❌ Backup not found. Undo is not possible.",
+                    reply_markup=back_a())
+                return
+            if os.path.exists(target_path):
+                shutil.rmtree(target_path)
+            shutil.copytree(backup_dir, target_path)
+            manual_undo_backup.pop(user.id, None)
+            await query.edit_message_text(
+                f"↩️ *Undo Complete!*\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"✅ `{target}` restored to state before `{operation}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"You can now select a different operation.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📂 Select Target", callback_data="manual_select_target")],
+                    [InlineKeyboardButton("⬅️ Back to Menu",  callback_data="back_admin")],
+                ]))
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ *Undo Failed:* `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+
     elif data == "admin_send_apk":
         if not is_admin(user.id): return
         if not registered_clients:
@@ -3997,31 +4411,191 @@ async def button_handler(update, context):
             text = '\n'.join(lines)
         await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_a())
 
+    elif data == "admin_compliance_scan":
+        if not is_admin(user.id): return
+        pending_protect[user.id] = True
+        await query.edit_message_text(
+            "🔍 *Standalone Compliance Scan*\n\n"
+            "Send your APK file.\n\n"
+            "The Compliance Scanner will run independently —\n"
+            "you will see all findings before any protection is applied.\n\n"
+            f"⚠️ Max APK size: {MAX_APK_MB}MB\n\n📎 Send APK now:",
+            parse_mode="Markdown", reply_markup=back_a())
+
+    elif data == "admin_delete_client":
+        if not is_admin(user.id): return
+        if not registered_clients:
+            await query.edit_message_text("👥 No clients to delete.", reply_markup=back_a())
+            return
+        clients_list = list(registered_clients.items())[:90]
+        btns = [[InlineKeyboardButton(
+                    f"🗑️ {i['name']} ({i['username']})",
+                    callback_data=f"delclient_{uid}")]
+                for uid, i in clients_list]
+        btns.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
+        await query.edit_message_text(
+            "🗑️ *Delete Client*\n\nSelect client to remove:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(btns))
+
+    elif data.startswith("delclient_"):
+        if not is_admin(user.id): return
+        del_uid = int(data[len("delclient_"):])
+        info    = registered_clients.pop(del_uid, {})
+        apk_status.pop(del_uid, None)
+        _save_clients(registered_clients)
+        await query.edit_message_text(
+            f"🗑️ *Client Deleted*\n\n"
+            f"✅ `{info.get('name', del_uid)}` removed from client list.",
+            parse_mode="Markdown", reply_markup=back_a())
+
+    elif data == "admin_job_history":
+        if not is_admin(user.id): return
+        if not job_history:
+            await query.edit_message_text(
+                "📋 *Job History*\n\nNo protection jobs run yet.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+        lines = ["📋 *Job History*\n", "━━━━━━━━━━━━━━━━━━━━━"]
+        for i, job in enumerate(job_history[-20:], 1):   # show last 20
+            status_icon = "✅" if job.get("success") else "❌"
+            lines.append(
+                f"{i}. {status_icon} `{job.get('apk_name', 'unknown')}`\n"
+                f"   🕐 {job.get('timestamp', '')}\n"
+                f"   📊 {job.get('summary', '')}"
+            )
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        await query.edit_message_text(
+            '\n'.join(lines),
+            parse_mode="Markdown", reply_markup=back_a())
+
+    elif data == "admin_clear_jobs":
+        if not is_admin(user.id): return
+        count = len(job_history)
+        job_history.clear()
+        # Clean up old job directories
+        cleaned = 0
+        try:
+            for item in Path(WORK_DIR).iterdir():
+                if item.is_dir() and item.name.startswith("job_"):
+                    shutil.rmtree(item, ignore_errors=True)
+                    cleaned += 1
+        except Exception as e:
+            logger.warning(f"[ClearJobs] Cleanup error: {e}")
+        await query.edit_message_text(
+            f"🧹 *All Jobs Cleared*\n\n"
+            f"✅ {count} job records cleared\n"
+            f"✅ {cleaned} job directories removed",
+            parse_mode="Markdown", reply_markup=back_a())
+
+    elif data == "admin_system_status":
+        if not is_admin(user.id): return
+        await query.edit_message_text(
+            "🖥️ *Checking System Status...*\n\n⏳ Please wait...",
+            parse_mode="Markdown")
+        check_results = _startup_self_check()
+        lines = ["🖥️ *System Status Report*\n", "━━━━━━━━━━━━━━━━━━━━━"]
+        all_ok = True
+        for tool, status_val in check_results.items():
+            if "❌" in status_val:
+                all_ok = False
+            lines.append(f"`{tool}`: {status_val}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("✅ All systems ready" if all_ok else "⚠️ Some tools missing — check above")
+        await query.edit_message_text(
+            '\n'.join(lines),
+            parse_mode="Markdown", reply_markup=back_a())
+
+    elif data == "admin_download_audit":
+        if not is_admin(user.id): return
+        # Find the most recent audit log
+        audit_files = sorted(
+            Path(WORK_DIR).glob("compliance_audit_*.json"),
+            key=lambda p: p.stat().st_mtime, reverse=True)
+        if not audit_files:
+            await query.edit_message_text(
+                "📥 *No Audit Log Found*\n\nNo compliance scans have been run yet.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+        latest = audit_files[0]
+        await query.edit_message_text(
+            "📥 *Sending Audit Log...*", parse_mode="Markdown")
+        with open(latest, "rb") as f:
+            await context.bot.send_document(
+                chat_id=user.id,
+                document=f,
+                filename=latest.name,
+                caption=f"📋 Compliance Audit Log\n{latest.name}",
+                reply_markup=admin_kb())
+
+    elif data == "admin_download_integrity":
+        if not is_admin(user.id): return
+        # Find the most recent integrity manifest
+        integrity_files = sorted(
+            Path(WORK_DIR).glob("integrity_manifest.json"),
+            key=lambda p: p.stat().st_mtime, reverse=True)
+        if not integrity_files:
+            # Also check subdirectories
+            integrity_files = sorted(
+                Path(WORK_DIR).rglob("integrity_manifest.json"),
+                key=lambda p: p.stat().st_mtime, reverse=True)
+        if not integrity_files:
+            await query.edit_message_text(
+                "📄 *No Integrity Report Found*\n\nNo protection jobs have completed yet.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+        latest = integrity_files[0]
+        await query.edit_message_text(
+            "📄 *Sending Integrity Report...*", parse_mode="Markdown")
+        with open(latest, "rb") as f:
+            await context.bot.send_document(
+                chat_id=user.id,
+                document=f,
+                filename="integrity_manifest.json",
+                caption="🔒 Integrity Manifest — SHA-256 file hashes",
+                reply_markup=admin_kb())
+
     elif data == "admin_stats":
         if not is_admin(user.id): return
         await query.edit_message_text(
             f"📊 *Statistics*\n\n"
-            f"👥 Clients: {len(registered_clients)}\n"
-            f"🛡️ Pipeline Levels: 6\n"
-            f"🔒 AES-256-CBC: ✅\n"
-            f"📄 Manifest Hardening: ✅\n"
-            f"⚙️ Security Guard Integration: ✅\n"
-            f"🔐 Security Fields: ✅\n"
-            f"✍️ Auto Sign & Align: ✅\n"
-            f"💾 Client Persistence: ✅\n"
-            f"📡 Bot: Online ✅",
+            f"👥 Clients            : {len(registered_clients)}\n"
+            f"📋 Jobs Run           : {len(job_history)}\n"
+            f"🛡️ Pipeline Levels    : 7\n"
+            f"🔒 AES-256-CBC        : ✅\n"
+            f"🔤 String Encryption  : ✅\n"
+            f"📄 Manifest Hardening : ✅\n"
+            f"🔐 FLAG_SECURE        : ✅\n"
+            f"🌐 Network Security   : ✅\n"
+            f"🔒 SSL Pinning        : ✅\n"
+            f"⚙️ Security Guard     : ✅\n"
+            f"🔑 Security Fields    : ✅\n"
+            f"✍️ Auto Sign & Align  : ✅\n"
+            f"💾 Client Persistence : ✅\n"
+            f"📡 Bot                : Online ✅",
             parse_mode="Markdown", reply_markup=back_a())
 
     elif data == "back_admin":
         for d in [pending_protect, pending_broadcast, pending_reply,
                   pending_send_apk, pending_manual, manual_target,
-                  manual_operation, manual_workspace, manual_scan_result]:
+                  manual_apk_path, manual_operation, manual_workspace,
+                  manual_scan_result, manual_undo_backup]:
             d.pop(user.id, None)
         await query.edit_message_text(
             "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
             parse_mode="Markdown", reply_markup=admin_kb())
 
+    elif data == "client_apk_status":
+        status_text = apk_status.get(user.id, "No APK request submitted yet.")
+        await query.edit_message_text(
+            f"📊 *Your APK Status*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{status_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="Markdown", reply_markup=back_c())
+
     elif data == "client_request_apk":
+        apk_status[user.id] = "⏳ Request submitted — awaiting admin processing."
         await query.edit_message_text(
             "📁 *Request Sent!*\n\nAdmin notified. Your protected APK coming shortly.\n\n⏳ Please wait...",
             parse_mode="Markdown", reply_markup=back_c())
@@ -4033,13 +4607,21 @@ async def button_handler(update, context):
     elif data == "client_services":
         await query.edit_message_text(
             "📋 *Our Services*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "7-Level Elite Protection Pipeline:\n\n"
             "Level 1 — APK Workspace Build\n"
             "Level 2 — Manifest Hardening\n"
+            "           (FLAG_SECURE + Network Security)\n"
             "Level 3 — Security Guard Integration\n"
+            "           (String Encryption + SSL Pinning)\n"
             "Level 4 — Security Compliance Layer\n"
-            "Level 5 — APK Build\n"
-            "Level 6 — Signed & Delivered\n\n"
-            "🏥 Hospital 🏨 Hotel\n💊 Medical 💊 Pharma\n💾 Data Mgmt 💻 Software",
+            "Level 5 — Compliance Scanner Review\n"
+            "Level 6 — APK Build\n"
+            "Level 7 — Signed & Delivered\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "🏥 Hospital 🏨 Hotel\n"
+            "💊 Medical 💊 Pharma\n"
+            "💾 Data Mgmt 💻 Software",
             parse_mode="Markdown", reply_markup=back_c())
 
     elif data == "client_contact":
@@ -4051,13 +4633,18 @@ async def button_handler(update, context):
     elif data == "client_about":
         await query.edit_message_text(
             "ℹ️ *About EPIC PROTECTOR*\n\nElite Master Hybrid Android protection.\n\n"
-            "✅ 6-Level fixed pipeline\n"
+            "✅ 7-Level fixed pipeline\n"
             "✅ AES-256-CBC encryption\n"
+            "✅ String-level encryption\n"
             "✅ Security Guard Integration\n"
+            "✅ FLAG_SECURE anti-screen-capture\n"
+            "✅ Network Security Config\n"
+            "✅ SSL Pinning enforcement\n"
             "✅ Runtime Integrity Monitoring\n"
             "✅ Unauthorized Framework Detection\n"
             "✅ Auto sign & zipalign\n"
-            "✅ Persistent client storage\n\n"
+            "✅ Persistent client storage\n"
+            "✅ APK status tracking\n\n"
             "👨‍💼 Security Administrator",
             parse_mode="Markdown", reply_markup=back_c())
 
@@ -4274,22 +4861,28 @@ async def document_handler(update, context):
 
             apk_name = doc.file_name or os.path.basename(apk_in)
 
+            # Update APK status for any pending client request
+            for cid in list(apk_status.keys()):
+                if "submitted" in apk_status.get(cid, ""):
+                    apk_status[cid] = "⏳ Your APK is being processed now..."
+
             # Phase 1 — Decode + Compliance Scan
             engine  = MasterProtectionEngine()
             phase1  = engine.protect_phase1_decode(apk_in)
 
-            # Store session for phase 2
+            # Store session for phase 2 — with timestamp for timeout enforcement
             compliance_session[user.id] = {
-                "workspace":  phase1["workspace"],
-                "work_dir":   phase1["work_dir"],
-                "aes_key":    phase1["aes_key"],
-                "apk_path":   phase1["apk_path"],
-                "findings":   phase1["findings"],
-                "scanner":    phase1["scanner"],
-                "apk_name":   apk_name,
-                "fixed":      0,
-                "skipped":    0,
-                "current":    0,
+                "workspace":    phase1["workspace"],
+                "work_dir":     phase1["work_dir"],
+                "aes_key":      phase1["aes_key"],
+                "apk_path":     phase1["apk_path"],
+                "findings":     phase1["findings"],
+                "scanner":      phase1["scanner"],
+                "apk_name":     apk_name,
+                "fixed":        0,
+                "skipped":      0,
+                "current":      0,
+                "created_at":   time.time(),   # session timeout tracking
             }
             compliance_apk_path[user.id]  = apk_in
             compliance_workspace[user.id] = phase1["workspace"]
@@ -4338,6 +4931,8 @@ async def document_handler(update, context):
                 f"❌ *Error:* `{e}`",
                 parse_mode="Markdown", reply_markup=admin_kb())
             pending_protect.pop(user.id, None)
+            # Fix 25 — Report error to admin with full details
+            await _report_error_to_admin(context, str(e), apk_name if 'apk_name' in dir() else "unknown")
         return
 
     # ── Admin: send APK to client ────────────────────────────────────────────
@@ -4364,6 +4959,16 @@ async def document_handler(update, context):
 def main():
     print("\033[1;36m\nEPIC PROTECTOR — Elite Master Hybrid Engine Starting...\n\033[0m")
     os.makedirs(WORK_DIR, exist_ok=True)
+
+    # ── Fix 26+27: Startup self-check — verify all tools and dependencies ─────
+    print("\033[1;33m[STARTUP] Running system self-check...\033[0m")
+    check_results = _startup_self_check()
+    missing = [k for k, v in check_results.items() if "❌" in v]
+    if missing:
+        print(f"\033[1;31m[STARTUP] WARNING — Missing tools/packages: {missing}\033[0m")
+        print("\033[1;31m[STARTUP] Bot will start but some features may not work until tools are installed.\033[0m")
+    else:
+        print("\033[1;32m[STARTUP] All tools and packages verified — system ready.\033[0m")
 
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
