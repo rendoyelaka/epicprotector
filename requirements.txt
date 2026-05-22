@@ -1,0 +1,14 @@
+# ══════════════════════════════════════════════════════════════════
+# EPIC PROTECTOR — Python Dependencies
+# Elite Master Hybrid Edition
+# ══════════════════════════════════════════════════════════════════
+#
+# Add this file to the ROOT of your GitHub repository.
+# GitHub Actions uses this file for pip dependency caching.
+# ══════════════════════════════════════════════════════════════════
+
+# Telegram Bot Framework
+python-telegram-bot==22.7
+
+# Web Keep-Alive Server
+flask==3.1.0
