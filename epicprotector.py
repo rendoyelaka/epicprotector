@@ -4281,7 +4281,8 @@ class ManualControlEngine:
 
             elif op_key == "compliance_scan":
                 findings = compliance_scanner.scan_workspace(workspace)
-                total    = sum(len(v) for v in findings.values() if isinstance(v, list))
+                # scan_workspace returns a list of finding dicts — not a dict
+                total = len(findings) if isinstance(findings, list) else                         sum(len(v) for v in findings.values() if isinstance(v, list))
                 result["findings"] = total
                 result["status"]   = f"✅ Scan complete — {total} findings"
 
@@ -4375,11 +4376,27 @@ class ManualControlEngine:
                 result["status"]        = f"✅ {r['removed_files']} files removed — saved {r['saved_kb']}"
 
             elif op_key == "rebuild_apk":
-                # Use workspace parent as work_dir to ensure correct output path
+                # Validate workspace exists and contains apktool.yml before rebuild
+                if not workspace or not os.path.exists(workspace):
+                    raise RuntimeError(
+                        "Workspace not found. Decode → Workspace step must run before Rebuild APK.")
+                apktool_yml = os.path.join(workspace, "apktool.yml")
+                if not os.path.exists(apktool_yml):
+                    # Search for apktool.yml in subdirectories
+                    found = list(Path(work_dir).rglob("apktool.yml"))
+                    if found:
+                        workspace = str(found[0].parent)
+                    else:
+                        raise RuntimeError(
+                            "apktool.yml not found in workspace. "
+                            "APK was not decoded correctly. "
+                            "Run Decode → Workspace step first.")
+                # Use workspace parent as work_dir for correct output path
                 rebuild_work_dir = os.path.dirname(workspace) if workspace else work_dir
                 l5 = Level5_APKBuilder(tools, rebuild_work_dir)
                 rebuilt = l5.rebuild(workspace)
                 result["rebuilt_apk"] = rebuilt
+                result["workspace"]   = workspace
                 result["status"]      = "✅ APK rebuilt successfully"
 
             elif op_key == "integrity_manifest":
@@ -5745,8 +5762,12 @@ async def button_handler(update, context):
                     current_apk = stripped
 
             # Update rebuilt apk path from rebuild step
+            # Also update workspace if rebuild corrected it
             if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
                 current_apk = result["rebuilt_apk"]
+            if op_key == "rebuild_apk" and result.get("workspace"):
+                current_workspace = result["workspace"]
+                manual_workspace[user.id] = current_workspace
 
             job_results.append(result)
 
@@ -6268,7 +6289,9 @@ async def document_handler(update, context):
                 "started_at": time.time(),
             }
 
-            total    = sum(len(v) for v in findings.values() if isinstance(v, list))
+            # scan_workspace returns a list — not a dict
+            total    = len(findings) if isinstance(findings, list) else \
+                       sum(len(v) for v in findings.values() if isinstance(v, list))
             scanner  = ComplianceScannerEngine()
             summary  = ComplianceScannerEngine.format_summary_message(findings, os.path.basename(compliance_apk_path.get(user.id, "unknown.apk")))
 
