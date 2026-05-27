@@ -1,20 +1,27 @@
+# ══════════════════════════════════════════════════════════════════
 # EPIC PROTECTOR — Git Ignore
+# Elite Master Hybrid Edition — 22-Step Pipeline
+# ══════════════════════════════════════════════════════════════════
 
-# ⚠️ NEVER commit these — keep them private
-obfuscation_map.json
-obf_dict.txt
+# ── Protection Output Files — never commit these ───────────────
 integrity_manifest.json
-resource_manifest.json
+safe_rename_map.json
+proguard-epic-hardened.pro
+clients.json
+bot_log.txt
+
+# ── Job Work Directories ───────────────────────────────────────
 *_PROTECTED/
 apk_extracted/
+undo_*/
 
-# Python
+# ── Python ─────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .env
 
-# OS
+# ── OS ─────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
