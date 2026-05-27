@@ -2427,15 +2427,13 @@ class MetadataStripper:
         removed = []
         cleaned = []
 
-        # ── Remove apktool metadata files ────────────────────────────────────
-        for fname in ("apktool.yml", "apktool.yaml"):
-            p = os.path.join(workspace_dir, fname)
-            if os.path.exists(p):
-                try:
-                    os.remove(p)
-                    removed.append(fname)
-                except Exception as e:
-                    logger.warning(f"[MetadataStripper] Could not remove {fname}: {e}")
+        # ── apktool.yml / apktool.yaml — must NOT be removed ─────────────────
+        # apktool requires apktool.yml to be present inside the workspace when
+        # running the build (b) command. Deleting it before rebuild causes:
+        #   brut.directory.PathNotExist: apktool.yml
+        # apktool.yml is a workspace-only instruction file — apktool does NOT
+        # include it in the final APK output, so there is nothing to strip here.
+        # It is safe to leave it — it never appears in the delivered APK.
 
         # ── Remove apktool leftover folders ──────────────────────────────────
         for folder in ("original", "unknown", ".apktool"):
