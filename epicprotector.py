@@ -6320,7 +6320,9 @@ async def document_handler(update, context):
                 "started_at": time.time(),
             }
 
-            total    = sum(len(v) for v in findings.values() if isinstance(v, list))
+            # findings is a flat list of finding dicts returned by scan_workspace()
+            # Each element is one finding — total count is simply len(findings)
+            total    = len(findings)
             scanner  = ComplianceScannerEngine()
             summary  = ComplianceScannerEngine.format_summary_message(findings, os.path.basename(compliance_apk_path.get(user.id, "unknown.apk")))
 
