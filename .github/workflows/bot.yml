@@ -2,7 +2,7 @@ name: EPIC PROTECTOR — Bot 24/7 Elite
 
 # ══════════════════════════════════════════════════════════════════
 # EPIC PROTECTOR — GitHub Actions Workflow
-# Elite Master Hybrid Edition
+# Elite Master Hybrid Edition — 22-Step Pipeline
 # ══════════════════════════════════════════════════════════════════
 #
 # Triggers:
@@ -15,7 +15,7 @@ name: EPIC PROTECTOR — Bot 24/7 Elite
 #   2. Environment validation — checks secrets before running
 #   3. Always saves logs — full audit trail
 #   4. Cleaner step naming — professional output
-#   5. Longer retention for logs — 14 days
+#   5. Longer retention for logs — 30 days
 #   6. Bot startup confirmation step
 #   7. Consistent tool versions pinned
 #   8. keytool verified after JDK install — keystore generation guaranteed
@@ -24,7 +24,7 @@ name: EPIC PROTECTOR — Bot 24/7 Elite
 #  11. Python syntax check before bot launch — catches errors early
 #  12. KS_PASS / KS_KEY removed — script generates fresh keystores dynamically
 #  13. Redundant crash upload merged — single clean log artifact
-#  14. 7-Level pipeline reflected in all step labels
+#  14. 22-Step pipeline reflected in all step labels
 # ══════════════════════════════════════════════════════════════════
 
 on:
@@ -37,7 +37,7 @@ on:
 
 jobs:
   run-bot:
-    name: EPIC PROTECTOR — Elite Bot Runner (7-Level)
+    name: EPIC PROTECTOR — Elite Bot Runner (22-Step)
     runs-on: ubuntu-22.04
     timeout-minutes: 350
 
@@ -72,8 +72,9 @@ jobs:
           echo "✅ All required secrets are present."
 
       # ── Step 4 — Install System Tools ──────────────────────────
-      # Fix 9: Uses default-jdk (full) instead of default-jdk-headless
-      # so that keytool is guaranteed to be available for keystore generation.
+      # Uses default-jdk (full) instead of default-jdk-headless
+      # so that keytool is guaranteed to be available for
+      # fresh keystore generation per job.
       - name: Install System Tools
         run: |
           echo "📦 Installing system tools..."
@@ -88,7 +89,6 @@ jobs:
           echo "✅ System tools installed."
           java -version
           echo "✅ Java confirmed."
-          # Fix 8: Verify keytool is available — required for keystore generation
           keytool -help > /dev/null 2>&1 && echo "✅ keytool confirmed." || { echo "❌ ERROR: keytool not found."; exit 1; }
           zipalign -h > /dev/null 2>&1 && echo "✅ zipalign confirmed." || echo "⚠️ zipalign check returned non-zero (normal)."
           apksigner version && echo "✅ apksigner confirmed." || echo "⚠️ apksigner version check returned non-zero (normal)."
@@ -104,13 +104,13 @@ jobs:
           python3 -c "import flask; print('✅ flask:', flask.__version__)"
 
       # ── Step 6 — Pre-Download and Cache apktool.jar ────────────
-      # Fix 10: apktool.jar downloaded here as a dedicated step so it is
+      # apktool.jar downloaded here as a dedicated step so it is
       # available immediately when the bot starts — no cold-start delay.
       - name: Pre-Download apktool
         run: |
           echo "📥 Pre-downloading apktool.jar..."
           mkdir -p /tmp/epic_tools
-          APKTOOL_URL="https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
+          APKTOOL_URL="https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar"
           APKTOOL_JAR="/tmp/epic_tools/apktool.jar"
           if [ ! -f "$APKTOOL_JAR" ]; then
             wget -q -O "$APKTOOL_JAR" "$APKTOOL_URL"
@@ -121,7 +121,6 @@ jobs:
             echo "❌ ERROR: apktool.jar download failed."
             exit 1
           fi
-          # Verify apktool runs correctly with Java
           java -jar "$APKTOOL_JAR" --version && echo "✅ apktool verified." || { echo "❌ apktool failed to run."; exit 1; }
 
       # ── Step 7 — Confirm Bot Script Exists ─────────────────────
@@ -134,8 +133,8 @@ jobs:
           echo "✅ epicprotector.py found."
           echo "📄 Script size: $(wc -l < epicprotector.py) lines"
 
-      # ── Step 8 — Python Syntax Check ───────────────────────────
-      # Fix 11: Validates Python syntax before launching the bot.
+      # ── Step 8 — Python Syntax Validation ──────────────────────
+      # Validates Python syntax before launching the bot.
       # Catches any script errors immediately — prevents silent failures.
       - name: Python Syntax Validation
         run: |
@@ -154,21 +153,21 @@ jobs:
           "
 
       # ── Step 9 — Run EPIC PROTECTOR Bot ────────────────────────
-      # Fix 12: KS_PASS and KS_KEY removed — script generates fresh
-      # keystores dynamically per job. No static keystore needed.
+      # KS_PASS and KS_KEY not required — script generates fresh
+      # keystores dynamically per job and destroys them after signing.
       - name: Run EPIC PROTECTOR Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
         run: |
-          echo "🚀 Starting EPIC PROTECTOR Elite Bot (7-Level Pipeline)..."
+          echo "🚀 Starting EPIC PROTECTOR Elite Bot (22-Step Pipeline)..."
           echo "⏰ Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           python3 epicprotector.py 2>&1 | tee bot_log.txt
           echo "⏰ End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
       # ── Step 10 — Upload Full Log Always ───────────────────────
-      # Fix 13: Single unified log artifact — always uploaded whether
-      # the run succeeded or failed. Crash report merged here.
+      # Single unified log artifact — always uploaded whether
+      # the run succeeded or failed.
       # Retention: 30 days for full audit trail coverage.
       - name: Upload Run Log
         if: always()
