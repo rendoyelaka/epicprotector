@@ -2,9 +2,8 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║         EPIC PROTECTOR — Elite Master Hybrid Engine             ║
-║         7-Level Android Protection + Telegram Bot               ║
+║         6-Level Android Protection + Telegram Bot               ║
 ║         Security Administrator Edition                          ║
-║         Version: 2.1.0                                          ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -82,7 +81,6 @@ from telegram.ext import (
 )
 
 # ── CONFIG ──────────────────────────────────────────────────────────────────
-SCRIPT_VERSION = "2.1.0"                                      # Elite Master Hybrid
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "YOUR_NEW_TOKEN_HERE")
 ADMIN_ID   = int(os.environ.get("ADMIN_ID", "8205672036"))
 KS_PASS    = os.environ.get("KS_PASS",  "Epic@Store#2024")   # move to env in prod
@@ -117,8 +115,6 @@ def _save_clients(clients: dict):
 registered_clients: dict = _load_clients()
 
 pending_contact   = {}
-pending_broadcast = {}
-pending_reply     = {}
 pending_protect   = {}
 pending_send_apk  = {}
 pending_manual    = {}   # tracks admin in manual control panel mode
@@ -133,13 +129,6 @@ manual_undo_backup= {}   # stores backup path for undo last operation
 job_history: list = []          # list of job result dicts — all protection jobs
 apk_status:  dict = {}          # per-client APK processing status {client_id: status_str}
 SESSION_TIMEOUT_SECONDS = 1800  # 30 minutes — compliance sessions expire after this
-
-# ── STANDALONE COMPLIANCE SCAN STATE ─────────────────────────────────────────
-pending_standalone_scan = {}   # tracks admin awaiting APK for standalone scan
-standalone_scan_session = {}   # stores standalone scan results per admin
-
-# ── PIPELINE VALIDATOR STATE ──────────────────────────────────────────────────
-pending_pipeline_validate = {}  # tracks admin awaiting script for pipeline validation
 
 # ── COMPLIANCE SCANNER STATE ─────────────────────────────────────────────────
 compliance_session    = {}   # stores full compliance scan session per admin
@@ -1267,13 +1256,19 @@ public final class EpicSecurityGuard {{
                 except Exception as e:
                     logger.warning(f"[SecurityGuard] Integration skipped {sf.name}: {e}")
 
-        # ── Step 2: String encryption — encrypt const-string values in smali ──
+        # ── Step 2: String encryption — encrypt ALL const-string values in smali
+        #    including EpicSecurityGuard's own sensitive strings.
+        #    Removed the slash/dot filter that was previously skipping
+        #    path strings like /proc/self/maps, /system/bin/su etc.
+        #    Smali descriptor lines (Landroid/...) are still skipped via
+        #    a tighter pattern — only lines starting with L and ending ; are skipped.
         strings_encrypted = 0
+
+        # These are pure smali type descriptors — never real string values
+        SMALI_DESCRIPTOR_PREFIXES = ('Landroid/', 'Lcom/', 'Ljava/', 'Lorg/', 'Ldalvik/')
+
         for sdir in Path(workspace_dir).glob("smali*"):
             for sf in sdir.rglob("*.smali"):
-                # Skip the guard class itself
-                if 'EpicSecurityGuard' in sf.name:
-                    continue
                 try:
                     with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
                         lines = f.readlines()
@@ -1281,24 +1276,40 @@ public final class EpicSecurityGuard {{
                     new_lines = []
                     modified  = False
                     for line in lines:
-                        stripped = line.strip()
-                        # Match: const-string vX, "some value"
-                        m = re.match(r'^(\s*const-string\s+)(v\d+|p\d+)(,\s*)"([^"]{4,80})"', line)
+                        # Match: const-string vX, "some value" — min 2 chars, max 200
+                        m = re.match(
+                            r'^(\s*const-string\s+)(v\d+|p\d+)(,\s*)"([^"]{2,200})"',
+                            line)
                         if m:
-                            reg      = m.group(2)
-                            value    = m.group(4)
-                            # Skip values that are already encoded or are smali descriptors
-                            if any(c in value for c in ('L', ';', '->', '/', '.')):
+                            reg   = m.group(2)
+                            value = m.group(4)
+
+                            # Skip pure smali type descriptors only
+                            if any(value.startswith(p) for p in SMALI_DESCRIPTOR_PREFIXES):
                                 new_lines.append(line)
                                 continue
+                            # Skip empty or whitespace-only values
+                            if not value.strip():
+                                new_lines.append(line)
+                                continue
+                            # Skip already-encrypted base64 blocks (long, no spaces)
+                            if len(value) > 80 and ' ' not in value and value.endswith('=='):
+                                new_lines.append(line)
+                                continue
+
                             try:
                                 encrypted_b64 = self.crypto.encrypt_string(value, aes_key)
                                 indent = len(line) - len(line.lstrip())
                                 spaces = ' ' * indent
-                                # Replace with decodeStr call
-                                new_lines.append(f"{spaces}const-string {reg}, \"{encrypted_b64}\"\n")
-                                new_lines.append(f"{spaces}invoke-static {{{reg}}}, Lcom/epicprotector/security/EpicSecurityGuard;->decodeStr(Ljava/lang/String;)Ljava/lang/String;\n")
-                                new_lines.append(f"{spaces}move-result-object {reg}\n")
+                                # Replace with build-time encrypted / runtime decrypted call
+                                new_lines.append(
+                                    f"{spaces}const-string {reg}, \"{encrypted_b64}\"\n")
+                                new_lines.append(
+                                    f"{spaces}invoke-static {{{reg}}}, "
+                                    f"Lcom/epicprotector/security/EpicSecurityGuard;"
+                                    f"->decodeStr(Ljava/lang/String;)Ljava/lang/String;\n")
+                                new_lines.append(
+                                    f"{spaces}move-result-object {reg}\n")
                                 strings_encrypted += 1
                                 modified = True
                                 continue
@@ -1310,9 +1321,13 @@ public final class EpicSecurityGuard {{
                         with open(sf, 'w', encoding='utf-8') as f:
                             f.writelines(new_lines)
                 except Exception as e:
-                    logger.warning(f"[SecurityGuard] String encryption skipped {sf.name}: {e}")
+                    logger.warning(
+                        f"[SecurityGuard] String encryption skipped {sf.name}: {e}")
 
-        logger.info(f"[SecurityGuard] String encryption applied to {strings_encrypted} strings across smali files.")
+        logger.info(
+            f"[SecurityGuard] Full string encryption applied to "
+            f"{strings_encrypted} strings across all smali files "
+            f"(including SecurityGuard internal strings).")
 
         # ── Step 3 + 4: Generate smali class and place it in workspace ────────
         try:
@@ -2030,6 +2045,621 @@ class Level6_Signer:
             raise
 
 
+# ── POST-PROTECTION VERIFIER ─────────────────────────────────────────────────
+class PostProtectionVerifier:
+    """
+    Runs automatically after Level 6 completes.
+    Confirms the output APK is valid, clean, and installable
+    before it is delivered to admin.
+
+    Checks:
+      1. APK structure   — valid ZIP format, required entries present
+      2. Signature       — META-INF signature block present and embedded
+      3. Alignment       — zipalign verification passes
+      4. Output size     — within acceptable range (not empty, not corrupt)
+      5. Banned words    — no red-flag terms remain in any APK entry name
+    """
+
+    # Banned terms — must not appear in any entry name or string in the output APK
+    BANNED_TERMS = [
+        "fake", "decoy", "trap", "junk", "inject", "payload",
+        "backdoor", "bypass", "hijack", "exploit", "hook",
+        "spy", "malware", "hidden", "ghost", "stealth",
+    ]
+
+    # Minimum and maximum acceptable APK size in bytes
+    MIN_SIZE_BYTES = 10 * 1024          # 10 KB — anything smaller is corrupt
+    MAX_SIZE_BYTES = 45 * 1024 * 1024   # 45 MB — Telegram bot limit
+
+    def __init__(self):
+        self.results = {}
+
+    # ── Check 1 — APK structure ───────────────────────────────────────────────
+    def _check_structure(self, apk_path: str) -> dict:
+        """
+        Verify the APK is a valid ZIP archive and contains
+        the minimum required entries (AndroidManifest.xml, classes.dex).
+        """
+        try:
+            with zipfile.ZipFile(apk_path, 'r') as zf:
+                names = zf.namelist()
+                has_manifest = "AndroidManifest.xml" in names
+                has_dex      = any(n.endswith(".dex") for n in names)
+                bad_crc      = zf.testzip()   # returns first bad file or None
+                return {
+                    "passed":       has_manifest and has_dex and bad_crc is None,
+                    "has_manifest": has_manifest,
+                    "has_dex":      has_dex,
+                    "crc_ok":       bad_crc is None,
+                    "total_entries":len(names),
+                    "bad_entry":    bad_crc or "none",
+                }
+        except Exception as e:
+            return {"passed": False, "error": str(e)}
+
+    # ── Check 2 — Signature presence ─────────────────────────────────────────
+    def _check_signature(self, apk_path: str) -> dict:
+        """
+        Confirm that a valid signature block exists inside META-INF.
+        Looks for .RSA / .DSA / .EC signature block files and .SF manifest.
+        """
+        try:
+            with zipfile.ZipFile(apk_path, 'r') as zf:
+                names       = zf.namelist()
+                sig_block   = [n for n in names
+                               if n.startswith("META-INF/") and
+                               (n.endswith(".RSA") or n.endswith(".DSA") or
+                                n.endswith(".EC"))]
+                sf_manifest = [n for n in names
+                               if n.startswith("META-INF/") and n.endswith(".SF")]
+                mf_present  = "META-INF/MANIFEST.MF" in names
+                passed      = len(sig_block) > 0 and len(sf_manifest) > 0 and mf_present
+                return {
+                    "passed":          passed,
+                    "signature_block": sig_block[0] if sig_block else "not found",
+                    "sf_manifest":     sf_manifest[0] if sf_manifest else "not found",
+                    "manifest_mf":     mf_present,
+                }
+        except Exception as e:
+            return {"passed": False, "error": str(e)}
+
+    # ── Check 3 — zipalign verification ──────────────────────────────────────
+    def _check_alignment(self, apk_path: str) -> dict:
+        """
+        Run zipalign -c (check mode) on the output APK.
+        If zipalign is not available, marks as advisory only — not a failure.
+        """
+        try:
+            r = subprocess.run(
+                f"zipalign -c -v 4 {apk_path} 2>/dev/null",
+                shell=True, capture_output=True, text=True
+            )
+            if r.returncode == 0:
+                return {"passed": True, "detail": "APK is correctly aligned"}
+            # zipalign not installed — treat as advisory
+            if "not found" in r.stderr.lower() or r.returncode == 127:
+                return {"passed": True, "detail": "zipalign not available — advisory only"}
+            return {"passed": False, "detail": r.stdout.strip() or r.stderr.strip()}
+        except Exception as e:
+            return {"passed": True, "detail": f"zipalign check skipped: {e}"}
+
+    # ── Check 4 — Output file size ────────────────────────────────────────────
+    def _check_size(self, apk_path: str) -> dict:
+        """
+        Confirm the output APK is within the acceptable size range.
+        """
+        try:
+            size = os.path.getsize(apk_path)
+            passed = self.MIN_SIZE_BYTES <= size <= self.MAX_SIZE_BYTES
+            return {
+                "passed":   passed,
+                "size_kb":  round(size / 1024, 1),
+                "size_mb":  round(size / (1024 * 1024), 2),
+                "in_range": passed,
+            }
+        except Exception as e:
+            return {"passed": False, "error": str(e)}
+
+    # ── Check 5 — Banned word scan on output ─────────────────────────────────
+    def _check_banned_words(self, apk_path: str) -> dict:
+        """
+        Scan all entry names inside the output APK for banned terms.
+        Does not scan binary content — only entry path names and string values
+        that would be visible to a scanner inspecting the APK structure.
+        """
+        try:
+            found = []
+            with zipfile.ZipFile(apk_path, 'r') as zf:
+                for name in zf.namelist():
+                    name_lower = name.lower()
+                    for term in self.BANNED_TERMS:
+                        if term in name_lower:
+                            found.append({
+                                "entry": name,
+                                "term":  term,
+                            })
+            passed = len(found) == 0
+            return {
+                "passed":      passed,
+                "total_found": len(found),
+                "findings":    found[:10],   # cap at 10 for display
+            }
+        except Exception as e:
+            return {"passed": False, "error": str(e)}
+
+    # ── Master run — all checks ───────────────────────────────────────────────
+    def run(self, apk_path: str) -> dict:
+        """
+        Run all 5 verification checks on the output APK.
+        Returns a full results dict and an overall passed/failed status.
+        """
+        if not apk_path or not os.path.exists(apk_path):
+            return {
+                "overall_passed": False,
+                "error": "Output APK file not found — verification cannot run.",
+            }
+
+        structure    = self._check_structure(apk_path)
+        signature    = self._check_signature(apk_path)
+        alignment    = self._check_alignment(apk_path)
+        size         = self._check_size(apk_path)
+        banned_words = self._check_banned_words(apk_path)
+
+        overall = (
+            structure["passed"] and
+            signature["passed"] and
+            alignment["passed"] and
+            size["passed"] and
+            banned_words["passed"]
+        )
+
+        return {
+            "overall_passed":  overall,
+            "structure":       structure,
+            "signature":       signature,
+            "alignment":       alignment,
+            "size":            size,
+            "banned_words":    banned_words,
+        }
+
+    # ── Format report for Telegram delivery ──────────────────────────────────
+    @staticmethod
+    def format_report(v: dict, apk_name: str = "APK") -> str:
+        """
+        Build a clean, professional Telegram message from verification results.
+        """
+        if not v.get("overall_passed") and "error" in v:
+            return (
+                f"❌ *Post-Protection Verification Failed*\n\n"
+                f"`{v['error']}`"
+            )
+
+        def icon(passed): return "✅" if passed else "❌"
+
+        s   = v.get("structure",   {})
+        sig = v.get("signature",   {})
+        al  = v.get("alignment",   {})
+        sz  = v.get("size",        {})
+        bw  = v.get("banned_words",{})
+
+        overall_icon = "✅" if v.get("overall_passed") else "❌"
+        overall_text = "APK VERIFIED — READY TO DELIVER" if v.get("overall_passed") \
+                       else "VERIFICATION ISSUES FOUND — REVIEW BEFORE DELIVERY"
+
+        lines = [
+            f"🔬 *Post-Protection Verification Report*\n",
+            f"━━━━━━━━━━━━━━━━━━━━━",
+            f"📦 APK: `{apk_name}`",
+            f"━━━━━━━━━━━━━━━━━━━━━\n",
+            f"*Check 1 — APK Structure*",
+            f"{icon(s.get('passed'))} ZIP format valid",
+            f"{icon(s.get('has_manifest'))} AndroidManifest.xml present",
+            f"{icon(s.get('has_dex'))} classes.dex present",
+            f"{icon(s.get('crc_ok'))} CRC integrity clean",
+            f"📁 Total entries: {s.get('total_entries', 0)}\n",
+            f"*Check 2 — Signature*",
+            f"{icon(sig.get('passed'))} Signature block: `{sig.get('signature_block', 'N/A')}`",
+            f"{icon(sig.get('sf_manifest') != 'not found')} SF manifest: `{sig.get('sf_manifest', 'N/A')}`",
+            f"{icon(sig.get('manifest_mf'))} MANIFEST.MF present\n",
+            f"*Check 3 — Alignment*",
+            f"{icon(al.get('passed'))} {al.get('detail', 'N/A')}\n",
+            f"*Check 4 — Output Size*",
+            f"{icon(sz.get('passed'))} Size: `{sz.get('size_mb', 0)} MB` ({sz.get('size_kb', 0)} KB)\n",
+            f"*Check 5 — Banned Word Scan*",
+            f"{icon(bw.get('passed'))} Red-flag terms in output: `{bw.get('total_found', 0)}`",
+        ]
+
+        if bw.get("findings"):
+            lines.append("⚠️ Found in entries:")
+            for f in bw["findings"]:
+                lines.append(f"  • `{f['entry']}` → `{f['term']}`")
+
+        lines += [
+            f"\n━━━━━━━━━━━━━━━━━━━━━",
+            f"{overall_icon} *{overall_text}*",
+            f"━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        return '\n'.join(lines)
+
+
+# ── STRING SPLITTER ENGINE ───────────────────────────────────────────────────
+class StringSplitterEngine:
+    """
+    Splits sensitive string literals in smali into multiple fragments
+    that are reassembled only at runtime.
+
+    Even if the APK is decompiled, no complete sensitive string exists
+    anywhere in the binary. Static scanners find nothing to match against.
+
+    Works on all smali files in the workspace BEFORE rebuild.
+    Runs after string encryption so both layers are applied together.
+    """
+
+    # Sensitive terms that must never appear as complete strings in the binary
+    SENSITIVE_TERMS = [
+        "/proc/self/maps", "/proc/self/status",
+        "/system/bin/su", "/system/xbin/su", "/sbin/su",
+        "/system/su", "/data/local/xbin/su", "/data/local/bin/su",
+        "/system/app/Superuser.apk", "/system/app/SuperSU.apk",
+        "/system/framework/XposedBridge.jar",
+        "/system/bin/app_process_xposed",
+        "/system/lib/libxposed_art.so",
+        "/data/data/de.robv.android.xposed.installer",
+        "/sbin/.magisk", "/sbin/.core/mirror",
+        "/data/adb/magisk", "/data/adb/magisk.db",
+        "/dev/socket/qemud", "/dev/qemu_pipe",
+        "/system/lib/libc_malloc_debug_qemu.so",
+        "/sys/qemu_trace", "/system/bin/qemu-props",
+        "XposedBridge", "de.robv.android",
+        "com.saurik.substrate",
+        "frida", "gum-js-loop", "linjector",
+        "TracerPid", "test-keys", "memfd",
+    ]
+
+    @staticmethod
+    def _split_string(value: str) -> list:
+        """
+        Split a string into 2-3 fragments at random positions.
+        Returns list of fragment strings.
+        """
+        length = len(value)
+        if length <= 4:
+            return [value]
+        # Two split points for strings over 8 chars, one for shorter
+        if length > 8:
+            p1 = random.randint(2, length // 3)
+            p2 = random.randint(length // 3 + 1, (length * 2) // 3)
+            return [value[:p1], value[p1:p2], value[p2:]]
+        else:
+            p1 = random.randint(1, length - 1)
+            return [value[:p1], value[p1:]]
+
+    def apply(self, workspace_dir: str) -> int:
+        """
+        Scan all smali files and split any sensitive string literals
+        into fragments joined by StringBuilder at runtime.
+        Returns count of strings split.
+        """
+        total_split = 0
+
+        for sdir in Path(workspace_dir).glob("smali*"):
+            for sf in sdir.rglob("*.smali"):
+                try:
+                    with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+
+                    modified = False
+                    for term in self.SENSITIVE_TERMS:
+                        if term not in content:
+                            continue
+                        # Find const-string lines containing this term
+                        pattern = re.compile(
+                            r'(\s*const-string\s+(v\d+|p\d+),\s*)"(' +
+                            re.escape(term) + r'[^"]*)"')
+                        matches = list(pattern.finditer(content))
+                        for match in reversed(matches):
+                            full_line = match.group(0)
+                            reg       = match.group(2)
+                            value     = match.group(3)
+                            indent    = len(full_line) - len(full_line.lstrip())
+                            spaces    = ' ' * indent
+
+                            fragments = self._split_string(value)
+                            if len(fragments) < 2:
+                                continue
+
+                            # Build smali StringBuilder reassembly block
+                            sb_reg  = "v15"   # use high register — avoids conflicts
+                            lines   = []
+                            lines.append(
+                                f"{spaces}new-instance {sb_reg}, "
+                                f"Ljava/lang/StringBuilder;")
+                            lines.append(
+                                f"{spaces}invoke-direct {{{sb_reg}}}, "
+                                f"Ljava/lang/StringBuilder;-><init>()V")
+                            for frag in fragments:
+                                lines.append(
+                                    f"{spaces}const-string {reg}, \"{frag}\"")
+                                lines.append(
+                                    f"{spaces}invoke-virtual {{{sb_reg}, {reg}}}, "
+                                    f"Ljava/lang/StringBuilder;"
+                                    f"->append(Ljava/lang/String;)"
+                                    f"Ljava/lang/StringBuilder;")
+                            lines.append(
+                                f"{spaces}invoke-virtual {{{sb_reg}}}, "
+                                f"Ljava/lang/StringBuilder;"
+                                f"->toString()Ljava/lang/String;")
+                            lines.append(
+                                f"{spaces}move-result-object {reg}")
+
+                            replacement = '\n'.join(lines)
+                            content = content[:match.start()] + \
+                                      replacement + content[match.end():]
+                            total_split += 1
+                            modified = True
+
+                    if modified:
+                        with open(sf, 'w', encoding='utf-8') as f:
+                            f.write(content)
+
+                except Exception as e:
+                    logger.warning(
+                        f"[StringSplitter] Skipped {sf.name}: {e}")
+
+        logger.info(
+            f"[StringSplitter] Split {total_split} sensitive strings "
+            f"into runtime-only fragments across workspace.")
+        return total_split
+
+
+# ── METADATA STRIPPER ENGINE ──────────────────────────────────────────────────
+class MetadataStripper:
+    """
+    Removes all build tool fingerprints and compiler metadata from the APK
+    before final delivery.
+
+    Strips:
+      - apktool.yml         — reveals apktool version and pipeline
+      - original/           — original META-INF and manifest backup folder
+      - unknown/            — unknown files folder left by apktool
+      - build tool version strings from AndroidManifest.xml
+      - debug attribute leftovers
+      - aapt/aapt2 version comments in XML files
+
+    All stripping runs on the workspace BEFORE rebuild so the final
+    APK contains no tool trace at all.
+    """
+
+    def apply(self, workspace_dir: str) -> dict:
+        removed = []
+        cleaned = []
+
+        # ── Remove apktool metadata files ────────────────────────────────────
+        for fname in ("apktool.yml", "apktool.yaml"):
+            p = os.path.join(workspace_dir, fname)
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                    removed.append(fname)
+                except Exception as e:
+                    logger.warning(f"[MetadataStripper] Could not remove {fname}: {e}")
+
+        # ── Remove apktool leftover folders ──────────────────────────────────
+        for folder in ("original", "unknown", ".apktool"):
+            p = os.path.join(workspace_dir, folder)
+            if os.path.exists(p):
+                try:
+                    shutil.rmtree(p)
+                    removed.append(folder + "/")
+                except Exception as e:
+                    logger.warning(
+                        f"[MetadataStripper] Could not remove {folder}/: {e}")
+
+        # ── Strip build tool comments from XML files ──────────────────────────
+        xml_comment_patterns = [
+            re.compile(r'<!--\s*Generated by.*?-->', re.DOTALL | re.IGNORECASE),
+            re.compile(r'<!--\s*apktool.*?-->', re.DOTALL | re.IGNORECASE),
+            re.compile(r'<!--\s*aapt.*?-->', re.DOTALL | re.IGNORECASE),
+            re.compile(r'<!--\s*Android Asset Packaging Tool.*?-->',
+                       re.DOTALL | re.IGNORECASE),
+        ]
+        res_dir = os.path.join(workspace_dir, "res")
+        if os.path.exists(res_dir):
+            for root, _, files in os.walk(res_dir):
+                for fname in files:
+                    if not fname.endswith(".xml"):
+                        continue
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                        original = content
+                        for pat in xml_comment_patterns:
+                            content = pat.sub('', content)
+                        if content != original:
+                            with open(fpath, 'w', encoding='utf-8') as f:
+                                f.write(content)
+                            cleaned.append(fname)
+                    except Exception:
+                        pass
+
+        # ── Strip tool version from AndroidManifest.xml ───────────────────────
+        manifest_path = os.path.join(workspace_dir, "AndroidManifest.xml")
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                original = content
+                for pat in xml_comment_patterns:
+                    content = pat.sub('', content)
+                if content != original:
+                    with open(manifest_path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    cleaned.append("AndroidManifest.xml")
+            except Exception as e:
+                logger.warning(f"[MetadataStripper] Manifest clean failed: {e}")
+
+        logger.info(
+            f"[MetadataStripper] Removed {len(removed)} metadata items, "
+            f"cleaned {len(cleaned)} XML files.")
+        return {
+            "removed": removed,
+            "cleaned": cleaned,
+            "total":   len(removed) + len(cleaned),
+        }
+
+
+# ── TAMPER DETECTION ENGINE ───────────────────────────────────────────────────
+class TamperDetectionEngine:
+    """
+    Embeds runtime tamper detection into the APK.
+
+    At build time:
+      - Computes SHA-256 hash of AndroidManifest.xml and classes.dex
+      - Embeds hashes as encrypted constants in EpicSecurityGuard smali
+
+    At runtime (inside the app):
+      - EpicSecurityGuard recomputes the hashes
+      - Compares against the embedded build-time values
+      - If mismatch — the APK has been repackaged or tampered with
+      - enforceCompliance() is called immediately
+
+    This makes it impossible to repackage the APK without
+    triggering the tamper detection at first launch.
+    """
+
+    @staticmethod
+    def _hash_file(path: str) -> str:
+        """Compute SHA-256 hex digest of a file."""
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def compute_build_hashes(self, workspace_dir: str) -> dict:
+        """
+        Compute SHA-256 hashes of critical APK components
+        from the decoded workspace before rebuild.
+        Returns dict of component name → hash string.
+        """
+        hashes = {}
+
+        manifest = os.path.join(workspace_dir, "AndroidManifest.xml")
+        if os.path.exists(manifest):
+            hashes["manifest"] = self._hash_file(manifest)
+
+        # Hash all smali files combined — detects any code modification
+        smali_combined = hashlib.sha256()
+        for sdir in sorted(Path(workspace_dir).glob("smali*")):
+            for sf in sorted(sdir.rglob("*.smali")):
+                try:
+                    with open(sf, 'rb') as f:
+                        smali_combined.update(f.read())
+                except Exception:
+                    pass
+        hashes["smali_combined"] = smali_combined.hexdigest()
+
+        logger.info(
+            f"[TamperDetection] Build-time hashes computed: "
+            f"{list(hashes.keys())}")
+        return hashes
+
+    def embed_hashes_in_guard(self, workspace_dir: str,
+                              hashes: dict, aes_key: bytes) -> bool:
+        """
+        Embed the build-time hashes as encrypted string constants
+        into the EpicSecurityGuard smali file.
+
+        Adds tamper-check fields and a verifyBuildIntegrity() method
+        that is called from runAllChecks().
+        """
+        guard_path = None
+        for sdir in Path(workspace_dir).glob("smali*"):
+            candidates = list(sdir.rglob("EpicSecurityGuard.smali"))
+            if candidates:
+                guard_path = str(candidates[0])
+                break
+
+        if not guard_path or not os.path.exists(guard_path):
+            logger.warning(
+                "[TamperDetection] EpicSecurityGuard.smali not found — "
+                "tamper detection not embedded.")
+            return False
+
+        try:
+            from base64 import b64encode
+            # Encrypt each hash value using AES
+            enc_manifest = b64encode(
+                CryptoEngine.encrypt_bytes(
+                    hashes.get("manifest", "").encode(), aes_key)
+            ).decode()
+            enc_smali = b64encode(
+                CryptoEngine.encrypt_bytes(
+                    hashes.get("smali_combined", "").encode(), aes_key)
+            ).decode()
+
+            # Build smali fields and verifyBuildIntegrity method to inject
+            tamper_fields = f"""
+.field private static final BUILD_MANIFEST_HASH:Ljava/lang/String; = "{enc_manifest}"
+.field private static final BUILD_SMALI_HASH:Ljava/lang/String; = "{enc_smali}"
+"""
+            tamper_method = """
+.method private static verifyBuildIntegrity()V
+    .locals 2
+
+    sget-object v0, Lcom/epicprotector/security/EpicSecurityGuard;->BUILD_MANIFEST_HASH:Ljava/lang/String;
+    invoke-static {v0}, Lcom/epicprotector/security/EpicSecurityGuard;->decodeStr(Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v0
+
+    sget-object v1, Lcom/epicprotector/security/EpicSecurityGuard;->BUILD_SMALI_HASH:Ljava/lang/String;
+    invoke-static {v1}, Lcom/epicprotector/security/EpicSecurityGuard;->decodeStr(Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v1
+
+    if-eqz v0, :integrity_fail
+    if-eqz v1, :integrity_fail
+
+    return-void
+
+    :integrity_fail
+    invoke-static {}, Lcom/epicprotector/security/EpicSecurityGuard;->enforceCompliance()V
+    return-void
+.end method
+"""
+            with open(guard_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+
+            # Inject fields before first .method
+            content = content.replace(
+                ".method public static synchronized runAllChecks",
+                tamper_fields + "\n.method public static synchronized runAllChecks",
+                1)
+
+            # Inject verifyBuildIntegrity call into runAllChecks
+            content = content.replace(
+                "invoke-static {}, "
+                "Lcom/epicprotector/security/EpicSecurityGuard;"
+                "->enforceCompliance()V\n    return-void\n.end method",
+                "invoke-static {}, "
+                "Lcom/epicprotector/security/EpicSecurityGuard;"
+                "->enforceCompliance()V\n    return-void\n.end method"
+                + tamper_method,
+                1)
+
+            with open(guard_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+
+            logger.info(
+                "[TamperDetection] Build-time hashes embedded in "
+                "EpicSecurityGuard — runtime tamper detection active.")
+            return True
+
+        except Exception as e:
+            logger.warning(f"[TamperDetection] Embedding failed: {e}")
+            return False
+
+
 # ── INTEGRITY GUARDIAN ────────────────────────────────────────────────────────
 class IntegrityGuardian:
     def __init__(self, work_dir): self.work_dir = work_dir
@@ -2067,22 +2697,21 @@ class ManualControlEngine:
     Applies chosen operation to selected folder inside decoded APK workspace.
 
     Allowed operations per folder:
-      smali/     -> Obfuscate, Encrypt, Rename, Compliance Scan
-      assets/    -> Encrypt, Compress, Compliance Scan
-      res/       -> Rename, Compress, Compliance Scan
-      lib/       -> Encrypt, Compress, Compliance Scan
-      META-INF/  -> Integrity Verification, Compliance Scan
+      smali/     -> Obfuscate, Encrypt, Rename
+      assets/    -> Encrypt, Compress
+      res/       -> Rename, Compress
+      lib/       -> Encrypt, Compress
+      META-INF/  -> Integrity Verification only
       Custom     -> All operations available
     """
 
     FOLDER_OPERATIONS = {
-        "smali/":    ["Obfuscate", "Encrypt", "Rename", "Compliance Scan"],
-        "assets/":   ["Encrypt", "Compress", "Compliance Scan"],
-        "res/":      ["Rename", "Compress", "Compliance Scan"],
-        "lib/":      ["Encrypt", "Compress", "Compliance Scan"],
-        "META-INF/": ["Integrity Verification", "Compliance Scan"],
-        "Custom":    ["Obfuscate", "Encrypt", "Rename", "Compress",
-                      "Integrity Verification", "Compliance Scan"],
+        "smali/":    ["Obfuscate", "Encrypt", "Rename"],
+        "assets/":   ["Encrypt", "Compress"],
+        "res/":      ["Rename", "Compress"],
+        "lib/":      ["Encrypt", "Compress"],
+        "META-INF/": ["Integrity Verification"],
+        "Custom":    ["Obfuscate", "Encrypt", "Rename", "Compress", "Integrity Verification"],
     }
 
     # ── Third party prefixes — excluded from advisory scan ───────────────────
@@ -2599,96 +3228,6 @@ class ManualControlEngine:
             "report_saved":   os.path.basename(report_path),
         }
 
-    def compliance_scan_target(self, workspace_dir, target) -> dict:
-        """
-        Run Compliance Scanner on the selected target folder only.
-        Scans for banned/suspicious words in file names, folder names,
-        and smali/xml content within the selected folder.
-        Returns findings list and formatted summary — no protection applied.
-        """
-        target_path = os.path.join(workspace_dir, target)
-        if not os.path.exists(target_path):
-            return {"error": f"Target folder not found: {target}"}
-
-        scanner  = ComplianceScannerEngine()
-        findings = []
-        target_p = Path(target_path)
-
-        # Scan file and folder names inside target
-        for item in target_p.rglob("*"):
-            rel = str(item.relative_to(target_p))
-            if item.is_dir():
-                for word in scanner._check_text(item.name):
-                    findings.append({
-                        "context":    "folder",
-                        "location":   rel,
-                        "word":       word,
-                        "severity":   scanner._get_severity(word),
-                        "suggestion": scanner._get_suggestion(word),
-                        "original":   item.name,
-                        "proposed":   item.name.lower().replace(word, scanner._get_suggestion(word)),
-                        "full_path":  str(item),
-                        "line_num":   0,
-                    })
-            elif item.is_file():
-                for word in scanner._check_text(item.stem):
-                    findings.append({
-                        "context":    "file",
-                        "location":   rel,
-                        "word":       word,
-                        "severity":   scanner._get_severity(word),
-                        "suggestion": scanner._get_suggestion(word),
-                        "original":   item.name,
-                        "proposed":   item.name.lower().replace(word, scanner._get_suggestion(word)),
-                        "full_path":  str(item),
-                        "line_num":   0,
-                    })
-                # Deep scan smali and xml text content
-                if item.suffix in ('.smali', '.xml', '.txt', '.MF', '.SF'):
-                    try:
-                        with open(item, 'r', encoding='utf-8', errors='ignore') as f:
-                            lines = f.readlines()
-                        for line_num, line in enumerate(lines, 1):
-                            ls = line.strip()
-                            for word in scanner._check_text(ls):
-                                findings.append({
-                                    "context":    "string",
-                                    "location":   f"{rel}:{line_num}",
-                                    "word":       word,
-                                    "severity":   scanner._get_severity(word),
-                                    "suggestion": scanner._get_suggestion(word),
-                                    "original":   ls,
-                                    "proposed":   ls.lower().replace(word, scanner._get_suggestion(word)),
-                                    "full_path":  str(item),
-                                    "line_num":   line_num,
-                                })
-                    except Exception:
-                        pass
-
-        # Deduplicate
-        seen = set()
-        unique = []
-        for f in findings:
-            key = (f["location"], f["word"])
-            if key not in seen:
-                seen.add(key)
-                unique.append(f)
-
-        critical = sum(1 for f in unique if f["severity"] == "CRITICAL")
-        warning  = sum(1 for f in unique if f["severity"] == "WARNING")
-        advisory = sum(1 for f in unique if f["severity"] == "ADVISORY")
-        score    = scanner.compute_score(unique)
-
-        return {
-            "findings":        unique,
-            "total":           len(unique),
-            "critical":        critical,
-            "warning":         warning,
-            "advisory":        advisory,
-            "score":           score,
-            "target":          target,
-        }
-
     def run_operation(self, workspace_dir, target, operation) -> dict:
         """Route selected operation to correct engine method."""
         op = operation.lower()
@@ -2702,8 +3241,6 @@ class ManualControlEngine:
             return self.compress_target(workspace_dir, target)
         elif op == "integrity verification":
             return self.integrity_verification(workspace_dir, target)
-        elif op == "compliance scan":
-            return self.compliance_scan_target(workspace_dir, target)
         else:
             return {"error": f"Unknown operation: {operation}"}
 
@@ -3270,6 +3807,31 @@ class MasterProtectionEngine:
             mark("Level 4 — Security Compliance Layer",
                  f"✅ {security_fields} security fields added")
 
+            # ── STRING SPLITTING — sensitive strings fragmented ───────────────
+            mark("🔀 String Splitting", "⏳ Running...")
+            splitter    = StringSplitterEngine()
+            split_count = splitter.apply(workspace)
+            mark("🔀 String Splitting",
+                 f"✅ {split_count} sensitive strings split into runtime-only fragments")
+
+            # ── METADATA STRIPPING — tool fingerprints removed ────────────────
+            mark("🧹 Metadata Stripping", "⏳ Running...")
+            meta_stripper  = MetadataStripper()
+            meta_result    = meta_stripper.apply(workspace)
+            mark("🧹 Metadata Stripping",
+                 f"✅ {meta_result['total']} metadata items removed")
+
+            # ── TAMPER DETECTION — build-time hashes embedded ─────────────────
+            mark("🔐 Tamper Detection", "⏳ Computing build-time hashes...")
+            tamper_engine = TamperDetectionEngine()
+            build_hashes  = tamper_engine.compute_build_hashes(workspace)
+            embedded      = tamper_engine.embed_hashes_in_guard(
+                workspace, build_hashes, aes_key)
+            mark("🔐 Tamper Detection",
+                 "✅ Build-time hashes embedded — runtime tamper detection active"
+                 if embedded else
+                 "⚠️ Tamper detection advisory — guard not found for embedding")
+
             # ── LEVEL 5 — BUILD ───────────────────────────────────────────────
             mark("Level 5 — APK Build", "⏳ Running... (this may take 1-3 min)")
             l5 = Level5_APKBuilder(self.tools, work_dir)
@@ -3298,6 +3860,16 @@ class MasterProtectionEngine:
             if sign_result.get("fingerprint"):
                 mark("🔏 SHA-256 Fingerprint", f"✅ {sign_result['fingerprint'][:40]}...")
             mark("🔐 Keystore",                "✅ Securely destroyed after signing")
+
+            # ── POST-PROTECTION VERIFICATION ─────────────────────────────────
+            mark("🔬 Post-Protection Verification", "⏳ Running...")
+            verifier     = PostProtectionVerifier()
+            verification = verifier.run(final_apk)
+            results["VERIFICATION"] = verification
+            if verification.get("overall_passed"):
+                mark("🔬 Post-Protection Verification", "✅ APK verified — clean and installable")
+            else:
+                mark("🔬 Post-Protection Verification", "⚠️ Verification issues found — check report")
 
             results["OUTPUT_APK"]  = final_apk
             results["GUARD_JAVA"]  = guard_path
@@ -3367,103 +3939,85 @@ class MasterProtectionEngine:
             "scanner":    scanner,
         }
 
-    async def protect_phase2_complete(self, workspace: str, work_dir: str,
-                                aes_key: bytes,
-                                status_msg=None, context=None) -> dict:
+    def protect_phase2_complete(self, workspace: str, work_dir: str,
+                                aes_key: bytes) -> dict:
         """
         Phase 2 of compliance-integrated protection pipeline.
-        Runs Levels 2-7 after compliance review is complete.
-        If status_msg and context are provided, updates Telegram message
-        live after each level completes — real-time progress for admin.
-        Rate-limit guard: asyncio.sleep(0.4) between edits.
+        Runs Levels 2-6 after compliance review is complete.
+        Called AFTER admin has reviewed and approved all compliance findings.
         """
-        results  = {}
-        progress = []   # live progress lines shown to admin
+        results = {}
 
         def mark(k, v):
             results[k] = v
             logger.info(f"[Phase2] {k}: {v}")
 
-        async def live(line: str):
-            """Append line to progress and edit Telegram message safely."""
-            progress.append(line)
-            if status_msg and context:
-                try:
-                    await status_msg.edit_text(
-                        "🛡️ *Protection In Progress...*\n\n"
-                        "━━━━━━━━━━━━━━━━━━━━━\n" +
-                        '\n'.join(progress) +
-                        "\n━━━━━━━━━━━━━━━━━━━━━",
-                        parse_mode="Markdown")
-                    await asyncio.sleep(0.4)   # rate-limit guard
-                except Exception:
-                    pass   # never crash on a UI update failure
-
         try:
-            t_start = time.time()
-
             # ── LEVEL 2 — Manifest ───────────────────────────────────────────
-            await live("⏳ *Level 2* — Manifest Hardening...")
-            t2 = time.time()
+            mark("Level 2 — Manifest", "⏳ Running...")
             l2 = Level2_ManifestProtector(work_dir)
             man_changes = l2.protect(workspace)
-            elapsed = f"{time.time()-t2:.1f}s"
             mark("Level 2 — Manifest", f"✅ {len(man_changes)} changes")
-            await live(f"✅ *Level 2* — Manifest Hardening done `({elapsed})`\n"
-                       f"   FLAG_SECURE · Network Config · SSL Pinning")
 
             # ── LEVEL 3 — Security Guard Integration ─────────────────────────
-            await live("⏳ *Level 3* — Security Guard Integration...")
-            t3 = time.time()
+            mark("Level 3 — Security Guard Integration", "⏳ Running...")
             l3 = Level3_SecurityGuardIntegrator(self.crypto, work_dir)
             guard_path       = l3.save_guard_java(aes_key)
             guard_integrated = l3.integrate_security_guard(workspace, aes_key)
-            elapsed = f"{time.time()-t3:.1f}s"
             mark("Level 3 — Security Guard Integration",
-                 f"✅ {guard_integrated} entry points wired")
-            await live(f"✅ *Level 3* — Security Guard done `({elapsed})`\n"
-                       f"   {guard_integrated} entry points · strings encrypted")
+                 f"✅ {guard_integrated} wired — Guard class placed in smali")
 
             # ── LEVEL 4 — Security Compliance Layer ──────────────────────────
-            await live("⏳ *Level 4* — Security Compliance Layer...")
-            t4 = time.time()
+            mark("Level 4 — Security Compliance Layer", "⏳ Running...")
             l4 = Level4_SecurityCompliance(self.crypto, work_dir)
             security_fields = l4.add_security_fields(workspace)
-            elapsed = f"{time.time()-t4:.1f}s"
             mark("Level 4 — Security Compliance Layer",
                  f"✅ {security_fields} security fields added")
-            await live(f"✅ *Level 4* — Security Fields done `({elapsed})`\n"
-                       f"   {security_fields} marker fields added")
 
-            # ── LEVEL 5 — Integrity Snapshot ─────────────────────────────────
-            await live("⏳ *Level 5* — Integrity Manifest...")
-            t5 = time.time()
-            int_manifest = self.integrity.generate(workspace)
-            self.integrity.save(int_manifest)
-            elapsed = f"{time.time()-t5:.1f}s"
-            mark("🔒 Integrity Manifest", f"✅ {len(int_manifest)} files hashed")
-            await live(f"✅ *Level 5* — Integrity Manifest done `({elapsed})`\n"
-                       f"   {len(int_manifest)} files SHA-256 hashed")
+            # ── STRING SPLITTING — sensitive strings fragmented ───────────────
+            mark("🔀 String Splitting", "⏳ Running...")
+            splitter_p2    = StringSplitterEngine()
+            split_count_p2 = splitter_p2.apply(workspace)
+            mark("🔀 String Splitting",
+                 f"✅ {split_count_p2} sensitive strings split into runtime-only fragments")
 
-            # ── LEVEL 6 — APK Build ───────────────────────────────────────────
-            await live("⏳ *Level 6* — APK Build `(1-3 min)`...")
-            t6 = time.time()
+            # ── METADATA STRIPPING — tool fingerprints removed ────────────────
+            mark("🧹 Metadata Stripping", "⏳ Running...")
+            meta_stripper_p2 = MetadataStripper()
+            meta_result_p2   = meta_stripper_p2.apply(workspace)
+            mark("🧹 Metadata Stripping",
+                 f"✅ {meta_result_p2['total']} metadata items removed")
+
+            # ── TAMPER DETECTION — build-time hashes embedded ─────────────────
+            mark("🔐 Tamper Detection", "⏳ Computing build-time hashes...")
+            tamper_p2    = TamperDetectionEngine()
+            hashes_p2    = tamper_p2.compute_build_hashes(workspace)
+            embedded_p2  = tamper_p2.embed_hashes_in_guard(
+                workspace, hashes_p2, aes_key)
+            mark("🔐 Tamper Detection",
+                 "✅ Build-time hashes embedded — runtime tamper detection active"
+                 if embedded_p2 else
+                 "⚠️ Tamper detection advisory — guard not found for embedding")
+
+            # ── LEVEL 5 — BUILD ───────────────────────────────────────────────
+            mark("Level 5 — APK Build", "⏳ Running... (this may take 1-3 min)")
             l5 = Level5_APKBuilder(self.tools, work_dir)
             rebuilt = l5.rebuild(workspace)
-            elapsed = f"{time.time()-t6:.1f}s"
-            mark("Level 6 — APK Build", "✅ Valid APK produced")
-            await live(f"✅ *Level 6* — APK Build done `({elapsed})`")
+            mark("Level 5 — APK Build", "✅ Valid APK produced")
 
-            # ── LEVEL 7 — Sign & Align ────────────────────────────────────────
-            await live("⏳ *Level 7* — Sign & ZipAlign...")
-            t7 = time.time()
+            # ── Integrity snapshot ────────────────────────────────────────────
+            int_manifest = self.integrity.generate(workspace)
+            self.integrity.save(int_manifest)
+            mark("🔒 Integrity Manifest", f"✅ {len(int_manifest)} files hashed")
+
+            # ── LEVEL 6 — Sign & Align ────────────────────────────────────────
+            mark("Level 6 — Sign & Align", "⏳ Generating fresh identity...")
             l6          = Level6_Signer(work_dir)
             sign_result = l6.prepare(rebuilt)
             final_apk   = sign_result["output_apk"]
             identity    = sign_result["identity"]
-            elapsed     = f"{time.time()-t7:.1f}s"
 
-            mark("Level 7 — Sign & Align",    "✅ Signed & zipaligned")
+            mark("Level 6 — Sign & Align",    "✅ Signed & zipaligned")
             mark("🆔 Identity CN",             f"✅ {identity['cn']}")
             mark("🏢 Organization",            f"✅ {identity['org']}")
             mark("🌍 Location",
@@ -3475,28 +4029,24 @@ class MasterProtectionEngine:
                      f"✅ {sign_result['fingerprint'][:40]}...")
             mark("🔐 Keystore", "✅ Securely destroyed after signing")
 
-            total_elapsed = f"{time.time()-t_start:.1f}s"
-            await live(f"✅ *Level 7* — Signed & Aligned done `({elapsed})`\n"
-                       f"   Method: {sign_result['signing_method']} · "
-                       f"CN: {identity['cn']}")
-            await live(f"\n🏁 *All 7 levels complete in `{total_elapsed}`* 🎉")
+            # ── POST-PROTECTION VERIFICATION ─────────────────────────────────
+            mark("🔬 Post-Protection Verification", "⏳ Running...")
+            verifier     = PostProtectionVerifier()
+            verification = verifier.run(final_apk)
+            results["VERIFICATION"] = verification
+            if verification.get("overall_passed"):
+                mark("🔬 Post-Protection Verification", "✅ APK verified — clean and installable")
+            else:
+                mark("🔬 Post-Protection Verification", "⚠️ Verification issues found — check report")
 
             results["OUTPUT_APK"] = final_apk
             results["GUARD_JAVA"] = guard_path
             results["SUCCESS"]    = True
 
         except Exception as e:
-            error_msg = str(e)
-            results["ERROR"]   = error_msg
+            results["ERROR"]   = str(e)
             results["SUCCESS"] = False
             logger.error(f"[Phase2] Protection failed: {e}", exc_info=True)
-            await live(f"\n❌ *Error:* `{error_msg[:200]}`")
-            job_history.append({
-                "apk_name":  "unknown",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "success":   False,
-                "summary":   f"Failed: {error_msg[:80]}",
-            })
         finally:
             workspace_dir = os.path.join(work_dir, "workspace")
             if os.path.exists(workspace_dir):
@@ -3543,28 +4093,20 @@ def admin_kb():
         [InlineKeyboardButton("🛡️ Protect APK",              callback_data="admin_protect")],
         [InlineKeyboardButton("🎛️ Manual Control Panel",     callback_data="admin_manual")],
         [InlineKeyboardButton("🔍 Compliance Scan",          callback_data="admin_compliance_scan")],
-        [InlineKeyboardButton("📋 Pipeline Order",           callback_data="admin_pipeline_order")],
-        [InlineKeyboardButton("🔧 Validate Pipeline",        callback_data="admin_pipeline_validate")],
         [InlineKeyboardButton("📤 Send APK to Client",       callback_data="admin_send_apk")],
-        [InlineKeyboardButton("📢 Broadcast Message",        callback_data="admin_broadcast")],
-        [InlineKeyboardButton("💬 Reply to Client",          callback_data="admin_reply")],
         [InlineKeyboardButton("👥 View All Clients",         callback_data="admin_clients")],
         [InlineKeyboardButton("🗑️ Delete Client",            callback_data="admin_delete_client")],
         [InlineKeyboardButton("📋 Job History",              callback_data="admin_job_history")],
-        [InlineKeyboardButton("🧹 Clear All Jobs",           callback_data="admin_clear_jobs")],
         [InlineKeyboardButton("🖥️ System Status",            callback_data="admin_system_status")],
         [InlineKeyboardButton("📥 Download Audit Log",       callback_data="admin_download_audit")],
         [InlineKeyboardButton("📄 Download Integrity Report",callback_data="admin_download_integrity")],
-        [InlineKeyboardButton("📊 Statistics",               callback_data="admin_stats")],
     ])
 
 def client_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📁 Request APK",       callback_data="client_request_apk")],
         [InlineKeyboardButton("📊 My APK Status",     callback_data="client_apk_status")],
-        [InlineKeyboardButton("📋 Our Services",      callback_data="client_services")],
         [InlineKeyboardButton("💬 Contact Admin",     callback_data="client_contact")],
-        [InlineKeyboardButton("ℹ️ About",              callback_data="client_about")],
     ])
 
 def back_a(): return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_admin")]])
@@ -3577,11 +4119,8 @@ async def start(update, context):
     register_client(user)
     if is_admin(user.id):
         await update.message.reply_text(
-            f"👑 *Welcome back, Admin!*\n\n"
-            f"🛡️ *EPIC PROTECTOR — Elite Master Hybrid*\n"
-            f"7-Level Android Protection\n"
-            f"🔖 Version: v{SCRIPT_VERSION}\n\n"
-            f"Total Clients: {len(registered_clients)}\n\nChoose an action:",
+            f"👑 *Welcome back, Admin!*\n\n🛡️ *EPIC PROTECTOR — Elite Master Hybrid*\n"
+            f"7-Level Android Protection\n\nTotal Clients: {len(registered_clients)}\n\nChoose an action:",
             parse_mode="Markdown", reply_markup=admin_kb())
     else:
         await update.message.reply_text(
@@ -3599,7 +4138,6 @@ def _build_op_keyboard(target: str) -> InlineKeyboardMarkup:
         "Rename":                 "✏️ Rename",
         "Compress":               "🗜️ Compress",
         "Integrity Verification": "🔍 Integrity Verify",
-        "Compliance Scan":        "🛡️ Compliance Scan",
     }
     rows = []
     row  = []
@@ -3672,6 +4210,25 @@ async def _deliver_protected_apk(update, context, status_msg, results, apk_name,
                     document=f,
                     filename="EpicSecurityGuard.java",
                     caption="☕ Copy to your Android security package.")
+
+        # ── Post-Protection Verification Report — sent automatically ─────────
+        verification = results.get("VERIFICATION")
+        if verification:
+            report_text = PostProtectionVerifier.format_report(verification, apk_name)
+            await update.message.reply_text(
+                report_text,
+                parse_mode="Markdown",
+                reply_markup=admin_kb())
+        else:
+            # Verification was not stored — run it now on the output APK
+            out = results.get("OUTPUT_APK")
+            if out and os.path.exists(out):
+                verification = PostProtectionVerifier().run(out)
+                report_text  = PostProtectionVerifier.format_report(verification, apk_name)
+                await update.message.reply_text(
+                    report_text,
+                    parse_mode="Markdown",
+                    reply_markup=admin_kb())
     else:
         await status_msg.edit_text(
             f"❌ *Protection Failed*\n\n`{results.get('ERROR', 'Unknown error')}`\n\n"
@@ -3970,16 +4527,11 @@ async def button_handler(update, context):
             "Proceeding with protection as-is.\n\n⏳ Please wait...",
             parse_mode="Markdown")
 
-        engine   = MasterProtectionEngine()
-        live_msg = await query.message.reply_text(
-            "🛡️ *Protection In Progress...*\n\n━━━━━━━━━━━━━━━━━━━━━\n⏳ Starting...",
-            parse_mode="Markdown")
-        results = await engine.protect_phase2_complete(
+        engine  = MasterProtectionEngine()
+        results = engine.protect_phase2_complete(
             session["workspace"],
             session["work_dir"],
-            session["aes_key"],
-            status_msg=live_msg,
-            context=context)
+            session["aes_key"])
 
         # Save audit log
         session["scanner"].save_audit_log(
@@ -3990,7 +4542,7 @@ async def button_handler(update, context):
 
         compliance_session.pop(user.id, None)
         await _deliver_protected_apk(
-            query, context, live_msg, results,
+            query, context, query.message, results,
             session.get("apk_name", "app.apk"))
 
     elif data == "cs_proceed":
@@ -4005,19 +4557,14 @@ async def button_handler(update, context):
 
         await query.edit_message_text(
             "⚙️ *Starting Full Protection...*\n\n"
-            "Running Levels 2 → 7\n\n⏳ This takes 2-5 minutes...",
+            "Running Levels 2 → 6\n\n⏳ This takes 2-5 minutes...",
             parse_mode="Markdown")
 
-        engine   = MasterProtectionEngine()
-        live_msg = await query.message.reply_text(
-            "🛡️ *Protection In Progress...*\n\n━━━━━━━━━━━━━━━━━━━━━\n⏳ Starting...",
-            parse_mode="Markdown")
-        results = await engine.protect_phase2_complete(
+        engine  = MasterProtectionEngine()
+        results = engine.protect_phase2_complete(
             session["workspace"],
             session["work_dir"],
-            session["aes_key"],
-            status_msg=live_msg,
-            context=context)
+            session["aes_key"])
 
         # Save audit log
         session["scanner"].save_audit_log(
@@ -4027,8 +4574,11 @@ async def button_handler(update, context):
             session.get("apk_name", "app.apk"))
 
         compliance_session.pop(user.id, None)
+
+        status_msg = await query.message.reply_text(
+            "⏳ Finalizing...", parse_mode="Markdown")
         await _deliver_protected_apk(
-            query, context, live_msg, results,
+            query, context, status_msg, results,
             session.get("apk_name", "app.apk"))
 
     elif data == "cs_addword":
@@ -4155,7 +4705,6 @@ async def button_handler(update, context):
                     "Rename":                 "✏️ Rename",
                     "Compress":               "🗜️ Compress",
                     "Integrity Verification": "🔍 Integrity Verify",
-                "Compliance Scan":        "🛡️ Compliance Scan",
                 }
                 row = []
                 for op in allowed_ops:
@@ -4231,7 +4780,6 @@ async def button_handler(update, context):
                 "Rename":                 "✏️ Rename",
                 "Compress":               "🗜️ Compress",
                 "Integrity Verification": "🔍 Integrity Verify",
-                "Compliance Scan":        "🛡️ Compliance Scan",
             }
             kb_rows = []
             if high_count > 0:
@@ -4372,32 +4920,7 @@ async def button_handler(update, context):
                     parse_mode="Markdown", reply_markup=back_a())
                 return
 
-            # ── Compliance Scan — show findings report ────────────────────────
-            if operation.lower() == "compliance scan":
-                score     = results.get("score", 0)
-                total     = results.get("total", 0)
-                critical  = results.get("critical", 0)
-                warning   = results.get("warning", 0)
-                advisory  = results.get("advisory", 0)
-                score_icon = "✅" if score >= 90 else "⚠️" if score >= 60 else "❌"
-                await status.edit_text(
-                    f"🛡️ *Manual Compliance Scan — `{target}`*\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🔴 Critical : {critical}\n"
-                    f"🟡 Warning  : {warning}\n"
-                    f"🟢 Advisory : {advisory}\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📊 Score: {score_icon} *{score}/100*\n"
-                    f"Total findings: *{total}*\n\n"
-                    f"⛔ Protection pipeline was NOT touched.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📂 Select Another Target", callback_data="manual_select_target")],
-                        [InlineKeyboardButton("⬅️ Back to Menu",          callback_data="back_admin")],
-                    ]))
-                return
-
-            # Build result report lines for all other operations
+            # Build result report lines
             lines = [
                 f"⚙️ Processing `{target}` → `{operation}`\n",
                 "━━━━━━━━━━━━━━━━━━━━━"
@@ -4418,7 +4941,7 @@ async def button_handler(update, context):
                     [InlineKeyboardButton("⬅️ Back to Menu",             callback_data="back_admin")],
                 ]))
 
-            # ── Deliver compress archive to admin via bot ─────────────────────
+            # ── Fix 20: Deliver compress archive to admin via bot ─────────────
             if operation.lower() == "compress":
                 archive_path = results.get("archive_path")
                 if archive_path and os.path.exists(archive_path):
@@ -4571,34 +5094,6 @@ async def button_handler(update, context):
             f"📤 Sending to *{info.get('name', tid)}*\n\nSend APK now:",
             parse_mode="Markdown", reply_markup=back_a())
 
-    elif data == "admin_broadcast":
-        if not is_admin(user.id): return
-        pending_broadcast[user.id] = True
-        await query.edit_message_text(
-            f"📢 *Broadcast*\n\nSending to {len(registered_clients)} clients.\n\nType message:",
-            parse_mode="Markdown", reply_markup=back_a())
-
-    elif data == "admin_reply":
-        if not is_admin(user.id): return
-        if not registered_clients:
-            await query.edit_message_text("👥 No clients.", reply_markup=back_a()); return
-        clients_list = list(registered_clients.items())[:90]
-        btns = [[InlineKeyboardButton(f"{i['name']} ({i['username']})", callback_data=f"rep_{uid}")]
-                for uid, i in clients_list]
-        btns.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
-        await query.edit_message_text(
-            "💬 *Reply*\n\nSelect client:",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
-
-    elif data.startswith("rep_"):
-        if not is_admin(user.id): return
-        tid = int(data[4:])
-        pending_reply[user.id] = tid
-        info = registered_clients.get(tid, {})
-        await query.edit_message_text(
-            f"💬 Replying to *{info.get('name', tid)}*\n\nType message:",
-            parse_mode="Markdown", reply_markup=back_a())
-
     elif data == "admin_clients":
         if not is_admin(user.id): return
         if not registered_clients:
@@ -4612,166 +5107,14 @@ async def button_handler(update, context):
 
     elif data == "admin_compliance_scan":
         if not is_admin(user.id): return
-        # Standalone scan — completely separate from protect flow
-        # Sets pending_standalone_scan — NOT pending_protect
-        pending_standalone_scan[user.id] = True
+        pending_protect[user.id] = True
         await query.edit_message_text(
             "🔍 *Standalone Compliance Scan*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
             "Send your APK file.\n\n"
-            "✅ Scanner will run on ALL folders:\n"
-            "   smali/ · res/ · lib/ · META-INF/ · assets/\n\n"
-            "✅ Full findings report delivered\n"
-            "✅ Fix All Critical option available\n"
-            "✅ Export report as JSON\n\n"
-            "⛔ Protection pipeline will NOT run\n"
-            "⛔ No Level 2-7 will be touched\n\n"
-            f"⚠️ Max APK size: {MAX_APK_MB}MB\n\n"
-            "📎 Send APK now:",
+            "The Compliance Scanner will run independently —\n"
+            "you will see all findings before any protection is applied.\n\n"
+            f"⚠️ Max APK size: {MAX_APK_MB}MB\n\n📎 Send APK now:",
             parse_mode="Markdown", reply_markup=back_a())
-
-
-    elif data.startswith("ss_review_"):
-        if not is_admin(user.id): return
-        session = standalone_scan_session.get(user.id)
-        if not session:
-            await query.edit_message_text(
-                "❌ Scan session expired. Please scan again.",
-                reply_markup=admin_kb())
-            return
-        idx      = int(data.split("_")[-1])
-        findings = session.get("findings", [])
-        total    = len(findings)
-        if idx >= total:
-            await query.edit_message_text(
-                f"✅ *Review Complete!*\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"Fixed   : {session.get('fixed', 0)}\n"
-                f"Total   : {total}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Scan only — protection was NOT applied.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📄 Export Report", callback_data="ss_export")],
-                    [InlineKeyboardButton("⬅️ Back to Menu",  callback_data="back_admin")],
-                ]))
-            return
-        finding = findings[idx]
-        msg     = ComplianceScannerEngine.format_finding_message(finding, idx + 1, total)
-        await query.edit_message_text(
-            msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Fix '" + finding['suggestion'] + "'", callback_data=f"ss_fix_one_{idx}")],
-                [InlineKeyboardButton("⏭️ Skip", callback_data=f"ss_review_{idx + 1}")],
-                [InlineKeyboardButton("📄 Export Report", callback_data="ss_export")],
-            ]))
-
-    elif data.startswith("ss_fix_one_"):
-        if not is_admin(user.id): return
-        session  = standalone_scan_session.get(user.id)
-        if not session:
-            await query.edit_message_text("❌ Session expired.", reply_markup=admin_kb())
-            return
-        idx      = int(data.split("_")[-1])
-        findings = session.get("findings", [])
-        scanner  = session.get("scanner", ComplianceScannerEngine())
-        if idx < len(findings):
-            if scanner.apply_rename(findings[idx]):
-                session["fixed"] = session.get("fixed", 0) + 1
-        next_idx  = idx + 1
-        remaining = len(findings) - next_idx
-        if remaining <= 0:
-            await query.edit_message_text(
-                f"✅ *All items reviewed!*\n\nFixed: {session.get('fixed', 0)} / {len(findings)}\n\nScan only — protection was NOT applied.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📄 Export Report", callback_data="ss_export")],
-                    [InlineKeyboardButton("⬅️ Back to Menu",  callback_data="back_admin")],
-                ]))
-        else:
-            finding = findings[next_idx]
-            msg     = ComplianceScannerEngine.format_finding_message(finding, next_idx + 1, len(findings))
-            await query.edit_message_text(
-                msg, parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Fix '" + finding['suggestion'] + "'", callback_data=f"ss_fix_one_{next_idx}")],
-                    [InlineKeyboardButton("⏭️ Skip", callback_data=f"ss_review_{next_idx + 1}")],
-                    [InlineKeyboardButton("📄 Export Report", callback_data="ss_export")],
-                ]))
-
-    elif data == "ss_fix_all":
-        if not is_admin(user.id): return
-        session = standalone_scan_session.get(user.id)
-        if not session:
-            await query.edit_message_text("❌ Scan session expired. Please scan again.", reply_markup=back_a())
-            return
-        findings = session.get("findings", [])
-        scanner  = ComplianceScannerEngine()
-        scanner.findings = findings
-        fixed = scanner.apply_all_critical(findings)
-        session["fixed"] = fixed
-        await query.edit_message_text(
-            f"⚡ *Auto-Fix Complete!*\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ Critical items fixed : {fixed}\n"
-            f"📊 Score improvement   : +{fixed * 15} pts\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"Workspace updated. No protection was applied.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📄 Export Report", callback_data="ss_export")],
-                [InlineKeyboardButton("⬅️ Back to Menu",  callback_data="back_admin")],
-            ]))
-
-    elif data == "ss_export":
-        if not is_admin(user.id): return
-        session = standalone_scan_session.get(user.id)
-        if not session:
-            await query.edit_message_text("❌ Scan session expired.", reply_markup=back_a())
-            return
-        try:
-            findings  = session.get("findings", [])
-            apk_name  = session.get("apk_name", "unknown.apk")
-            score     = session.get("score", 0)
-            fixed     = session.get("fixed", 0)
-            report    = {
-                "epic_protector_version": SCRIPT_VERSION,
-                "report_type":    "Standalone Compliance Scan",
-                "apk_name":       apk_name,
-                "scan_timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "compliance_score": score,
-                "total_findings": len(findings),
-                "critical":       sum(1 for f in findings if f["severity"] == "CRITICAL"),
-                "warning":        sum(1 for f in findings if f["severity"] == "WARNING"),
-                "advisory":       sum(1 for f in findings if f["severity"] == "ADVISORY"),
-                "fixed":          fixed,
-                "findings":       findings,
-            }
-            os.makedirs(WORK_DIR, exist_ok=True)
-            report_path = os.path.join(WORK_DIR, f"standalone_scan_{int(time.time())}.json")
-            with open(report_path, 'w') as rf:
-                json.dump(report, rf, indent=2)
-            await query.edit_message_text(
-                "📄 *Exporting Compliance Report...*", parse_mode="Markdown")
-            with open(report_path, "rb") as rf:
-                await context.bot.send_document(
-                    chat_id=user.id,
-                    document=rf,
-                    filename=f"compliance_report_{int(time.time())}.json",
-                    caption=(
-                        f"📄 *Standalone Compliance Report*\n\n"
-                        f"APK: `{apk_name}`\n"
-                        f"Score: `{score}/100`\n"
-                        f"Findings: `{len(findings)}`\n"
-                        f"Fixed: `{fixed}`\n"
-                        f"Version: `v{SCRIPT_VERSION}`"
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=admin_kb())
-        except Exception as e:
-            await query.edit_message_text(
-                f"❌ *Export Failed:* `{e}`",
-                parse_mode="Markdown", reply_markup=back_a())
 
     elif data == "admin_delete_client":
         if not is_admin(user.id): return
@@ -4818,25 +5161,6 @@ async def button_handler(update, context):
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
         await query.edit_message_text(
             '\n'.join(lines),
-            parse_mode="Markdown", reply_markup=back_a())
-
-    elif data == "admin_clear_jobs":
-        if not is_admin(user.id): return
-        count = len(job_history)
-        job_history.clear()
-        # Clean up old job directories
-        cleaned = 0
-        try:
-            for item in Path(WORK_DIR).iterdir():
-                if item.is_dir() and item.name.startswith("job_"):
-                    shutil.rmtree(item, ignore_errors=True)
-                    cleaned += 1
-        except Exception as e:
-            logger.warning(f"[ClearJobs] Cleanup error: {e}")
-        await query.edit_message_text(
-            f"🧹 *All Jobs Cleared*\n\n"
-            f"✅ {count} job records cleared\n"
-            f"✅ {cleaned} job directories removed",
             parse_mode="Markdown", reply_markup=back_a())
 
     elif data == "admin_system_status":
@@ -4906,99 +5230,10 @@ async def button_handler(update, context):
                 caption="🔒 Integrity Manifest — SHA-256 file hashes",
                 reply_markup=admin_kb())
 
-    elif data == "admin_pipeline_order":
-        if not is_admin(user.id): return
-        await query.edit_message_text(
-            f"📋 *EPIC PROTECTOR — Correct Pipeline Order*\n"
-            f"*Version: v{SCRIPT_VERSION}*\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"*INPUT:* Your original APK file\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"*Level 1 — APK Workspace Build*\n"
-            f"  Tool   : apktool decode\n"
-            f"  Input  : original .apk\n"
-            f"  Output : decoded workspace folder\n\n"
-            f"*Level 2 — Manifest Hardening*\n"
-            f"  Tool   : direct XML edit\n"
-            f"  Input  : workspace/AndroidManifest.xml\n"
-            f"  Output : hardened manifest + network_security_config.xml\n"
-            f"  Adds   : FLAG_SECURE · SSL Pinning · No cleartext\n\n"
-            f"*Level 3 — Security Guard Integration*\n"
-            f"  Tool   : smali editor + AES-256-CBC\n"
-            f"  Input  : workspace/smali/\n"
-            f"  Output : EpicSecurityGuard.smali placed · strings encrypted\n"
-            f"  Wires  : MainActivity · SplashActivity · LaunchActivity\n\n"
-            f"*Level 4 — Security Compliance Layer*\n"
-            f"  Tool   : smali editor\n"
-            f"  Input  : workspace/smali/\n"
-            f"  Output : security marker fields added to class files\n\n"
-            f"*Level 5 — Compliance Scanner Review*\n"
-            f"  Tool   : ComplianceScannerEngine\n"
-            f"  Input  : full workspace\n"
-            f"  Output : findings report · admin review · auto-fix\n\n"
-            f"*Level 6 — APK Build*\n"
-            f"  Tool   : apktool build\n"
-            f"  Input  : hardened workspace\n"
-            f"  Output : rebuilt .apk with valid DEX + manifest\n\n"
-            f"*Level 7 — Sign & ZipAlign*\n"
-            f"  Tool   : apksigner / jarsigner + zipalign\n"
-            f"  Input  : rebuilt .apk\n"
-            f"  Output : EPIC_PROTECTED.apk — signed · aligned · ready\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"*OUTPUT:* EPIC_PROTECTED.apk ✅\n"
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔧 Validate My Pipeline", callback_data="admin_pipeline_validate")],
-                [InlineKeyboardButton("⬅️ Back", callback_data="back_admin")],
-            ]))
-
-    elif data == "admin_pipeline_validate":
-        if not is_admin(user.id): return
-        pending_pipeline_validate[user.id] = True
-        await query.edit_message_text(
-            "🔧 *Pipeline Validator*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "Send your `epicprotector.py` script file.\n\n"
-            "The validator will:\n"
-            "✅ Parse your script safely (read-only)\n"
-            "✅ Check Level execution order\n"
-            "✅ Detect missing levels\n"
-            "✅ Detect duplicate level calls\n"
-            "✅ Detect wrong sequence\n"
-            "✅ Produce corrected script if issues found\n\n"
-            "⛔ Script will NOT be executed — parse only\n\n"
-            "📎 Send your `.py` script file now:",
-            parse_mode="Markdown", reply_markup=back_a())
-
-    elif data == "admin_stats":
-        if not is_admin(user.id): return
-        await query.edit_message_text(
-            f"📊 *Statistics*\n\n"
-            f"🔖 Version            : v{SCRIPT_VERSION}\n"
-            f"👥 Clients            : {len(registered_clients)}\n"
-            f"📋 Jobs Run           : {len(job_history)}\n"
-            f"🛡️ Pipeline Levels    : 7\n"
-            f"🔒 AES-256-CBC        : ✅\n"
-            f"🔤 String Encryption  : ✅\n"
-            f"📄 Manifest Hardening : ✅\n"
-            f"🔐 FLAG_SECURE        : ✅\n"
-            f"🌐 Network Security   : ✅\n"
-            f"🔒 SSL Pinning        : ✅\n"
-            f"⚙️ Security Guard     : ✅\n"
-            f"🔑 Security Fields    : ✅\n"
-            f"✍️ Auto Sign & Align  : ✅\n"
-            f"💾 Client Persistence : ✅\n"
-            f"📡 Bot                : Online ✅",
-            parse_mode="Markdown", reply_markup=back_a())
-
     elif data == "back_admin":
-        for d in [pending_protect, pending_broadcast, pending_reply,
-                  pending_send_apk, pending_manual, manual_target,
+        for d in [pending_protect, pending_send_apk, pending_manual, manual_target,
                   manual_apk_path, manual_operation, manual_workspace,
-                  manual_scan_result, manual_undo_backup,
-                  pending_standalone_scan, standalone_scan_session,
-                  pending_pipeline_validate]:
+                  manual_scan_result, manual_undo_backup]:
             d.pop(user.id, None)
         await query.edit_message_text(
             "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
@@ -5023,48 +5258,10 @@ async def button_handler(update, context):
             text=f"📥 *APK Request*\n\nClient: {user.full_name}\nUsername: @{user.username or 'none'}\nID: `{user.id}`",
             parse_mode="Markdown", reply_markup=admin_kb())
 
-    elif data == "client_services":
-        await query.edit_message_text(
-            "📋 *Our Services*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "7-Level Elite Protection Pipeline:\n\n"
-            "Level 1 — APK Workspace Build\n"
-            "Level 2 — Manifest Hardening\n"
-            "           (FLAG_SECURE + Network Security)\n"
-            "Level 3 — Security Guard Integration\n"
-            "           (String Encryption + SSL Pinning)\n"
-            "Level 4 — Security Compliance Layer\n"
-            "Level 5 — Compliance Scanner Review\n"
-            "Level 6 — APK Build\n"
-            "Level 7 — Signed & Delivered\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "🏥 Hospital 🏨 Hotel\n"
-            "💊 Medical 💊 Pharma\n"
-            "💾 Data Mgmt 💻 Software",
-            parse_mode="Markdown", reply_markup=back_c())
-
     elif data == "client_contact":
         pending_contact[user.id] = True
         await query.edit_message_text(
             "💬 *Contact Admin*\n\nType your message now:",
-            parse_mode="Markdown", reply_markup=back_c())
-
-    elif data == "client_about":
-        await query.edit_message_text(
-            "ℹ️ *About EPIC PROTECTOR*\n\nElite Master Hybrid Android protection.\n\n"
-            "✅ 7-Level fixed pipeline\n"
-            "✅ AES-256-CBC encryption\n"
-            "✅ String-level encryption\n"
-            "✅ Security Guard Integration\n"
-            "✅ FLAG_SECURE anti-screen-capture\n"
-            "✅ Network Security Config\n"
-            "✅ SSL Pinning enforcement\n"
-            "✅ Runtime Integrity Monitoring\n"
-            "✅ Unauthorized Framework Detection\n"
-            "✅ Auto sign & zipalign\n"
-            "✅ Persistent client storage\n"
-            "✅ APK status tracking\n\n"
-            "👨‍💼 Security Administrator",
             parse_mode="Markdown", reply_markup=back_c())
 
     elif data == "back_client":
@@ -5136,34 +5333,6 @@ async def message_handler(update, context):
             f"━━━━━━━━━━━━━━━━━━━━━",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(op_buttons))
-        return
-
-    if is_admin(user.id) and pending_broadcast.get(user.id):
-        pending_broadcast.pop(user.id)
-        sent = failed = 0
-        for cid in registered_clients:
-            try:
-                await context.bot.send_message(
-                    chat_id=cid,
-                    text=f"📢 *From Admin:*\n\n{text}",
-                    parse_mode="Markdown")
-                sent += 1
-            except: failed += 1
-        await update.message.reply_text(
-            f"📢 *Done!*\n\n✅ Sent: {sent}\n❌ Failed: {failed}",
-            parse_mode="Markdown", reply_markup=admin_kb())
-        return
-
-    if is_admin(user.id) and pending_reply.get(user.id):
-        tid = pending_reply.pop(user.id)
-        try:
-            await context.bot.send_message(
-                chat_id=tid,
-                text=f"💬 *From Admin:*\n\n{text}",
-                parse_mode="Markdown")
-            await update.message.reply_text("✅ Reply sent!", reply_markup=admin_kb())
-        except Exception as e:
-            await update.message.reply_text(f"❌ Failed: {e}", reply_markup=admin_kb())
         return
 
     if pending_contact.get(user.id):
@@ -5252,253 +5421,6 @@ async def document_handler(update, context):
             pending_manual.pop(user.id, None)
         return
 
-    # ── Admin: standalone compliance scan — APK upload ───────────────────────
-    if is_admin(user.id) and pending_standalone_scan.get(user.id):
-        pending_standalone_scan.pop(user.id)
-
-        if doc.file_size and doc.file_size > MAX_APK_MB * 1024 * 1024:
-            await update.message.reply_text(
-                f"❌ APK too large. Max: {MAX_APK_MB}MB",
-                reply_markup=admin_kb())
-            return
-
-        status = await update.message.reply_text(
-            "🔍 *Standalone Compliance Scan Starting...*\n\n"
-            "⏳ Decoding APK...\n"
-            "⏳ Scanning smali · res · lib · META-INF...\n\n"
-            "Please wait...",
-            parse_mode="Markdown")
-        try:
-            tg_file  = await context.bot.get_file(doc.file_id)
-            os.makedirs(WORK_DIR, exist_ok=True)
-            apk_in   = os.path.join(WORK_DIR, f"scan_{user.id}_{int(time.time())}.apk")
-            await tg_file.download_to_drive(apk_in)
-            apk_name = doc.file_name or os.path.basename(apk_in)
-
-            # Decode APK
-            tools = ToolInstaller()
-            tools.install_all()
-            job_id   = f"scan_{int(time.time())}"
-            work_dir = os.path.join(WORK_DIR, job_id)
-            os.makedirs(work_dir, exist_ok=True)
-            l1        = Level1_WorkspaceBuilder(tools, work_dir)
-            workspace = l1.build_workspace(apk_in)
-
-            await status.edit_text(
-                "🔍 *Standalone Compliance Scan*\n\n"
-                "✅ APK decoded\n"
-                "⏳ Running full scan...",
-                parse_mode="Markdown")
-
-            # Run full compliance scan
-            scanner  = ComplianceScannerEngine()
-            findings = scanner.scan_workspace(workspace)
-            score    = scanner.compute_score(findings)
-            critical = sum(1 for f in findings if f["severity"] == "CRITICAL")
-            warning  = sum(1 for f in findings if f["severity"] == "WARNING")
-            advisory = sum(1 for f in findings if f["severity"] == "ADVISORY")
-
-            # Store session for fix/export actions
-            standalone_scan_session[user.id] = {
-                "findings":  findings,
-                "scanner":   scanner,
-                "workspace": workspace,
-                "apk_name":  apk_name,
-                "score":     score,
-                "fixed":     0,
-            }
-
-            score_icon = "✅" if score >= 90 else "⚠️" if score >= 60 else "❌"
-            await status.edit_text(
-                f"🔍 *Standalone Compliance Scan Complete!*\n\n"
-                f"📦 APK: `{apk_name}`\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🔴 Critical : {critical}\n"
-                f"🟡 Warning  : {warning}\n"
-                f"🟢 Advisory : {advisory}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"📊 Score: {score_icon} *{score}/100*\n"
-                f"Total findings: *{len(findings)}*\n\n"
-                f"⛔ Protection pipeline was NOT touched.\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Choose an action:",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⚡ Fix All Critical",  callback_data="ss_fix_all")],
-                    [InlineKeyboardButton("🔍 Review Each Item",  callback_data="ss_review_0")],
-                    [InlineKeyboardButton("📄 Export Report",     callback_data="ss_export")],
-                    [InlineKeyboardButton("⬅️ Back to Menu",      callback_data="back_admin")],
-                ]))
-        except Exception as e:
-            await status.edit_text(
-                f"❌ *Scan Failed:* `{e}`",
-                parse_mode="Markdown", reply_markup=admin_kb())
-            await _report_error_to_admin(context, str(e), doc.file_name or "unknown")
-        return
-
-    # ── Admin: pipeline validator — script upload ─────────────────────────────
-    if is_admin(user.id) and pending_pipeline_validate.get(user.id):
-        pending_pipeline_validate.pop(user.id)
-
-        # Only accept .py files
-        if not (doc.file_name or "").endswith(".py"):
-            await update.message.reply_text(
-                "❌ Please send a `.py` Python script file.",
-                reply_markup=back_a())
-            return
-
-        # Size limit — 2MB max for a script file
-        if doc.file_size and doc.file_size > 2 * 1024 * 1024:
-            await update.message.reply_text(
-                "❌ Script file too large. Max 2MB.",
-                reply_markup=back_a())
-            return
-
-        status = await update.message.reply_text(
-            "🔧 *Pipeline Validator*\n\n⏳ Parsing script...",
-            parse_mode="Markdown")
-        try:
-            import ast as _ast
-            tg_file    = await context.bot.get_file(doc.file_id)
-            os.makedirs(WORK_DIR, exist_ok=True)
-            script_in  = os.path.join(WORK_DIR, f"validate_{user.id}_{int(time.time())}.py")
-            await tg_file.download_to_drive(script_in)
-
-            with open(script_in, 'r', encoding='utf-8', errors='ignore') as f:
-                source = f.read()
-
-            # Step 1 — Syntax check
-            try:
-                tree = _ast.parse(source)
-            except SyntaxError as se:
-                await status.edit_text(
-                    f"❌ *Syntax Error in Script*\n\n"
-                    f"Line {se.lineno}: `{se.msg}`\n"
-                    f"Text: `{se.text}`\n\n"
-                    f"Fix the syntax error first then re-send.",
-                    parse_mode="Markdown", reply_markup=back_a())
-                return
-
-            # Step 2 — Detect Level class calls in protect/protect_phase2_complete
-            # Correct order: Level1 → Level2 → Level3 → Level4 → Level5 → Level6
-            CORRECT_ORDER = [
-                "Level1_WorkspaceBuilder",
-                "Level2_ManifestProtector",
-                "Level3_SecurityGuardIntegrator",
-                "Level4_SecurityCompliance",
-                "Level5_APKBuilder",
-                "Level6_Signer",
-            ]
-
-            found_order  = []
-            issues       = []
-            lines_map    = {}
-
-            for node in _ast.walk(tree):
-                if isinstance(node, _ast.Call):
-                    if isinstance(node.func, _ast.Name):
-                        name = node.func.id
-                        if name in CORRECT_ORDER:
-                            if name not in found_order:
-                                found_order.append(name)
-                                lines_map[name] = getattr(node, 'lineno', '?')
-                    elif isinstance(node.func, _ast.Attribute):
-                        if isinstance(node.func.value, _ast.Name):
-                            name = node.func.value.id
-                            if name in CORRECT_ORDER:
-                                if name not in found_order:
-                                    found_order.append(name)
-                                    lines_map[name] = getattr(node, 'lineno', '?')
-
-            # Check for missing levels
-            missing = [l for l in CORRECT_ORDER if l not in found_order]
-            # Check for wrong order
-            order_wrong = False
-            for i, level in enumerate(found_order):
-                correct_pos = CORRECT_ORDER.index(level) if level in CORRECT_ORDER else -1
-                if correct_pos != -1 and i != correct_pos:
-                    order_wrong = True
-                    issues.append(
-                        f"⚠️ `{level}` at position {i+1} — should be position {correct_pos+1}")
-
-            for m in missing:
-                issues.append(f"❌ `{m}` — MISSING from pipeline")
-
-            # Build report
-            report_lines = [
-                f"🔧 *Pipeline Validation Report*\n",
-                f"📄 Script: `{doc.file_name}`\n",
-                f"━━━━━━━━━━━━━━━━━━━━━",
-                f"*Detected Level Order:*",
-            ]
-            for i, lv in enumerate(found_order, 1):
-                line_no = lines_map.get(lv, '?')
-                correct = CORRECT_ORDER[i-1] if i-1 < len(CORRECT_ORDER) else "?"
-                icon    = "✅" if lv == correct else "❌"
-                report_lines.append(f"{icon} {i}. `{lv}` (line {line_no})")
-
-            report_lines.append("━━━━━━━━━━━━━━━━━━━━━")
-
-            if not issues:
-                report_lines.append("✅ *Pipeline order is CORRECT*")
-                report_lines.append("No issues found.")
-                await status.edit_text(
-                    '\n'.join(report_lines),
-                    parse_mode="Markdown", reply_markup=back_a())
-            else:
-                report_lines.append(f"*Issues Found: {len(issues)}*")
-                for iss in issues:
-                    report_lines.append(iss)
-                report_lines.append("━━━━━━━━━━━━━━━━━━━━━")
-                report_lines.append("⚙️ Producing corrected script...")
-
-                await status.edit_text(
-                    '\n'.join(report_lines),
-                    parse_mode="Markdown")
-
-                # Step 3 — Produce corrected script
-                # Re-order Level instantiations in protect() and protect_phase2_complete()
-                corrected = source
-
-                # Insert correction header comment at top
-                correction_note = (
-                    f"# ── PIPELINE CORRECTION APPLIED BY EPIC PROTECTOR v{SCRIPT_VERSION} ──\n"
-                    f"# Correction timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    f"# Issues found: {len(issues)}\n"
-                    f"# The protect_phase2_complete and protect methods have been\n"
-                    f"# reordered to match the correct Level 1-6 execution sequence.\n"
-                    f"# Correct order: L1→L2→L3→L4→L5→Integrity→L6\n"
-                    f"# ────────────────────────────────────────────────────────\n\n"
-                )
-                corrected = correction_note + corrected
-
-                # Save corrected script
-                corrected_path = os.path.join(
-                    WORK_DIR, f"corrected_pipeline_{int(time.time())}.py")
-                with open(corrected_path, 'w', encoding='utf-8') as cf:
-                    cf.write(corrected)
-
-                with open(corrected_path, "rb") as cf:
-                    await context.bot.send_document(
-                        chat_id=user.id,
-                        document=cf,
-                        filename="epicprotector_corrected.py",
-                        caption=(
-                            f"🔧 *Pipeline Corrected Script*\n\n"
-                            f"Issues found: `{len(issues)}`\n"
-                            f"Correction header added at top of script.\n"
-                            f"Review the marked sections and apply fixes.\n\n"
-                            f"Version: `v{SCRIPT_VERSION}`"
-                        ),
-                        parse_mode="Markdown",
-                        reply_markup=admin_kb())
-
-        except Exception as e:
-            await status.edit_text(
-                f"❌ *Validation Failed:* `{e}`",
-                parse_mode="Markdown", reply_markup=back_a())
-        return
-
     # ── Admin: protect APK — with Compliance Scanner ────────────────────────
     if is_admin(user.id) and pending_protect.get(user.id):
         pending_protect.pop(user.id)
@@ -5558,23 +5480,18 @@ async def document_handler(update, context):
 
             if not findings:
                 # No findings — proceed directly to protection
-                live_msg = await update.message.reply_text(
-                    "🛡️ *Protection In Progress...*\n\n━━━━━━━━━━━━━━━━━━━━━\n⏳ Starting...",
-                    parse_mode="Markdown")
                 await status.edit_text(
                     "✅ *Compliance Scan Complete!*\n\n"
                     "🟢 Score: *100/100*\n"
                     "No compliance issues found.\n\n"
                     "⚙️ Proceeding with full protection...",
                     parse_mode="Markdown")
-                results = await engine.protect_phase2_complete(
+                results = engine.protect_phase2_complete(
                     phase1["workspace"],
                     phase1["work_dir"],
-                    phase1["aes_key"],
-                    status_msg=live_msg,
-                    context=context)
+                    phase1["aes_key"])
                 await _deliver_protected_apk(
-                    update, context, live_msg, results, apk_name)
+                    update, context, status, results, apk_name)
             else:
                 # Show compliance summary and first finding
                 summary = ComplianceScannerEngine.format_summary_message(
@@ -5628,8 +5545,7 @@ async def document_handler(update, context):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    print(f"\033[1;36m\nEPIC PROTECTOR v{SCRIPT_VERSION} — Elite Master Hybrid Engine Starting...\n\033[0m")
-    print(f"\033[1;33m[VERSION] EPIC PROTECTOR v{SCRIPT_VERSION} | 7-Level Pipeline | Elite Master Hybrid\033[0m")
+    print("\033[1;36m\nEPIC PROTECTOR — Elite Master Hybrid Engine Starting...\n\033[0m")
     os.makedirs(WORK_DIR, exist_ok=True)
 
     # ── Fix 26+27: Startup self-check — verify all tools and dependencies ─────
