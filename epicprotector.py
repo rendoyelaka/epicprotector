@@ -97,6 +97,9 @@ GH_BRANCH   = "main"                                          # Target branch
 BASE_CONFIG  = "config.json"                                  # Persistent config file in repo
 BASE_APK_DIR = os.path.join(WORK_DIR, "base_apk")            # Local base APK storage
 
+SCORES_CONFIG    = "scores.json"                              # Score history — committed to GitHub
+MAX_SCORE_HISTORY = 10                                        # Keep last 10 jobs only
+
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -5376,6 +5379,129 @@ class MasterProtectionEngine:
         return results
 
 
+
+# ── SCORE TRACKER ENGINE ─────────────────────────────────────────────────────
+class ScoreTrackerEngine:
+    """
+    Tracks protection job scores across restarts.
+    Stores last 10 jobs in scores.json — committed to GitHub via GH_PAT.
+    Each record: date/time, APK name, steps run, score/100, pass/fail.
+    """
+
+    @staticmethod
+    def load_scores() -> list:
+        """Load score history from local scores.json."""
+        local_path = os.path.join(os.getcwd(), SCORES_CONFIG)
+        try:
+            if os.path.exists(local_path):
+                with open(local_path, "r") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, list) else []
+        except Exception:
+            pass
+        return []
+
+    @staticmethod
+    def save_scores(scores: list) -> tuple:
+        """Save score history locally and commit to GitHub."""
+        local_path = os.path.join(os.getcwd(), SCORES_CONFIG)
+        try:
+            with open(local_path, "w") as f:
+                json.dump(scores, f, indent=2)
+        except Exception as e:
+            return False, f"Local save failed: {e}"
+
+        if not GH_PAT:
+            return True, "Saved locally (GH_PAT not set — not committed)"
+
+        import urllib.request, base64
+        api_url = f"https://api.github.com/repos/{GH_REPO}/contents/{SCORES_CONFIG}"
+        headers = {
+            "Authorization": f"token {GH_PAT}",
+            "Content-Type":  "application/json",
+            "Accept":        "application/vnd.github.v3+json",
+            "User-Agent":    "EpicProtector-Bot",
+        }
+        current_sha = None
+        try:
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req) as resp:
+                current_sha = json.loads(resp.read()).get("sha")
+        except Exception:
+            pass
+
+        content_b64 = base64.b64encode(
+            json.dumps(scores, indent=2).encode("utf-8")
+        ).decode("utf-8")
+        payload = {"message": "EpicProtector: Update score history",
+                   "content": content_b64, "branch": GH_BRANCH}
+        if current_sha:
+            payload["sha"] = current_sha
+        try:
+            req = urllib.request.Request(
+                api_url, data=json.dumps(payload).encode("utf-8"),
+                headers=headers, method="PUT")
+            with urllib.request.urlopen(req) as resp:
+                resp.read()
+            return True, "Score committed to GitHub"
+        except Exception as e:
+            return False, f"GitHub commit failed: {e}"
+
+    @staticmethod
+    def record(apk_name: str, steps_run: list, score: int, passed: bool):
+        """Add a new job record and keep only last MAX_SCORE_HISTORY entries."""
+        scores = ScoreTrackerEngine.load_scores()
+        entry  = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "apk_name":  apk_name,
+            "steps_run": len(steps_run),
+            "score":     score,
+            "passed":    passed,
+        }
+        scores.insert(0, entry)
+        scores = scores[:MAX_SCORE_HISTORY]
+        ScoreTrackerEngine.save_scores(scores)
+
+    @staticmethod
+    def format_tracker_message() -> str:
+        """Format score tracker display for Telegram."""
+        scores = ScoreTrackerEngine.load_scores()
+        if not scores:
+            return (
+                "📊 *Protection Score Tracker*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "No jobs recorded yet.\n"
+                "Run a protection job to see scores here.\n"
+                "━━━━━━━━━━━━━━━━━━━━━"
+            )
+
+        lines = ["📊 *Protection Score Tracker*\n",
+                 "━━━━━━━━━━━━━━━━━━━━━",
+                 f"*Last {len(scores)} job(s):*\n"]
+
+        for i, s in enumerate(scores, 1):
+            icon    = "✅" if s.get("passed") else "❌"
+            score   = s.get("score", 0)
+            name    = s.get("apk_name", "unknown.apk")
+            ts      = s.get("timestamp", "—")
+            steps   = s.get("steps_run", 0)
+            grade   = ("🏆 ELITE" if score >= 95 else
+                       "🥇 Advanced" if score >= 85 else
+                       "🥈 Professional" if score >= 70 else
+                       "🥉 Standard" if score >= 55 else "⚠️ Basic")
+            lines.append(f"{i}. `{ts}` — `{name}`")
+            lines.append(f"   {icon} Score: *{score}/100* {grade} — {steps} steps")
+
+        lines.append("\n━━━━━━━━━━━━━━━━━━━━━")
+        if len(scores) >= 2:
+            avg   = round(sum(s.get("score",0) for s in scores) / len(scores))
+            best  = max(s.get("score",0) for s in scores)
+            lines.append(f"📈 Average Score: *{avg}/100*")
+            lines.append(f"🏆 Best Score:    *{best}/100*")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        return "\n".join(lines)
+
+
 # ── KEEP-ALIVE SERVER ─────────────────────────────────────────────────────────
 epic_server = Flask(__name__)
 
@@ -5414,13 +5540,15 @@ manual_undo_backup  = {}   # backup dir for undo last job
 manual_job_start    = {}   # job start timestamp
 pending_detection   = {}   # tracks admin detection scan mode
 
-# ── ADMIN KEYBOARD — CLEAN 2-BUTTON MENU ─────────────────────────────────────
+# ── ADMIN KEYBOARD ───────────────────────────────────────────────────────────
 def admin_kb():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ Quick Protect",           callback_data="admin_quick_protect")],
         [InlineKeyboardButton("🛡️ Protect APK",            callback_data="admin_protect")],
         [InlineKeyboardButton("🎛️ Manual Control Panel",   callback_data="admin_manual")],
         [InlineKeyboardButton("🔬 APK Detection Analysis",  callback_data="admin_detection_scan")],
         [InlineKeyboardButton("📦 Base APK",                callback_data="admin_base_apk")],
+        [InlineKeyboardButton("📊 Score Tracker",           callback_data="admin_score_tracker")],
     ])
 
 
@@ -5779,41 +5907,237 @@ async def button_handler(update, context):
             parse_mode="Markdown", reply_markup=admin_kb())
         return
 
-    # ── PROTECT APK ───────────────────────────────────────────────────────────
+    # ── QUICK PROTECT — one tap, full 22-step, auto Base APK ────────────────
+    elif data == "admin_quick_protect":
+        if not is_admin(user.id): return
+        config  = _get_base_apk_config()
+        file_id = config.get("base_apk_file_id")
+        if not file_id:
+            await query.edit_message_text(
+                "⚡ *Quick Protect*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "❌ No Base APK stored yet.\n\n"
+                "Go to 📦 Base APK → Upload Base APK first.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+        status_msg = await query.edit_message_text(
+            "⚡ *Quick Protect — Starting...*\n\n"
+            "📥 Loading Base APK...\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Full 22-step protection — no selections needed.",
+            parse_mode="Markdown")
+        try:
+            apk_path = BaseApkStorageEngine.get_local_path(config)
+            if not apk_path:
+                apk_path = await BaseApkStorageEngine.download_base_apk(context.bot, config)
+            if not apk_path:
+                await status_msg.edit_text(
+                    "❌ *Failed to load Base APK.*\n\nCheck Base APK storage.",
+                    parse_mode="Markdown", reply_markup=back_a())
+                return
+            apk_name = config.get("base_apk_filename", "base.apk")
+            await status_msg.edit_text(
+                "⚡ *Quick Protect — Running...*\n\n"
+                f"📦 `{apk_name}`\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "⏳ Full 22-step protection pipeline running...\n"
+                "Please wait — this may take 3-5 minutes.",
+                parse_mode="Markdown")
+            engine  = MasterProtectionEngine()
+            results = engine.protect(apk_path)
+            if results.get("SUCCESS"):
+                score_val = results.get("PROTECTION_SCORE", 0)
+                ScoreTrackerEngine.record(
+                    apk_name=apk_name,
+                    steps_run=list(ManualControlEngine.PIPELINE_ORDER),
+                    score=score_val,
+                    passed=True)
+                final_apk = results.get("OUTPUT_APK")
+                await status_msg.edit_text(
+                    "⚡ *Quick Protect Complete!*\n\n"
+                    f"📦 `{apk_name}`\n"
+                    f"📊 Score: *{score_val}/100*\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
+                    "✅ Full protection applied\n"
+                    "✅ Signed with fresh unique identity\n"
+                    "✅ Keystore securely destroyed\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
+                    "📤 Sending protected APK...",
+                    parse_mode="Markdown")
+                if final_apk and os.path.exists(final_apk):
+                    with open(final_apk, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=user.id,
+                            document=f,
+                            filename=f"EPIC_PROTECTED_{apk_name}",
+                            caption="⚡ Quick Protect complete — EPIC PROTECTOR Elite")
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text="✅ *Quick Protect delivered.*",
+                    parse_mode="Markdown",
+                    reply_markup=admin_kb())
+            else:
+                err = results.get("ERROR", "Unknown error")
+                ScoreTrackerEngine.record(apk_name=apk_name, steps_run=[], score=0, passed=False)
+                await status_msg.edit_text(
+                    f"❌ *Quick Protect Failed:*\n\n`{err}`",
+                    parse_mode="Markdown", reply_markup=admin_kb())
+        except Exception as e:
+            await status_msg.edit_text(
+                f"❌ *Quick Protect Error:* `{e}`",
+                parse_mode="Markdown", reply_markup=admin_kb())
+        return
+
+    # ── PROTECT APK — auto-loads Base APK ────────────────────────────────────
     elif data == "admin_protect":
         if not is_admin(user.id): return
-        pending_protect[user.id] = "awaiting_apk"
-        await query.edit_message_text(
+        config  = _get_base_apk_config()
+        file_id = config.get("base_apk_file_id")
+        if not file_id:
+            await query.edit_message_text(
+                "🛡️ *Protect APK*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "❌ No Base APK stored yet.\n\n"
+                "Go to 📦 Base APK → Upload Base APK first.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+        apk_name   = config.get("base_apk_filename", "base.apk")
+        status_msg = await query.edit_message_text(
             "🛡️ *Protect APK — Elite Master Hybrid*\n\n"
+            f"📦 Base APK: `{apk_name}`\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔍 Compliance Scan runs automatically before protection.\n"
-            "You will review findings before protection proceeds.\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "Pipeline:\n"
-            "1 — Strip Signature\n"
-            "2 — Decode Workspace\n"
-            "3 — 🔍 Compliance Scan + Review\n"
-            "4 — Manifest Hardening\n"
-            "5 — Security Guard Integration\n"
-            "6 — Tamper Detection\n"
-            "7 — String Obfuscation\n"
-            "8 — Metadata Stripping\n"
-            "9 — Rebuild APK\n"
-            "10 — Sign & zipalign\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"⚠️ Max APK size: {MAX_APK_MB}MB\n\n📎 Send APK now:",
-            parse_mode="Markdown", reply_markup=back_a())
+            "📥 Loading Base APK...\n"
+            "🔍 Compliance Scan will run automatically.",
+            parse_mode="Markdown")
+        try:
+            apk_path = BaseApkStorageEngine.get_local_path(config)
+            if not apk_path:
+                await status_msg.edit_text(
+                    "🛡️ *Protect APK*\n\n"
+                    f"📦 `{apk_name}`\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
+                    "📥 Downloading Base APK...\n⏳ Please wait...",
+                    parse_mode="Markdown")
+                apk_path = await BaseApkStorageEngine.download_base_apk(context.bot, config)
+            if not apk_path:
+                await status_msg.edit_text(
+                    "❌ *Failed to load Base APK.*\n\nCheck Base APK storage.",
+                    parse_mode="Markdown", reply_markup=back_a())
+                return
+            pending_protect[user.id] = "processing"
+            await status_msg.edit_text(
+                "🔍 *Running Compliance Scan...*\n\n"
+                f"📦 `{apk_name}`\n"
+                "⏳ Scanning APK — please wait...",
+                parse_mode="Markdown")
+            engine = MasterProtectionEngine()
+            phase1 = engine.protect_phase1_decode(apk_path)
+            workspace = phase1["workspace"]
+            work_dir2 = phase1["work_dir"]
+            findings  = phase1["findings"]
+            aes_key   = phase1["aes_key"]
+            compliance_workspace[user.id] = workspace
+            compliance_job_dir[user.id]   = work_dir2
+            compliance_apk_path[user.id]  = apk_path
+            compliance_session[user.id]   = {
+                "findings":   findings,
+                "aes_key":    aes_key,
+                "started_at": time.time(),
+            }
+            total   = len(findings)
+            summary = ComplianceScannerEngine.format_summary_message(
+                findings, apk_name)
+            if total == 0:
+                await status_msg.edit_text(
+                    "🔍 *Compliance Scan Complete*\n\n"
+                    "✅ No compliance issues found.\n\n"
+                    "Ready to proceed with full protection.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Proceed to Protection", callback_data="cs_proceed")],
+                        [InlineKeyboardButton("⬅️ Back", callback_data="back_admin")],
+                    ]))
+            else:
+                await status_msg.edit_text(
+                    f"🔍 *Compliance Scan Complete*\n\n"
+                    f"Found {total} items to review:\n\n"
+                    f"{summary}\n\nChoose how to handle:",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔧 Auto-fix All",       callback_data="cs_autofix")],
+                        [InlineKeyboardButton("🔍 Review One by One",  callback_data="cs_review_0")],
+                        [InlineKeyboardButton("⏭️ Skip All & Proceed", callback_data="cs_skipall")],
+                        [InlineKeyboardButton("➕ Add Custom Word",    callback_data="cs_addword")],
+                        [InlineKeyboardButton("⬅️ Back",              callback_data="back_admin")],
+                    ]))
+        except Exception as e:
+            pending_protect.pop(user.id, None)
+            await status_msg.edit_text(
+                f"❌ *Protection Failed:* `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+        return
 
-    # ── MANUAL CONTROL PANEL — ENTRY ─────────────────────────────────────────
+    # ── MANUAL CONTROL PANEL — auto-loads Base APK, full 22-step selection ──
     elif data == "admin_manual":
         if not is_admin(user.id): return
-        pending_manual[user.id] = "awaiting_apk"
-        await query.edit_message_text(
+        config  = _get_base_apk_config()
+        file_id = config.get("base_apk_file_id")
+        if not file_id:
+            await query.edit_message_text(
+                "🎛️ *Manual Control Panel*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "❌ No Base APK stored yet.\n\n"
+                "Go to 📦 Base APK → Upload Base APK first.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+        apk_name   = config.get("base_apk_filename", "base.apk")
+        status_msg = await query.edit_message_text(
             "🎛️ *Manual Control Panel*\n\n"
+            f"📦 Base APK: `{apk_name}`\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            "22-Step Selective Operation System\n\n"
-            "📎 Send your APK file to begin:",
-            parse_mode="Markdown", reply_markup=back_a())
+            "📥 Loading Base APK...",
+            parse_mode="Markdown")
+        try:
+            apk_path = BaseApkStorageEngine.get_local_path(config)
+            if not apk_path:
+                await status_msg.edit_text(
+                    "🎛️ *Manual Control Panel*\n\n"
+                    f"📦 `{apk_name}`\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
+                    "📥 Downloading Base APK...\n⏳ Please wait...",
+                    parse_mode="Markdown")
+                apk_path = await BaseApkStorageEngine.download_base_apk(context.bot, config)
+            if not apk_path:
+                await status_msg.edit_text(
+                    "❌ *Failed to load Base APK.*\n\nCheck Base APK storage.",
+                    parse_mode="Markdown", reply_markup=back_a())
+                return
+            job_id   = f"manual_{int(time.time())}"
+            work_dir = os.path.join(WORK_DIR, job_id)
+            os.makedirs(work_dir, exist_ok=True)
+            manual_apk_path[user.id]  = apk_path
+            manual_work_dir[user.id]  = work_dir
+            manual_selected[user.id]  = set()
+            manual_aes_key[user.id]   = AESKeyManager.generate()
+            manual_job_start[user.id] = time.time()
+            pending_manual[user.id]   = "apk_ready"
+            engine = ManualControlEngine(CryptoEngine(), work_dir)
+            await status_msg.edit_text(
+                f"🎛️ *Manual Control Panel*\n\n"
+                f"📦 `{apk_name}` loaded\n\n"
+                f"Select a preset or choose custom:\n\n"
+                f"⚡ *Quick Sign Only* — Strip, Decode, Keystore, Fingerprint, Sign\n"
+                f"🔒 *Full Protection* — All 22 steps\n"
+                f"🎯 *Custom* — You choose manually\n"
+                f"━━━━━━━━━━━━━━━━━━━━━",
+                parse_mode="Markdown",
+                reply_markup=engine.build_preset_keyboard())
+        except Exception as e:
+            pending_manual.pop(user.id, None)
+            await status_msg.edit_text(
+                f"❌ *Failed to load Base APK:* `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+        return
 
     # ── MANUAL — PRESET SELECTION ─────────────────────────────────────────────
     elif data == "mcp_show_presets":
@@ -6086,21 +6410,84 @@ async def button_handler(update, context):
     # ── DETECTION SCAN ───────────────────────────────────────────────────────
     elif data == "admin_detection_scan":
         if not is_admin(user.id): return
-        pending_detection[user.id] = "awaiting_apk"
-        await query.edit_message_text(
+        config  = _get_base_apk_config()
+        file_id = config.get("base_apk_file_id")
+        if not file_id:
+            await query.edit_message_text(
+                "🔬 *APK Detection Analysis*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "❌ No Base APK stored yet.\n\n"
+                "Go to 📦 Base APK → Upload Base APK first.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+        apk_name   = config.get("base_apk_filename", "base.apk")
+        status_msg = await query.edit_message_text(
             "🔬 *APK Detection Analysis*\n\n"
+            f"📦 Base APK: `{apk_name}`\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            "Sends a full detection risk report:\n\n"
-            "✅ smali/ — risk per file\n"
-            "✅ res/drawable/ & mipmap/ — safe vs unsafe\n"
-            "✅ res/values/ — string table risk\n"
-            "✅ assets/ — content risk scan\n"
-            "✅ lib/ — .so file visibility\n"
-            "✅ AndroidManifest.xml — permissions\n"
-            "✅ Overall risk score before & after\n\n"
-            f"⚠️ Max APK size: {MAX_APK_MB}MB\n\n"
-            "📎 Send your APK now:",
-            parse_mode="Markdown", reply_markup=back_a())
+            "📥 Loading Base APK...",
+            parse_mode="Markdown")
+        try:
+            apk_path = BaseApkStorageEngine.get_local_path(config)
+            if not apk_path:
+                await status_msg.edit_text(
+                    "🔬 *APK Detection Analysis*\n\n"
+                    f"📦 `{apk_name}`\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
+                    "📥 Downloading Base APK...\n⏳ Please wait...",
+                    parse_mode="Markdown")
+                apk_path = await BaseApkStorageEngine.download_base_apk(context.bot, config)
+            if not apk_path:
+                await status_msg.edit_text(
+                    "❌ *Failed to load Base APK.*\n\nCheck Base APK storage.",
+                    parse_mode="Markdown", reply_markup=back_a())
+                return
+            pending_detection.pop(user.id, None)
+            await status_msg.edit_text(
+                "🔬 *Decoding APK...*\n\n"
+                f"📦 `{apk_name}`\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "⏳ Extracting workspace...",
+                parse_mode="Markdown")
+            job_id    = f"detect_{int(time.time())}"
+            work_dir  = os.path.join(WORK_DIR, job_id)
+            os.makedirs(work_dir, exist_ok=True)
+            tools     = ToolInstaller()
+            tools.install_all()
+            l1        = Level1_WorkspaceBuilder(tools, work_dir)
+            workspace = l1.build_workspace(apk_path)
+            await status_msg.edit_text(
+                "🔬 *Analysing...*\n\n"
+                f"📦 `{apk_name}`\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "⏳ Running full detection analysis...",
+                parse_mode="Markdown")
+            analyser = APKDetectionAnalyser(work_dir)
+            report   = analyser.analyse(workspace, apk_path)
+            messages = analyser.format_telegram_report(report)
+            await status_msg.edit_text(messages[0], parse_mode="Markdown")
+            for msg in messages[1:]:
+                await context.bot.send_message(
+                    chat_id=user.id, text=msg, parse_mode="Markdown")
+            await context.bot.send_message(
+                chat_id=user.id, text="🔬 *Detection Analysis complete.*",
+                parse_mode="Markdown", reply_markup=admin_kb())
+        except Exception as e:
+            await status_msg.edit_text(
+                f"❌ *Detection Analysis Failed:* `{e}`",
+                parse_mode="Markdown", reply_markup=admin_kb())
+        return
+
+    # ── SCORE TRACKER ─────────────────────────────────────────────────────────
+    elif data == "admin_score_tracker":
+        if not is_admin(user.id): return
+        msg = ScoreTrackerEngine.format_tracker_message()
+        await query.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Refresh", callback_data="admin_score_tracker")],
+                [InlineKeyboardButton("🔙 Back",    callback_data="back_admin")],
+            ]))
 
     # ── BASE APK — MAIN MENU ─────────────────────────────────────────────────
     elif data == "admin_base_apk":
@@ -6627,95 +7014,7 @@ async def document_handler(update, context):
                 parse_mode="HTML", reply_markup=base_apk_kb())
         return
 
-    # ── Admin: Protect APK upload ─────────────────────────────────────────────
-    if is_admin(user.id) and pending_protect.get(user.id) == "awaiting_apk":
-        if not doc.file_name.endswith(".apk"):
-            await update.message.reply_text(
-                "❌ Please send a valid .apk file.", reply_markup=back_a())
-            return
-
-        size_mb = doc.file_size / (1024 * 1024)
-        if size_mb > MAX_APK_MB:
-            await update.message.reply_text(
-                f"❌ APK too large ({size_mb:.1f}MB). Max: {MAX_APK_MB}MB",
-                reply_markup=back_a())
-            return
-
-        apk_name   = doc.file_name
-        status_msg = await update.message.reply_text(
-            "📥 *Receiving APK...*\n\n⏳ Please wait...",
-            parse_mode="Markdown")
-
-        try:
-            job_id   = f"protect_{int(time.time())}"
-            work_dir = os.path.join(WORK_DIR, job_id)
-            os.makedirs(work_dir, exist_ok=True)
-
-            tg_file = await context.bot.get_file(doc.file_id)
-            apk_in  = os.path.join(work_dir, apk_name)
-            await tg_file.download_to_drive(apk_in)
-
-            pending_protect[user.id] = "processing"
-
-            await status_msg.edit_text(
-                "🔍 *Running Compliance Scan...*\n\n⏳ Scanning APK — please wait...",
-                parse_mode="Markdown")
-
-            engine  = MasterProtectionEngine()
-            phase1  = engine.protect_phase1_decode(apk_in)
-
-            workspace = phase1["workspace"]
-            work_dir2 = phase1["work_dir"]
-            findings  = phase1["findings"]
-            aes_key   = phase1["aes_key"]
-
-            compliance_workspace[user.id]  = workspace
-            compliance_job_dir[user.id]    = work_dir2
-            compliance_apk_path[user.id]   = apk_in
-            compliance_session[user.id]    = {
-                "findings":   findings,
-                "aes_key":    aes_key,
-                "started_at": time.time(),
-            }
-
-            # findings is a flat list of finding dicts returned by scan_workspace()
-            # Each element is one finding — total count is simply len(findings)
-            total    = len(findings)
-            scanner  = ComplianceScannerEngine()
-            summary  = ComplianceScannerEngine.format_summary_message(findings, os.path.basename(compliance_apk_path.get(user.id, "unknown.apk")))
-
-            if total == 0:
-                await status_msg.edit_text(
-                    "🔍 *Compliance Scan Complete*\n\n"
-                    "✅ No compliance issues found.\n\n"
-                    "Ready to proceed with full protection.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("✅ Proceed to Protection", callback_data="cs_proceed")],
-                        [InlineKeyboardButton("⬅️ Back", callback_data="back_admin")],
-                    ]))
-            else:
-                await status_msg.edit_text(
-                    f"🔍 *Compliance Scan Complete*\n\n"
-                    f"Found {total} items to review:\n\n"
-                    f"{summary}\n\n"
-                    f"Choose how to handle:",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔧 Auto-fix All",        callback_data="cs_autofix")],
-                        [InlineKeyboardButton("🔍 Review One by One",   callback_data="cs_review_0")],
-                        [InlineKeyboardButton("⏭️ Skip All & Proceed",  callback_data="cs_skipall")],
-                        [InlineKeyboardButton("➕ Add Custom Word",     callback_data="cs_addword")],
-                        [InlineKeyboardButton("⬅️ Back",               callback_data="back_admin")],
-                    ]))
-
-        except Exception as e:
-            pending_protect.pop(user.id, None)
-            await status_msg.edit_text(
-                f"❌ *Protection Failed:* `{e}`",
-                parse_mode="Markdown", reply_markup=back_a())
-            await _report_error_to_admin(context, str(e), apk_name)
-        return
+    # Protect APK now auto-loads from Base APK — no document upload needed
 
     if not is_admin(user.id):
         await update.message.reply_text(
