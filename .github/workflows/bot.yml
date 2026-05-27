@@ -61,6 +61,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           echo "🔍 Validating required secrets..."
           if [ -z "$BOT_TOKEN" ]; then
@@ -69,6 +70,10 @@ jobs:
           fi
           if [ -z "$ADMIN_ID" ]; then
             echo "❌ ERROR: ADMIN_ID secret is missing."
+            exit 1
+          fi
+          if [ -z "$GH_PAT" ]; then
+            echo "❌ ERROR: GH_PAT secret is missing."
             exit 1
           fi
           echo "✅ All required secrets are present."
@@ -199,6 +204,7 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           echo "🚀 Starting EPIC PROTECTOR Elite Bot (22-Step Pipeline)..."
           echo "⏰ Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
