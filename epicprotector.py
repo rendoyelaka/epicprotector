@@ -3274,9 +3274,453 @@ class ManualControlEngine:
         "com/bumptech/", "okhttp3/", "retrofit2/",
     )
 
+    # ── NAME PATTERN CONSTANTS — used by scan and obfuscation ───────────────
+    HIGH_VALUE_NAME_PATTERNS = (
+        "mainactivity", "loginactivity", "splashactivity",
+        "manager", "controller", "handler", "dispatcher",
+        "api", "network", "http", "rest", "retrofit", "client",
+        "auth", "token", "key", "secret", "credential", "password",
+        "database", "db", "dao", "repository", "room",
+        "payment", "billing", "license", "register",
+    )
+
+    MEDIUM_VALUE_NAME_PATTERNS = (
+        "utils", "helper", "common", "base", "core",
+        "service", "receiver", "provider", "fragment",
+        "adapter", "viewmodel", "presenter",
+    )
+
+    LOW_VALUE_NAME_PATTERNS = (
+        "r$", "br$", "buildconfig", "databinding",
+        "generated", "auto_", "_generated",
+    )
+
+    HIGH_VALUE_CONTENT_SIGNATURES = (
+        b"https://", b"http://",
+        b"password", b"passwd", b"secret",
+        b"Bearer", b"Authorization",
+        b"AES", b"RSA", b"SHA-256",
+        b"SELECT ", b"INSERT ", b"UPDATE ", b"DELETE ",
+        b"api_key", b"apikey", b"private_key",
+    )
+
+    MEDIUM_VALUE_CONTENT_SIGNATURES = (
+        b"const-string",
+        b"SharedPreferences",
+        b"getSystemService",
+    )
+
     def __init__(self, crypto, work_dir):
         self.crypto   = crypto
         self.work_dir = work_dir
+
+    # ── INTERNAL HELPERS ──────────────────────────────────────────────────────
+
+    def _rname(self, n=8) -> str:
+        """Generate a random alphanumeric identifier of length n."""
+        return ''.join(random.choices(string.ascii_lowercase, k=n))
+
+    def _is_third_party(self, rel_path: str) -> bool:
+        """Return True if file belongs to a third party library."""
+        p = rel_path.replace("\\", "/").lower()
+        return any(p.startswith(prefix.lower()) for prefix in self.THIRD_PARTY_PREFIXES)
+
+    def _score_by_name(self, filename: str) -> str:
+        """Return HIGH / MEDIUM / LOW based on filename pattern."""
+        name = filename.lower().replace(".smali", "").replace(".java", "")
+        for pat in self.LOW_VALUE_NAME_PATTERNS:
+            if pat in name:
+                return "LOW"
+        for pat in self.HIGH_VALUE_NAME_PATTERNS:
+            if pat in name:
+                return "HIGH"
+        for pat in self.MEDIUM_VALUE_NAME_PATTERNS:
+            if pat in name:
+                return "MEDIUM"
+        return "LOW"
+
+    def _score_by_content(self, filepath: str) -> str:
+        """Read up to 8KB of file content and scan for sensitive signatures."""
+        try:
+            with open(filepath, 'rb') as f:
+                chunk = f.read(8192)
+            for sig in self.HIGH_VALUE_CONTENT_SIGNATURES:
+                if sig.lower() in chunk.lower():
+                    return "HIGH"
+            for sig in self.MEDIUM_VALUE_CONTENT_SIGNATURES:
+                if sig in chunk:
+                    return "MEDIUM"
+        except Exception:
+            pass
+        return "LOW"
+
+    def _score_asset(self, filepath: str) -> str:
+        """Score assets/ and lib/ files by extension and name."""
+        name = os.path.basename(filepath).lower()
+        ext  = os.path.splitext(name)[1]
+        if ext in ('.so',):
+            return "HIGH"
+        if ext in ('.json', '.db', '.sqlite', '.key',
+                   '.conf', '.config', '.pem', '.p12', '.keystore'):
+            return "HIGH"
+        if ext in ('.xml', '.properties', '.txt'):
+            return "MEDIUM"
+        return "LOW"
+
+    # ── SCAN FUNCTIONS ────────────────────────────────────────────────────────
+
+    def run_fast_scan(self, workspace_dir, target) -> dict:
+        """
+        Layer 1 — Fast name-based scan.
+        Scans file and folder names only — no file reads.
+        Returns counts and top file lists per value level.
+        Excludes third party libraries automatically.
+        """
+        target_path = os.path.join(workspace_dir, target)
+        if not os.path.exists(target_path):
+            return {"error": f"Target folder not found: {target}"}
+
+        high   = []
+        medium = []
+        low    = []
+
+        for fp in Path(target_path).rglob("*"):
+            if not fp.is_file():
+                continue
+            try:
+                rel = str(fp.relative_to(target_path))
+            except Exception:
+                continue
+            if self._is_third_party(rel):
+                continue
+            name = fp.name
+            if target.startswith("smali") or target.startswith("com/"):
+                score = self._score_by_name(name)
+            elif target.startswith("assets") or target.startswith("lib"):
+                score = self._score_asset(str(fp))
+            elif target.startswith("res"):
+                score = "MEDIUM" if "raw" in rel or "values" in rel else "LOW"
+            elif target.startswith("META-INF"):
+                score = "MEDIUM"
+            else:
+                score = self._score_by_name(name)
+
+            if score == "HIGH":
+                high.append(rel)
+            elif score == "MEDIUM":
+                medium.append(rel)
+            else:
+                low.append(rel)
+
+        return {"high": high, "medium": medium, "low": low, "scan_type": "fast"}
+
+    def run_deep_scan(self, workspace_dir, target) -> dict:
+        """
+        Layer 1 + Layer 2 — Deep name + content scan.
+        Reads up to 8KB of each file to detect sensitive signatures.
+        Excludes third party libraries automatically.
+        """
+        target_path = os.path.join(workspace_dir, target)
+        if not os.path.exists(target_path):
+            return {"error": f"Target folder not found: {target}"}
+
+        high   = []
+        medium = []
+        low    = []
+
+        for fp in Path(target_path).rglob("*"):
+            if not fp.is_file():
+                continue
+            try:
+                rel = str(fp.relative_to(target_path))
+            except Exception:
+                continue
+            if self._is_third_party(rel):
+                continue
+            name = fp.name
+            if target.startswith("assets") or target.startswith("lib"):
+                name_score = self._score_asset(str(fp))
+            else:
+                name_score = self._score_by_name(name)
+            content_score = self._score_by_content(str(fp))
+            score_rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
+            best = max(score_rank[name_score], score_rank[content_score])
+            final_score = "HIGH" if best == 3 else "MEDIUM" if best == 2 else "LOW"
+            if final_score == "HIGH":
+                high.append(rel)
+            elif final_score == "MEDIUM":
+                medium.append(rel)
+            else:
+                low.append(rel)
+
+        return {"high": high, "medium": medium, "low": low, "scan_type": "deep"}
+
+    def build_advisory_report(self, scan_result: dict, target: str) -> str:
+        """Build formatted advisory report text from scan results."""
+        if "error" in scan_result:
+            return f"❌ Scan failed: {scan_result['error']}"
+
+        high   = scan_result.get("high",   [])
+        medium = scan_result.get("medium", [])
+        low    = scan_result.get("low",    [])
+        stype  = scan_result.get("scan_type", "fast")
+        scan_label = "🔍 Deep Scan" if stype == "deep" else "⚡ Fast Scan"
+
+        lines = [
+            f"🧠 *Intelligence Report — {scan_label}*\n",
+            f"📂 Target: `{target}`",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            f"🔴 *High Value: {len(high)} files* → Obfuscate recommended",
+            f"🟡 *Medium Value: {len(medium)} files* → Encrypt recommended",
+            f"🟢 *Low Value: {len(low)} files* → Safe to skip",
+            "━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        if high:
+            lines.append("🔴 *Top High Value Files:*")
+            for f in high[:5]:
+                lines.append(f"  • `{os.path.basename(f)}`")
+            if len(high) > 5:
+                lines.append(f"  _...and {len(high)-5} more_")
+        if medium:
+            lines.append("🟡 *Top Medium Value Files:*")
+            for f in medium[:5]:
+                lines.append(f"  • `{os.path.basename(f)}`")
+            if len(medium) > 5:
+                lines.append(f"  _...and {len(medium)-5} more_")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        return '\n'.join(lines)
+
+    # ── TARGET OPERATION FUNCTIONS ────────────────────────────────────────────
+
+    def obfuscate_target(self, workspace_dir, target) -> dict:
+        """
+        Obfuscate class names, method names and field names
+        inside all smali files found under the target folder.
+        """
+        target_path = os.path.join(workspace_dir, target)
+        if not os.path.exists(target_path):
+            return {"error": f"Target folder not found: {target}"}
+
+        files_processed = 0
+        classes_renamed = 0
+        methods_renamed = 0
+        fields_renamed  = 0
+
+        for sf in Path(target_path).rglob("*.smali"):
+            try:
+                with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+
+                content, cn = re.subn(
+                    r'(\.source ")([^"]+)(")',
+                    lambda m: f'{m.group(1)}{self._rname(8)}.java{m.group(3)}',
+                    content
+                )
+                classes_renamed += cn
+
+                def rename_method(m):
+                    name = m.group(2)
+                    if name in ('<init>', '<clinit>', 'onCreate', 'onStart',
+                                'onResume', 'onPause', 'onStop', 'onDestroy',
+                                'onCreateView', 'onActivityCreated', 'run',
+                                'onClick', 'onTouch', 'onReceive'):
+                        return m.group(0)
+                    return f"{m.group(1)}{self._rname(7)}{m.group(3)}"
+
+                content, mc = re.subn(
+                    r'(\.method\s+(?:[\w\s]*?)\s)(\w+)(\()',
+                    rename_method, content)
+                methods_renamed += mc
+
+                def rename_field(m):
+                    name = m.group(2)
+                    if name.startswith('TAG') or name in ('serialVersionUID',):
+                        return m.group(0)
+                    return f"{m.group(1)}{self._rname(6)}{m.group(3)}"
+
+                content, fc = re.subn(
+                    r'(\.field\s+(?:[\w\s]*?)\s)(\w+)(:)',
+                    rename_field, content)
+                fields_renamed += fc
+
+                with open(sf, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                files_processed += 1
+
+            except Exception as e:
+                logger.warning(f"[ManualControl] Obfuscation skipped {sf.name}: {e}")
+
+        return {
+            "files_processed": files_processed,
+            "classes_renamed":  classes_renamed,
+            "methods_renamed":  methods_renamed,
+            "fields_renamed":   fields_renamed,
+        }
+
+    def encrypt_target(self, workspace_dir, target) -> dict:
+        """
+        XOR-encrypt all files under the target folder using a
+        session key. Only encrypts binary/data files — skips smali and xml.
+        """
+        target_path = os.path.join(workspace_dir, target)
+        if not os.path.exists(target_path):
+            return {"error": f"Target folder not found: {target}"}
+
+        session_key     = os.urandom(32)
+        files_encrypted = 0
+        files_skipped   = 0
+
+        for fp in Path(target_path).rglob("*"):
+            if not fp.is_file():
+                continue
+            if fp.suffix in ('.smali', '.xml'):
+                files_skipped += 1
+                continue
+            try:
+                with open(fp, 'rb') as f:
+                    data = f.read()
+                encrypted = self.crypto.xor_encrypt(data, session_key)
+                with open(fp, 'wb') as f:
+                    f.write(encrypted)
+                files_encrypted += 1
+            except Exception as e:
+                logger.warning(f"[ManualControl] Encryption skipped {fp.name}: {e}")
+                files_skipped += 1
+
+        return {
+            "files_encrypted": files_encrypted,
+            "files_skipped":   files_skipped,
+        }
+
+    def rename_target(self, workspace_dir, target) -> dict:
+        """
+        Rename files inside the target folder to randomized
+        professional names while preserving extensions.
+        Never renames AndroidManifest.xml, classes*.dex,
+        or any XML inside res/ — apktool requires exact names.
+        """
+        target_path = os.path.join(workspace_dir, target)
+        if not os.path.exists(target_path):
+            return {"error": f"Target folder not found: {target}"}
+
+        files_renamed = 0
+        files_skipped = 0
+        is_res_target = (
+            target.startswith("res") or
+            "res/" in target or
+            target == "res"
+        )
+
+        for fp in Path(target_path).rglob("*"):
+            if not fp.is_file():
+                continue
+            if fp.name in ('AndroidManifest.xml', 'classes.dex',
+                           'classes2.dex', 'classes3.dex'):
+                files_skipped += 1
+                continue
+            if is_res_target and fp.suffix == '.xml':
+                files_skipped += 1
+                continue
+            try:
+                rel   = fp.relative_to(target_path)
+                parts = rel.parts
+                if parts and parts[0].startswith('res') and fp.suffix == '.xml':
+                    files_skipped += 1
+                    continue
+            except Exception:
+                pass
+            try:
+                new_name = self._rname(10) + fp.suffix
+                new_path = fp.parent / new_name
+                fp.rename(new_path)
+                files_renamed += 1
+            except Exception as e:
+                logger.warning(f"[ManualControl] Rename skipped {fp.name}: {e}")
+                files_skipped += 1
+
+        return {
+            "files_renamed": files_renamed,
+            "files_skipped": files_skipped,
+        }
+
+    def compress_target(self, workspace_dir, target) -> dict:
+        """
+        Compress all files under the target folder into a zip archive.
+        Returns archive path so the bot can deliver it to admin.
+        """
+        target_path = os.path.join(workspace_dir, target)
+        if not os.path.exists(target_path):
+            return {"error": f"Target folder not found: {target}"}
+
+        archive_name = os.path.join(
+            workspace_dir,
+            f"compressed_{target.replace('/', '_')}_{int(time.time())}.zip"
+        )
+        files_compressed = 0
+
+        try:
+            with zipfile.ZipFile(archive_name, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for fp in Path(target_path).rglob("*"):
+                    if fp.is_file():
+                        arcname = fp.relative_to(target_path)
+                        zf.write(fp, arcname)
+                        files_compressed += 1
+        except Exception as e:
+            return {"error": f"Compression failed: {e}"}
+
+        size_kb = os.path.getsize(archive_name) // 1024
+        return {
+            "files_compressed": files_compressed,
+            "archive_size_kb":  size_kb,
+            "archive_name":     os.path.basename(archive_name),
+            "archive_path":     archive_name,
+        }
+
+    def integrity_verification(self, workspace_dir, target) -> dict:
+        """
+        Run SHA-256 integrity verification on all files
+        inside the target folder and return a summary report.
+        """
+        target_path = os.path.join(workspace_dir, target)
+        if not os.path.exists(target_path):
+            return {"error": f"Target folder not found: {target}"}
+
+        files_verified = 0
+        manifest       = {}
+
+        for fp in Path(target_path).rglob("*"):
+            if not fp.is_file():
+                continue
+            try:
+                s = hashlib.sha256()
+                with open(fp, 'rb') as f:
+                    for chunk in iter(lambda: f.read(8192), b''):
+                        s.update(chunk)
+                rel = str(fp.relative_to(target_path))
+                manifest[rel] = s.hexdigest()
+                files_verified += 1
+            except Exception as e:
+                logger.warning(f"[ManualControl] Verification skipped {fp.name}: {e}")
+
+        report_path = os.path.join(
+            self.work_dir,
+            f"integrity_report_{target.replace('/', '_')}.json"
+        )
+        try:
+            with open(report_path, 'w') as f:
+                json.dump({
+                    "target":      target,
+                    "verified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "total_files": files_verified,
+                    "files":       manifest
+                }, f, indent=2)
+        except Exception as e:
+            logger.warning(f"[ManualControl] Integrity report save failed: {e}")
+
+        return {
+            "files_verified": files_verified,
+            "report_saved":   os.path.basename(report_path),
+        }
 
     def enforce_pipeline_order(self, selected_ops: list) -> list:
         """
@@ -3383,10 +3827,22 @@ class ManualControlEngine:
                 result["status"]          = r["status"]
 
             elif op_key == "obfuscation":
-                splitter = StringSplitterEngine()
-                count    = splitter.apply(workspace)
-                result["strings_split"] = count
-                result["status"]        = f"✅ {count} strings obfuscated"
+                # Run obfuscate_target on smali/ folder — renames classes, methods, fields
+                obf_result = self.obfuscate_target(workspace, "smali/")
+                # Also run StringSplitterEngine — fragments sensitive strings
+                splitter   = StringSplitterEngine()
+                split_count = splitter.apply(workspace)
+                if "error" in obf_result:
+                    result["status"] = f"⚠️ String split: {split_count} — {obf_result['error']}"
+                else:
+                    result["files_processed"]  = obf_result.get("files_processed", 0)
+                    result["methods_renamed"]   = obf_result.get("methods_renamed", 0)
+                    result["strings_split"]     = split_count
+                    result["status"] = (
+                        f"✅ {obf_result.get('files_processed',0)} files obfuscated — "
+                        f"{obf_result.get('methods_renamed',0)} methods renamed — "
+                        f"{split_count} strings split"
+                    )
 
             elif op_key == "security_guard":
                 l3 = Level3_SecurityGuardIntegrator(self.crypto, work_dir)
@@ -3404,10 +3860,22 @@ class ManualControlEngine:
                                    else "⚠️ Hashes computed — guard not found for embedding"
 
             elif op_key == "encryption":
-                l4 = Level4_SecurityCompliance(self.crypto, work_dir)
+                # Run encrypt_target on assets/ and lib/ folders
+                enc_assets = self.encrypt_target(workspace, "assets/")
+                enc_lib    = self.encrypt_target(workspace, "lib/")
+                # Also run Level4 security fields
+                l4     = Level4_SecurityCompliance(self.crypto, work_dir)
                 fields = l4.add_security_fields(workspace)
-                result["security_fields"] = fields
-                result["status"]          = f"✅ {fields} security fields encrypted"
+                total_encrypted = (
+                    enc_assets.get("files_encrypted", 0) +
+                    enc_lib.get("files_encrypted", 0)
+                )
+                result["files_encrypted"]  = total_encrypted
+                result["security_fields"]  = fields
+                result["status"] = (
+                    f"✅ {total_encrypted} files encrypted — "
+                    f"{fields} security fields added"
+                )
 
             elif op_key == "dex_repackaging":
                 repackager = DEXRepackager()
