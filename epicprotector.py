@@ -5386,7 +5386,7 @@ async def button_handler(update, context):
         findings  = session.get("findings", [])
         if idx < len(findings):
             finding = findings[idx]
-            scanner.fix_finding(workspace, finding)
+            scanner.apply_rename(finding)
             session["findings"][idx]["fixed"] = True
             compliance_session[user.id] = session
         next_idx = idx + 1
@@ -5468,7 +5468,7 @@ async def button_handler(update, context):
         fixed     = 0
         for f in findings:
             try:
-                scanner.fix_finding(workspace, f)
+                scanner.apply_rename(f)
                 fixed += 1
             except Exception:
                 pass
@@ -5690,7 +5690,7 @@ async def document_handler(update, context):
 
             total    = sum(len(v) for v in findings.values() if isinstance(v, list))
             scanner  = ComplianceScannerEngine()
-            summary  = scanner.format_findings_summary(findings)
+            summary  = ComplianceScannerEngine.format_summary_message(findings, os.path.basename(compliance_apk_path.get(user.id, "unknown.apk")))
 
             if total == 0:
                 await status_msg.edit_text(
