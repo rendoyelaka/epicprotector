@@ -2751,6 +2751,484 @@ class PreflightValidator:
         return results
 
 
+# ── APK DETECTION ANALYSER ────────────────────────────────────────────────────
+class APKDetectionAnalyser:
+    """
+    Analyses a decoded APK workspace and produces a full detection
+    risk report per folder, file type, and content.
+
+    Reports:
+      - smali/ risk per file with HIGH/MEDIUM/LOW rating
+      - res/drawable/ and res/mipmap/ safe vs unsafe to rename
+      - res/values/ string table risk
+      - assets/ content risk
+      - lib/ .so file visibility
+      - AndroidManifest.xml permissions and triggering words
+      - resources.arsc decoded string table
+      - Overall detection risk score before and after protection estimate
+    """
+
+    # Safe keywords used for rename suggestions
+    SAFE_KEYWORDS = [
+        "shield", "guard", "security", "protection", "compliance",
+        "verification", "integrity", "authentication", "audit",
+        "certification", "enforcement", "monitoring", "validation",
+        "core", "layer", "unit", "module", "engine", "platform",
+        "service", "resource", "asset", "data", "config", "base",
+    ]
+
+    # Permissions considered high risk by scanners
+    HIGH_RISK_PERMISSIONS = [
+        "READ_CONTACTS", "WRITE_CONTACTS",
+        "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION",
+        "READ_CALL_LOG", "WRITE_CALL_LOG",
+        "CAMERA", "RECORD_AUDIO",
+        "READ_SMS", "SEND_SMS", "RECEIVE_SMS",
+        "READ_PHONE_STATE", "CALL_PHONE",
+        "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE",
+        "PROCESS_OUTGOING_CALLS", "GET_ACCOUNTS",
+    ]
+
+    MEDIUM_RISK_PERMISSIONS = [
+        "INTERNET", "ACCESS_NETWORK_STATE", "ACCESS_WIFI_STATE",
+        "RECEIVE_BOOT_COMPLETED", "FOREGROUND_SERVICE",
+        "REQUEST_INSTALL_PACKAGES", "SYSTEM_ALERT_WINDOW",
+        "CHANGE_NETWORK_STATE", "CHANGE_WIFI_STATE",
+    ]
+
+    # Triggering words that scanners flag
+    TRIGGER_WORDS = [
+        "password", "passwd", "secret", "token", "apikey", "api_key",
+        "private_key", "credentials", "auth", "bearer",
+        "adb", "debug", "root", "su ", "superuser",
+        "xposed", "frida", "magisk", "substrate",
+    ]
+
+    def __init__(self, work_dir: str):
+        self.work_dir = work_dir
+
+    def analyse(self, workspace_dir: str, apk_path: str) -> dict:
+        """
+        Full detection analysis of decoded APK workspace.
+        Returns structured report dict.
+        """
+        report = {
+            "apk_name":    os.path.basename(apk_path),
+            "apk_size_mb": round(os.path.getsize(apk_path) / (1024*1024), 2),
+            "smali":       self._analyse_smali(workspace_dir),
+            "drawable":    self._analyse_res_folder(workspace_dir, "drawable"),
+            "mipmap":      self._analyse_res_folder(workspace_dir, "mipmap"),
+            "raw":         self._analyse_res_folder(workspace_dir, "raw"),
+            "values":      self._analyse_values(workspace_dir),
+            "assets":      self._analyse_assets(workspace_dir),
+            "lib":         self._analyse_lib(workspace_dir),
+            "manifest":    self._analyse_manifest(workspace_dir),
+        }
+        report["risk_score"]      = self._calculate_risk_score(report)
+        report["estimated_after"] = max(5, report["risk_score"] - 55)
+        return report
+
+    def _analyse_smali(self, workspace_dir: str) -> dict:
+        """Analyse smali/ folder — count files and risk per file."""
+        smali_path = Path(workspace_dir) / "smali"
+        if not smali_path.exists():
+            # Try smali_classes2 etc
+            smali_dirs = list(Path(workspace_dir).glob("smali*"))
+            if not smali_dirs:
+                return {"total": 0, "high": 0, "medium": 0, "low": 0,
+                        "high_files": [], "source_directives": 0, "log_calls": 0}
+        else:
+            smali_dirs = [smali_path] + list(Path(workspace_dir).glob("smali_classes*"))
+
+        total = high = medium = low = 0
+        source_directives = log_calls = 0
+        high_files = []
+
+        for sdir in smali_dirs:
+            for sf in Path(sdir).rglob("*.smali"):
+                total += 1
+                try:
+                    with open(sf, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read()
+
+                    # Count source directives
+                    if ".source " in content:
+                        source_directives += 1
+
+                    # Count log calls
+                    if "android/util/Log" in content or "Ljava/io/PrintStream" in content:
+                        log_calls += 1
+
+                    # Score file risk
+                    score = self._score_smali_file(sf.name, content)
+                    if score == "HIGH":
+                        high += 1
+                        high_files.append(sf.name)
+                    elif score == "MEDIUM":
+                        medium += 1
+                    else:
+                        low += 1
+                except Exception:
+                    low += 1
+
+        return {
+            "total":             total,
+            "high":              high,
+            "medium":            medium,
+            "low":               low,
+            "high_pct":          round((high/total*100), 1) if total else 0,
+            "medium_pct":        round((medium/total*100), 1) if total else 0,
+            "low_pct":           round((low/total*100), 1) if total else 0,
+            "high_files":        high_files[:5],
+            "source_directives": source_directives,
+            "log_calls":         log_calls,
+        }
+
+    def _score_smali_file(self, filename: str, content: str) -> str:
+        """Score a smali file HIGH/MEDIUM/LOW based on name and content."""
+        name = filename.lower().replace(".smali", "")
+
+        HIGH_NAMES = (
+            "mainactivity", "loginactivity", "splashactivity",
+            "manager", "controller", "handler", "dispatcher",
+            "api", "network", "http", "rest", "client",
+            "auth", "token", "key", "secret", "credential",
+            "database", "db", "dao", "repository",
+            "payment", "billing", "license",
+        )
+        MEDIUM_NAMES = (
+            "utils", "helper", "common", "base", "core",
+            "service", "receiver", "provider", "fragment",
+            "adapter", "viewmodel", "presenter",
+        )
+
+        for pat in HIGH_NAMES:
+            if pat in name:
+                return "HIGH"
+
+        HIGH_CONTENT = (
+            b"https://", b"http://", b"password", b"secret",
+            b"Bearer", b"Authorization", b"api_key", b"private_key",
+            b"SELECT ", b"INSERT ", b"DELETE ", b"AES", b"RSA",
+        )
+        content_bytes = content.encode("utf-8", errors="ignore")
+        for sig in HIGH_CONTENT:
+            if sig.lower() in content_bytes.lower():
+                return "HIGH"
+
+        for pat in MEDIUM_NAMES:
+            if pat in name:
+                return "MEDIUM"
+
+        return "LOW"
+
+    def _analyse_res_folder(self, workspace_dir: str, folder: str) -> dict:
+        """Analyse res/drawable, res/mipmap, res/raw — safe vs unsafe to rename."""
+        # Search for folder anywhere under res/
+        res_path = Path(workspace_dir) / "res"
+        if not res_path.exists():
+            return {"total": 0, "safe_rename": 0, "unsafe_rename": 0, "files": []}
+
+        target_dirs = list(res_path.glob(f"{folder}*"))
+        if not target_dirs:
+            return {"total": 0, "safe_rename": 0, "unsafe_rename": 0, "files": []}
+
+        total = safe = unsafe = 0
+        files = []
+
+        for tdir in target_dirs:
+            for fp in Path(tdir).rglob("*"):
+                if not fp.is_file():
+                    continue
+                total += 1
+                # XML files inside res/ cannot be renamed safely
+                if fp.suffix == ".xml":
+                    unsafe += 1
+                    files.append({"name": fp.name, "safe": False,
+                                  "reason": "XML — apktool requires exact name"})
+                else:
+                    safe += 1
+                    # Suggest safe keyword rename
+                    kw  = random.choice(self.SAFE_KEYWORDS)
+                    kw2 = random.choice(self.SAFE_KEYWORDS)
+                    suggested = f"{kw}_{kw2}{fp.suffix}"
+                    files.append({"name": fp.name, "safe": True,
+                                  "suggested": suggested})
+
+        return {
+            "total":        total,
+            "safe_rename":  safe,
+            "unsafe_rename": unsafe,
+            "safe_pct":     round((safe/total*100), 1) if total else 0,
+            "files":        files[:10],
+        }
+
+    def _analyse_values(self, workspace_dir: str) -> dict:
+        """Analyse res/values/ — string entries and trigger words."""
+        values_path = Path(workspace_dir) / "res" / "values"
+        if not values_path.exists():
+            return {"total_files": 0, "string_entries": 0,
+                    "trigger_hits": 0, "unsafe_rename": 0}
+
+        total_files = string_entries = trigger_hits = 0
+
+        for vf in values_path.rglob("*.xml"):
+            total_files += 1
+            try:
+                with open(vf, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                # Count string entries
+                string_entries += content.count("<string ")
+                # Check trigger words
+                for tw in self.TRIGGER_WORDS:
+                    if tw in content.lower():
+                        trigger_hits += 1
+                        break
+            except Exception:
+                pass
+
+        return {
+            "total_files":    total_files,
+            "string_entries": string_entries,
+            "trigger_hits":   trigger_hits,
+            "unsafe_rename":  total_files,
+            "note":           "res/values/ files cannot be renamed — apktool requires exact names",
+        }
+
+    def _analyse_assets(self, workspace_dir: str) -> dict:
+        """Analyse assets/ — content risk scan."""
+        assets_path = Path(workspace_dir) / "assets"
+        if not assets_path.exists():
+            return {"total": 0, "risky": 0, "clean": 0, "risky_files": []}
+
+        total = risky = clean = 0
+        risky_files = []
+
+        for fp in assets_path.rglob("*"):
+            if not fp.is_file():
+                continue
+            total += 1
+            # Try to read text content
+            if fp.suffix in (".json", ".xml", ".html", ".txt",
+                             ".properties", ".conf", ".config", ".csv"):
+                try:
+                    with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read().lower()
+                    found_triggers = [tw for tw in self.TRIGGER_WORDS
+                                      if tw in content]
+                    if found_triggers:
+                        risky += 1
+                        risky_files.append({
+                            "name":     fp.name,
+                            "triggers": found_triggers[:3],
+                        })
+                    else:
+                        clean += 1
+                except Exception:
+                    clean += 1
+            else:
+                clean += 1
+
+        return {
+            "total":       total,
+            "risky":       risky,
+            "clean":       clean,
+            "risky_files": risky_files[:5],
+        }
+
+    def _analyse_lib(self, workspace_dir: str) -> dict:
+        """Analyse lib/ — .so file names and count."""
+        lib_path = Path(workspace_dir) / "lib"
+        if not lib_path.exists():
+            return {"total": 0, "so_files": [], "note": "lib/ not present"}
+
+        so_files = []
+        for fp in lib_path.rglob("*.so"):
+            so_files.append(fp.name)
+
+        return {
+            "total":    len(so_files),
+            "so_files": so_files[:10],
+            "note":     "Native library names visible to static scanners",
+        }
+
+    def _analyse_manifest(self, workspace_dir: str) -> dict:
+        """Analyse AndroidManifest.xml — permissions and trigger words."""
+        manifest_path = Path(workspace_dir) / "AndroidManifest.xml"
+        if not manifest_path.exists():
+            return {"permissions": [], "high_risk": [], "medium_risk": [],
+                    "trigger_hits": 0, "services": 0, "receivers": 0}
+
+        try:
+            with open(manifest_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            return {"permissions": [], "high_risk": [], "medium_risk": [],
+                    "trigger_hits": 0, "services": 0, "receivers": 0}
+
+        # Extract permissions
+        perms = re.findall(
+            r'android\.permission\.([A-Z_]+)', content)
+        perms = list(set(perms))
+
+        high_risk   = [p for p in perms if p in self.HIGH_RISK_PERMISSIONS]
+        medium_risk = [p for p in perms if p in self.MEDIUM_RISK_PERMISSIONS]
+
+        # Count services and receivers
+        services  = content.count("<service")
+        receivers = content.count("<receiver")
+
+        # Check trigger words
+        trigger_hits = sum(1 for tw in self.TRIGGER_WORDS
+                           if tw in content.lower())
+
+        return {
+            "total_permissions": len(perms),
+            "high_risk":         high_risk,
+            "medium_risk":       medium_risk,
+            "trigger_hits":      trigger_hits,
+            "services":          services,
+            "receivers":         receivers,
+        }
+
+    def _calculate_risk_score(self, report: dict) -> int:
+        """Calculate overall detection risk score 0-100."""
+        score = 0
+
+        # smali risk
+        smali = report.get("smali", {})
+        score += min(30, smali.get("high", 0) * 2)
+        score += min(10, smali.get("source_directives", 0) // 5)
+        score += min(10, smali.get("log_calls", 0) * 2)
+
+        # assets risk
+        assets = report.get("assets", {})
+        score += min(15, assets.get("risky", 0) * 5)
+
+        # manifest risk
+        manifest = report.get("manifest", {})
+        score += min(15, len(manifest.get("high_risk", [])) * 3)
+        score += min(5,  len(manifest.get("medium_risk", [])))
+        score += min(5,  manifest.get("trigger_hits", 0) * 2)
+
+        # values trigger hits
+        values = report.get("values", {})
+        score += min(10, values.get("trigger_hits", 0) * 3)
+
+        return min(100, score)
+
+    def format_telegram_report(self, report: dict) -> list:
+        """
+        Format the full report into Telegram-sized messages.
+        Returns list of message strings — each under 4096 chars.
+        """
+        messages = []
+
+        smali   = report.get("smali", {})
+        risk    = report.get("risk_score", 0)
+        after   = report.get("estimated_after", 0)
+
+        risk_label  = "🔴 High Risk"   if risk >= 60 else                       "🟡 Medium Risk" if risk >= 30 else "🟢 Low Risk"
+        after_label = "🟢 Low Risk"    if after <= 20 else                       "🟡 Medium Risk" if after <= 50 else "🔴 High Risk"
+
+        # Message 1 — Header + smali
+        lines1 = [
+            "🔬 *APK Detection Analysis Report*",
+            "",
+            f"📦 APK: `{report['apk_name']}` ({report['apk_size_mb']}MB)",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            "📊 *Detection Risk Score*",
+            f"  Before Protection: *{risk}/100 — {risk_label}*",
+            f"  Estimated After:   *{after}/100 — {after_label}*",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            "",
+            f"📂 *smali/ — {smali.get('total',0)} files*",
+            f"  🔴 High Risk:   {smali.get('high',0)} files ({smali.get('high_pct',0)}%)",
+            f"  🟡 Medium Risk: {smali.get('medium',0)} files ({smali.get('medium_pct',0)}%)",
+            f"  🟢 Low Risk:    {smali.get('low',0)} files ({smali.get('low_pct',0)}%)",
+            f"  📝 Source directives: {smali.get('source_directives',0)}",
+            f"  📋 Log call files: {smali.get('log_calls',0)}",
+        ]
+        if smali.get("high_files"):
+            lines1.append("")
+            lines1.append("  🔴 Top High Risk Files:")
+            for hf in smali.get("high_files", [])[:5]:
+                lines1.append(f"    • `{hf}`")
+        messages.append("\n".join(lines1))
+
+        # Message 2 — res folders
+        drawable = report.get("drawable", {})
+        mipmap   = report.get("mipmap", {})
+        raw      = report.get("raw", {})
+        values   = report.get("values", {})
+
+        lines2 = [
+            f"📂 *res/drawable/ — {drawable.get('total',0)} files*",
+            f"  ✅ Safe to rename: {drawable.get('safe_rename',0)} ({drawable.get('safe_pct',0)}%)",
+            f"  ⚠️  Cannot rename:  {drawable.get('unsafe_rename',0)}",
+            "",
+            f"📂 *res/mipmap/ — {mipmap.get('total',0)} files*",
+            f"  ✅ Safe to rename: {mipmap.get('safe_rename',0)} ({mipmap.get('safe_pct',0)}%)",
+            f"  ⚠️  Cannot rename:  {mipmap.get('unsafe_rename',0)}",
+            "",
+            f"📂 *res/raw/ — {raw.get('total',0)} files*",
+            f"  ✅ Safe to rename: {raw.get('safe_rename',0)} ({raw.get('safe_pct',0)}%)",
+            f"  ⚠️  Cannot rename:  {raw.get('unsafe_rename',0)}",
+            "",
+            f"📂 *res/values/ — {values.get('total_files',0)} files*",
+            f"  📝 String entries: {values.get('string_entries',0)}",
+            f"  ⚠️  Trigger hits: {values.get('trigger_hits',0)}",
+            f"  ⚠️  Cannot rename: {values.get('unsafe_rename',0)} files",
+            f"  ℹ️  {values.get('note','')}",
+        ]
+        messages.append("\n".join(lines2))
+
+        # Message 3 — assets, lib, manifest
+        assets   = report.get("assets", {})
+        lib      = report.get("lib", {})
+        manifest = report.get("manifest", {})
+
+        lines3 = [
+            f"📂 *assets/ — {assets.get('total',0)} files*",
+            f"  🔴 Risky content: {assets.get('risky',0)} files",
+            f"  🟢 Clean:         {assets.get('clean',0)} files",
+        ]
+        if assets.get("risky_files"):
+            lines3.append("")
+            lines3.append("  🔴 Risky Files:")
+            for rf in assets.get("risky_files", []):
+                triggers = ", ".join(rf.get("triggers", []))
+                lines3.append(f"    • `{rf['name']}` — triggers: {triggers}")
+
+        lines3 += [
+            "",
+            f"📂 *lib/ — {lib.get('total',0)} .so files*",
+        ]
+        for so in lib.get("so_files", [])[:5]:
+            lines3.append(f"  • `{so}`")
+        if lib.get("total", 0) == 0:
+            lines3.append(f"  ℹ️  {lib.get('note','No lib/ folder found')}")
+
+        lines3 += [
+            "",
+            "📄 *AndroidManifest.xml*",
+            f"  Total permissions: {manifest.get('total_permissions',0)}",
+            f"  🔴 High risk permissions: {len(manifest.get('high_risk',[]))}",
+        ]
+        for p in manifest.get("high_risk", [])[:5]:
+            lines3.append(f"    • `{p}`")
+        lines3 += [
+            f"  🟡 Medium risk permissions: {len(manifest.get('medium_risk',[]))}",
+            f"  ⚠️  Trigger words found: {manifest.get('trigger_hits',0)}",
+            f"  📋 Services declared: {manifest.get('services',0)}",
+            f"  📋 Receivers declared: {manifest.get('receivers',0)}",
+        ]
+        messages.append("\n".join(lines3))
+
+        return messages
+
+
+
 # ── SAFE RENAME ENGINE ────────────────────────────────────────────────────────
 class SafeRenameEngine:
     """
@@ -4877,12 +5355,14 @@ manual_selected     = {}   # set of selected operation keys
 manual_aes_key      = {}   # AES key for this job session
 manual_undo_backup  = {}   # backup dir for undo last job
 manual_job_start    = {}   # job start timestamp
+pending_detection   = {}   # tracks admin detection scan mode
 
 # ── ADMIN KEYBOARD — CLEAN 2-BUTTON MENU ─────────────────────────────────────
 def admin_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛡️ Protect APK",          callback_data="admin_protect")],
         [InlineKeyboardButton("🎛️ Manual Control Panel", callback_data="admin_manual")],
+        [InlineKeyboardButton("🔬 APK Detection Analysis", callback_data="admin_detection_scan")],
     ])
 
 def client_kb():
@@ -5036,7 +5516,7 @@ async def button_handler(update, context):
 
     # ── BACK TO ADMIN ─────────────────────────────────────────────────────────
     if data == "back_admin":
-        for d in [pending_protect, pending_manual, manual_apk_path,
+        for d in [pending_protect, pending_manual, pending_detection, manual_apk_path,
                   manual_workspace, manual_work_dir, manual_selected,
                   manual_aes_key, manual_undo_backup, manual_job_start]:
             d.pop(user.id, None)
@@ -5349,6 +5829,25 @@ async def button_handler(update, context):
                 f"❌ *Undo Failed:* `{e}`",
                 parse_mode="Markdown", reply_markup=back_a())
 
+    # ── DETECTION SCAN ───────────────────────────────────────────────────────
+    elif data == "admin_detection_scan":
+        if not is_admin(user.id): return
+        pending_detection[user.id] = "awaiting_apk"
+        await query.edit_message_text(
+            "🔬 *APK Detection Analysis*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Sends a full detection risk report:\n\n"
+            "✅ smali/ — risk per file\n"
+            "✅ res/drawable/ & mipmap/ — safe vs unsafe\n"
+            "✅ res/values/ — string table risk\n"
+            "✅ assets/ — content risk scan\n"
+            "✅ lib/ — .so file visibility\n"
+            "✅ AndroidManifest.xml — permissions\n"
+            "✅ Overall risk score before & after\n\n"
+            f"⚠️ Max APK size: {MAX_APK_MB}MB\n\n"
+            "📎 Send your APK now:",
+            parse_mode="Markdown", reply_markup=back_a())
+
     # ── COMPLIANCE SCAN CALLBACKS (inside Protect APK flow) ──────────────────
     elif data == "cs_proceed":
         if not is_admin(user.id): return
@@ -5634,6 +6133,87 @@ async def document_handler(update, context):
             pending_manual.pop(user.id, None)
             await status_msg.edit_text(
                 f"❌ *Failed to receive APK:* `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+        return
+
+    # ── Admin: Detection Analysis APK upload ─────────────────────────────────
+    if is_admin(user.id) and pending_detection.get(user.id) == "awaiting_apk":
+        if not doc.file_name.endswith(".apk"):
+            await update.message.reply_text(
+                "❌ Please send a valid .apk file.", reply_markup=back_a())
+            return
+
+        size_mb = doc.file_size / (1024 * 1024)
+        if size_mb > MAX_APK_MB:
+            await update.message.reply_text(
+                f"❌ APK too large ({size_mb:.1f}MB). Max: {MAX_APK_MB}MB",
+                reply_markup=back_a())
+            return
+
+        status_msg = await update.message.reply_text(
+            "🔬 *Receiving APK...*\n\n⏳ Please wait...",
+            parse_mode="Markdown")
+
+        try:
+            job_id   = f"detect_{int(time.time())}"
+            work_dir = os.path.join(WORK_DIR, job_id)
+            os.makedirs(work_dir, exist_ok=True)
+
+            tg_file = await context.bot.get_file(doc.file_id)
+            apk_in  = os.path.join(work_dir, doc.file_name)
+            await tg_file.download_to_drive(apk_in)
+
+            pending_detection.pop(user.id, None)
+
+            await status_msg.edit_text(
+                "🔬 *Decoding APK...*\n\n⏳ Extracting workspace...",
+                parse_mode="Markdown")
+
+            # Decode APK to workspace
+            tools = ToolInstaller()
+            tools.install_all()
+            l1        = Level1_WorkspaceBuilder(tools, work_dir)
+            workspace = l1.build_workspace(apk_in)
+
+            await status_msg.edit_text(
+                "🔬 *Analysing...*\n\n⏳ Running full detection analysis...",
+                parse_mode="Markdown")
+
+            # Run full detection analysis
+            analyser = APKDetectionAnalyser(work_dir)
+            report   = analyser.analyse(workspace, apk_in)
+            messages = analyser.format_telegram_report(report)
+
+            # Send first message as edit
+            await status_msg.edit_text(
+                messages[0],
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_admin")]
+                ]))
+
+            # Send remaining messages as new messages
+            for msg in messages[1:]:
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text=msg,
+                    parse_mode="Markdown")
+
+            # Send final back button
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="🔬 *Analysis Complete.*\n\nUse Manual Control Panel to protect your APK.",
+                parse_mode="Markdown",
+                reply_markup=admin_kb())
+
+            # Cleanup workspace
+            if os.path.exists(workspace):
+                shutil.rmtree(workspace, ignore_errors=True)
+
+        except Exception as e:
+            pending_detection.pop(user.id, None)
+            await status_msg.edit_text(
+                f"❌ *Detection Analysis Failed:* `{e}`",
                 parse_mode="Markdown", reply_markup=back_a())
         return
 
