@@ -90,6 +90,13 @@ TOOLS_DIR  = "/tmp/epic_tools"
 DB_FILE    = os.path.join(WORK_DIR, "clients.json")          # persistent storage
 MAX_APK_MB = 45                                               # Telegram bot limit
 
+# ── BASE APK PERSISTENT STORAGE CONFIG ───────────────────────────────────────
+GH_PAT      = os.environ.get("GH_PAT", "")                   # GitHub Personal Access Token
+GH_REPO     = "rendoyelaka/EpicProtector"                     # GitHub repository
+GH_BRANCH   = "main"                                          # Target branch
+BASE_CONFIG  = "config.json"                                  # Persistent config file in repo
+BASE_APK_DIR = os.path.join(WORK_DIR, "base_apk")            # Local base APK storage
+
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -5410,9 +5417,20 @@ pending_detection   = {}   # tracks admin detection scan mode
 # ── ADMIN KEYBOARD — CLEAN 2-BUTTON MENU ─────────────────────────────────────
 def admin_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛡️ Protect APK",          callback_data="admin_protect")],
-        [InlineKeyboardButton("🎛️ Manual Control Panel", callback_data="admin_manual")],
-        [InlineKeyboardButton("🔬 APK Detection Analysis", callback_data="admin_detection_scan")],
+        [InlineKeyboardButton("🛡️ Protect APK",            callback_data="admin_protect")],
+        [InlineKeyboardButton("🎛️ Manual Control Panel",   callback_data="admin_manual")],
+        [InlineKeyboardButton("🔬 APK Detection Analysis",  callback_data="admin_detection_scan")],
+        [InlineKeyboardButton("📦 Base APK",                callback_data="admin_base_apk")],
+    ])
+
+
+def base_apk_kb():
+    """Base APK submenu keyboard."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📤 Upload Base APK",  callback_data="base_apk_upload")],
+        [InlineKeyboardButton("🗑️ Delete Base APK",  callback_data="base_apk_delete")],
+        [InlineKeyboardButton("📊 Base APK Status",  callback_data="base_apk_status")],
+        [InlineKeyboardButton("🔙 Back",             callback_data="back_admin")],
     ])
 
 def client_kb():
@@ -5536,6 +5554,189 @@ async def _report_error_to_admin(context, error_text: str, apk_name: str = ""):
         pass
 
 
+# ── BASE APK PERSISTENT STORAGE ENGINE ───────────────────────────────────────
+class BaseApkStorageEngine:
+    """
+    Manages persistent Base APK storage using Telegram file ID.
+    Saves file ID to config.json in GitHub repo so it survives
+    every restart and code push — no re-upload ever needed.
+    """
+
+    DEFAULT_CONFIG = {
+        "base_apk_file_id":   None,
+        "base_apk_filename":  None,
+        "base_apk_size_mb":   None,
+        "base_apk_uploaded":  None,
+    }
+
+    # ── Load config from local file or GitHub ─────────────────────────────────
+    @staticmethod
+    def load_config() -> dict:
+        """Load config.json from repo root if present, else return defaults."""
+        local_path = os.path.join(os.getcwd(), BASE_CONFIG)
+        if os.path.exists(local_path):
+            try:
+                with open(local_path, "r") as f:
+                    data = json.load(f)
+                    # Merge with defaults to handle missing keys
+                    merged = dict(BaseApkStorageEngine.DEFAULT_CONFIG)
+                    merged.update(data)
+                    return merged
+            except Exception:
+                pass
+        return dict(BaseApkStorageEngine.DEFAULT_CONFIG)
+
+    # ── Save config locally and commit to GitHub ──────────────────────────────
+    @staticmethod
+    def save_config(config: dict) -> tuple:
+        """
+        Save config.json locally and commit to GitHub repo.
+        Returns (success: bool, message: str)
+        """
+        local_path = os.path.join(os.getcwd(), BASE_CONFIG)
+        try:
+            with open(local_path, "w") as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            return False, f"Local save failed: {e}"
+
+        if not GH_PAT:
+            return False, "GH_PAT secret not configured in GitHub Actions"
+
+        import urllib.request
+        import base64
+
+        api_url = f"https://api.github.com/repos/{GH_REPO}/contents/{BASE_CONFIG}"
+        headers = {
+            "Authorization": f"token {GH_PAT}",
+            "Content-Type":  "application/json",
+            "Accept":        "application/vnd.github.v3+json",
+            "User-Agent":    "EpicProtector-Bot",
+        }
+
+        # Get current SHA if file exists (needed for update)
+        current_sha = None
+        try:
+            req = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req) as resp:
+                existing = json.loads(resp.read())
+                current_sha = existing.get("sha")
+        except Exception:
+            pass  # File does not exist yet — first commit
+
+        content_b64 = base64.b64encode(
+            json.dumps(config, indent=2).encode("utf-8")
+        ).decode("utf-8")
+
+        payload = {
+            "message": "EpicProtector: Update base APK config",
+            "content": content_b64,
+            "branch":  GH_BRANCH,
+        }
+        if current_sha:
+            payload["sha"] = current_sha
+
+        try:
+            data_bytes = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                api_url, data=data_bytes, headers=headers, method="PUT"
+            )
+            with urllib.request.urlopen(req) as resp:
+                resp.read()
+            return True, "Config saved and committed to GitHub"
+        except Exception as e:
+            return False, f"GitHub commit failed: {e}"
+
+    # ── Download Base APK from Telegram using stored file ID ─────────────────
+    @staticmethod
+    async def download_base_apk(bot, config: dict) -> str:
+        """
+        Download base APK from Telegram using stored file ID.
+        Returns local path to downloaded APK, or empty string on failure.
+        """
+        file_id  = config.get("base_apk_file_id")
+        filename = config.get("base_apk_filename", "base.apk")
+        if not file_id:
+            return ""
+        try:
+            os.makedirs(BASE_APK_DIR, exist_ok=True)
+            local_path = os.path.join(BASE_APK_DIR, filename)
+            tg_file    = await bot.get_file(file_id)
+            await tg_file.download_to_drive(local_path)
+            return local_path
+        except Exception as e:
+            logger.error(f"[BaseAPK] Download failed: {e}")
+            return ""
+
+    # ── Get local base APK path if already downloaded ────────────────────────
+    @staticmethod
+    def get_local_path(config: dict) -> str:
+        """Return local path if base APK already downloaded this session."""
+        filename = config.get("base_apk_filename", "")
+        if not filename:
+            return ""
+        local_path = os.path.join(BASE_APK_DIR, filename)
+        return local_path if os.path.exists(local_path) else ""
+
+    # ── Clear config — delete base APK record ────────────────────────────────
+    @staticmethod
+    def clear_config() -> tuple:
+        """Clear base APK config — deletes file ID record from GitHub."""
+        return BaseApkStorageEngine.save_config(
+            dict(BaseApkStorageEngine.DEFAULT_CONFIG)
+        )
+
+    # ── Format status message ─────────────────────────────────────────────────
+    @staticmethod
+    def format_status(config: dict) -> str:
+        """Format a status message for display in Telegram."""
+        file_id  = config.get("base_apk_file_id")
+        filename = config.get("base_apk_filename", "—")
+        size_mb  = config.get("base_apk_size_mb")
+        uploaded = config.get("base_apk_uploaded", "—")
+        local    = BaseApkStorageEngine.get_local_path(config)
+
+        if not file_id:
+            return (
+                "📦 *Base APK Status*\n\n"
+                "❌ No base APK stored.\n\n"
+                "Tap *Upload Base APK* to set one."
+            )
+
+        size_str   = f"{size_mb:.2f} MB" if size_mb else "—"
+        local_str  = "✅ Ready in session" if local else "⬇️ Will download on next use"
+
+        return (
+            "📦 *Base APK Status*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📄 Filename:  `{filename}`\n"
+            f"📏 Size:      `{size_str}`\n"
+            f"📅 Uploaded:  `{uploaded}`\n"
+            f"💾 Session:   {local_str}\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "✅ Base APK is stored permanently.\n"
+            "Survives every restart and code push."
+        )
+
+
+# ── BASE APK SESSION STATE ────────────────────────────────────────────────────
+pending_base_apk = {}   # tracks admin Base APK upload mode
+_base_apk_config = {}   # in-memory config cache
+
+
+def _get_base_apk_config() -> dict:
+    """Return cached config or load from disk."""
+    if not _base_apk_config:
+        _base_apk_config.update(BaseApkStorageEngine.load_config())
+    return _base_apk_config
+
+
+def _refresh_base_apk_config():
+    """Force reload config from disk into cache."""
+    _base_apk_config.clear()
+    _base_apk_config.update(BaseApkStorageEngine.load_config())
+
+
 def _startup_self_check() -> dict:
     results = {}
     checks = {
@@ -5568,7 +5769,8 @@ async def button_handler(update, context):
     if data == "back_admin":
         for d in [pending_protect, pending_manual, pending_detection, manual_apk_path,
                   manual_workspace, manual_work_dir, manual_selected,
-                  manual_aes_key, manual_undo_backup, manual_job_start]:
+                  manual_aes_key, manual_undo_backup, manual_job_start,
+                  pending_base_apk]:
             d.pop(user.id, None)
         await query.edit_message_text(
             "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
@@ -5897,6 +6099,94 @@ async def button_handler(update, context):
             f"⚠️ Max APK size: {MAX_APK_MB}MB\n\n"
             "📎 Send your APK now:",
             parse_mode="Markdown", reply_markup=back_a())
+
+    # ── BASE APK — MAIN MENU ─────────────────────────────────────────────────
+    elif data == "admin_base_apk":
+        if not is_admin(user.id): return
+        config = _get_base_apk_config()
+        file_id = config.get("base_apk_file_id")
+        status_line = "✅ Base APK stored — ready to use." if file_id else "❌ No Base APK stored yet."
+        await query.edit_message_text(
+            "📦 *Base APK Manager*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Store your base APK permanently.\n"
+            "Survives every restart and code push.\n"
+            "Upload once — never upload again.\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{status_line}\n\n"
+            "Choose an action:",
+            parse_mode="Markdown", reply_markup=base_apk_kb())
+
+    # ── BASE APK — UPLOAD ─────────────────────────────────────────────────────
+    elif data == "base_apk_upload":
+        if not is_admin(user.id): return
+        pending_base_apk[user.id] = "awaiting_apk"
+        await query.edit_message_text(
+            "📤 *Upload Base APK*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Send your base APK file now.\n\n"
+            f"⚠️ Max size: {MAX_APK_MB}MB\n\n"
+            "📎 Send .apk file:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="admin_base_apk")]
+            ]))
+
+    # ── BASE APK — STATUS ─────────────────────────────────────────────────────
+    elif data == "base_apk_status":
+        if not is_admin(user.id): return
+        _refresh_base_apk_config()
+        config = _get_base_apk_config()
+        await query.edit_message_text(
+            BaseApkStorageEngine.format_status(config),
+            parse_mode="Markdown", reply_markup=base_apk_kb())
+
+    # ── BASE APK — DELETE CONFIRM ─────────────────────────────────────────────
+    elif data == "base_apk_delete":
+        if not is_admin(user.id): return
+        config = _get_base_apk_config()
+        if not config.get("base_apk_file_id"):
+            await query.edit_message_text(
+                "📦 *Base APK Manager*\n\n"
+                "❌ No base APK stored. Nothing to delete.",
+                parse_mode="Markdown", reply_markup=base_apk_kb())
+            return
+        filename = config.get("base_apk_filename", "unknown.apk")
+        await query.edit_message_text(
+            "🗑️ *Delete Base APK*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📄 File: `{filename}`\n\n"
+            "⚠️ This will permanently remove the stored base APK.\n"
+            "You will need to upload again to restore it.\n\n"
+            "Are you sure?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes — Delete",  callback_data="base_apk_delete_confirm")],
+                [InlineKeyboardButton("❌ No — Cancel",   callback_data="admin_base_apk")],
+            ]))
+
+    # ── BASE APK — DELETE EXECUTE ─────────────────────────────────────────────
+    elif data == "base_apk_delete_confirm":
+        if not is_admin(user.id): return
+        await query.edit_message_text(
+            "🗑️ *Deleting Base APK...*\n\n⏳ Please wait...",
+            parse_mode="Markdown")
+        success, msg = BaseApkStorageEngine.clear_config()
+        _refresh_base_apk_config()
+        # Remove local cached file
+        if os.path.exists(BASE_APK_DIR):
+            shutil.rmtree(BASE_APK_DIR, ignore_errors=True)
+        if success:
+            await query.edit_message_text(
+                "🗑️ *Base APK Deleted*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ Base APK has been removed permanently.\n\n"
+                "Tap *Upload Base APK* to store a new one.",
+                parse_mode="Markdown", reply_markup=base_apk_kb())
+        else:
+            await query.edit_message_text(
+                f"❌ *Delete Failed*\n\n`{msg}`",
+                parse_mode="Markdown", reply_markup=base_apk_kb())
 
     # ── COMPLIANCE SCAN CALLBACKS (inside Protect APK flow) ──────────────────
     elif data == "cs_proceed":
@@ -6267,6 +6557,70 @@ async def document_handler(update, context):
                 parse_mode="Markdown", reply_markup=back_a())
         return
 
+    # ── Admin: Base APK upload ───────────────────────────────────────────────
+    if is_admin(user.id) and pending_base_apk.get(user.id) == "awaiting_apk":
+        if not doc.file_name.endswith(".apk"):
+            await update.message.reply_text(
+                "❌ Please send a valid .apk file.", reply_markup=base_apk_kb())
+            return
+
+        size_mb = doc.file_size / (1024 * 1024)
+        if size_mb > MAX_APK_MB:
+            await update.message.reply_text(
+                f"❌ APK too large ({size_mb:.1f}MB). Max: {MAX_APK_MB}MB",
+                reply_markup=base_apk_kb())
+            return
+
+        status_msg = await update.message.reply_text(
+            "📦 *Saving Base APK...*\n\n⏳ Please wait...",
+            parse_mode="Markdown")
+
+        try:
+            pending_base_apk.pop(user.id, None)
+
+            # Build new config with Telegram file ID
+            new_config = {
+                "base_apk_file_id":  doc.file_id,
+                "base_apk_filename": doc.file_name,
+                "base_apk_size_mb":  round(size_mb, 2),
+                "base_apk_uploaded": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            # Save locally and commit to GitHub
+            success, msg = BaseApkStorageEngine.save_config(new_config)
+            _refresh_base_apk_config()
+
+            if success:
+                # Download to local cache immediately for this session
+                os.makedirs(BASE_APK_DIR, exist_ok=True)
+                local_path = os.path.join(BASE_APK_DIR, doc.file_name)
+                tg_file = await context.bot.get_file(doc.file_id)
+                await tg_file.download_to_drive(local_path)
+
+                await status_msg.edit_text(
+                    "📦 *Base APK Saved Successfully!*\n\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📄 Filename:  `{doc.file_name}`\n"
+                    f"📏 Size:      `{size_mb:.2f} MB`\n"
+                    f"📅 Saved:     `{new_config['base_apk_uploaded']}`\n"
+                    "━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "✅ Stored permanently in GitHub.\n"
+                    "Survives every restart and code push.\n"
+                    "You will never need to upload this again.",
+                    parse_mode="Markdown", reply_markup=base_apk_kb())
+            else:
+                await status_msg.edit_text(
+                    f"❌ *Save Failed*\n\n`{msg}`\n\n"
+                    "Check your GH_PAT secret is correctly set in GitHub Actions secrets.",
+                    parse_mode="Markdown", reply_markup=base_apk_kb())
+
+        except Exception as e:
+            pending_base_apk.pop(user.id, None)
+            await status_msg.edit_text(
+                f"❌ *Base APK Save Failed:* `{e}`",
+                parse_mode="Markdown", reply_markup=base_apk_kb())
+        return
+
     # ── Admin: Protect APK upload ─────────────────────────────────────────────
     if is_admin(user.id) and pending_protect.get(user.id) == "awaiting_apk":
         if not doc.file_name.endswith(".apk"):
@@ -6378,6 +6732,16 @@ def main():
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
     print("\033[1;32m[OK] Keep-alive server on port 8080\033[0m")
+
+    # ── BASE APK STARTUP LOAD ─────────────────────────────────────────────────
+    print("\033[1;33m[STARTUP] Checking for stored Base APK...\033[0m")
+    _refresh_base_apk_config()
+    base_cfg = _get_base_apk_config()
+    if base_cfg.get("base_apk_file_id"):
+        fname = base_cfg.get("base_apk_filename", "base.apk")
+        print(f"\033[1;32m[STARTUP] Base APK found: {fname} — will download on first use.\033[0m")
+    else:
+        print("\033[1;33m[STARTUP] No Base APK stored yet. Upload via bot when ready.\033[0m")
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
