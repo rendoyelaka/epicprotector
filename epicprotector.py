@@ -3324,7 +3324,8 @@ class ManualControlEngine:
     def run_operation(self, op_key: str, apk_path: str,
                       workspace: str, work_dir: str,
                       aes_key: bytes, tools: "ToolInstaller",
-                      compliance_scanner: "ComplianceScannerEngine") -> dict:
+                      compliance_scanner: "ComplianceScannerEngine",
+                      rebuilt_apk_override: str = None) -> dict:
         """
         Runs a single operation from the pipeline.
         Returns result dict with status and details.
@@ -3428,7 +3429,9 @@ class ManualControlEngine:
                 result["status"]        = f"✅ {r['removed_files']} files removed — saved {r['saved_kb']}"
 
             elif op_key == "rebuild_apk":
-                l5 = Level5_APKBuilder(tools, work_dir)
+                # Use workspace parent as work_dir to ensure correct output path
+                rebuild_work_dir = os.path.dirname(workspace) if workspace else work_dir
+                l5 = Level5_APKBuilder(tools, rebuild_work_dir)
                 rebuilt = l5.rebuild(workspace)
                 result["rebuilt_apk"] = rebuilt
                 result["status"]      = "✅ APK rebuilt successfully"
@@ -3451,7 +3454,7 @@ class ManualControlEngine:
 
             elif op_key == "unique_fingerprint":
                 gen      = EliteFingerprintGenerator()
-                identity = gen.generate_identity()
+                identity = gen.generate(work_dir)
                 result["identity"] = identity
                 result["status"]   = f"✅ Unique identity: {identity.get('cn','')}"
 
@@ -3460,8 +3463,19 @@ class ManualControlEngine:
 
             elif op_key == "sign_apk":
                 l6 = Level6_Signer(work_dir)
-                rebuilt_apk = result.get("rebuilt_apk") or \
-                              os.path.join(work_dir, "EPIC_PROTECTED.apk")
+                # Use override passed from button handler chain
+                # rebuilt_apk_override = current_apk at point of sign step
+                rebuilt_apk = rebuilt_apk_override
+                if not rebuilt_apk or not os.path.exists(rebuilt_apk):
+                    # Fallback — search work_dir for rebuilt.apk
+                    candidates = list(Path(work_dir).glob("rebuilt.apk")) +                                  list(Path(work_dir).rglob("rebuilt.apk")) +                                  list(Path(work_dir).glob("*.apk"))
+                    # Filter out input APK — find the rebuilt one
+                    candidates = [c for c in candidates
+                                  if "input" not in c.name and "stripped" not in c.name]
+                    if candidates:
+                        rebuilt_apk = str(candidates[0])
+                    else:
+                        raise RuntimeError("No rebuilt APK found to sign. Run Rebuild APK step first.")
                 sign_result = l6.prepare(rebuilt_apk)
                 result["final_apk"]   = sign_result["output_apk"]
                 result["identity"]    = sign_result["identity"]
@@ -4761,9 +4775,15 @@ async def button_handler(update, context):
             except Exception:
                 pass
 
+            # For sign_apk — inject current_apk as rebuilt_apk BEFORE
+            # run_operation executes so it receives correct APK path
+            if op_key == "sign_apk":
+                current_apk = current_apk  # ensure current_apk is up to date
+
             result = engine.run_operation(
                 op_key, current_apk, current_workspace,
-                work_dir, aes_key, tools, scanner)
+                work_dir, aes_key, tools, scanner,
+                rebuilt_apk_override=current_apk if op_key == "sign_apk" else None)
 
             # Update workspace/apk path from decode step
             if op_key == "decode_workspace" and result.get("workspace"):
@@ -4776,13 +4796,9 @@ async def button_handler(update, context):
                 if os.path.exists(stripped):
                     current_apk = stripped
 
-            # Update rebuilt apk path
+            # Update rebuilt apk path from rebuild step
             if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
                 current_apk = result["rebuilt_apk"]
-
-            # Pass rebuilt apk to sign step
-            if op_key == "sign_apk":
-                result["rebuilt_apk"] = current_apk
 
             job_results.append(result)
 
