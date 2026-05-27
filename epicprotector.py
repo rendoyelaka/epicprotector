@@ -5698,20 +5698,22 @@ class BaseApkStorageEngine:
 
         if not file_id:
             return (
-                "📦 *Base APK Status*\n\n"
+                "📦 <b>Base APK Status</b>\n\n"
                 "❌ No base APK stored.\n\n"
-                "Tap *Upload Base APK* to set one."
+                "Tap <b>Upload Base APK</b> to set one."
             )
 
         size_str   = f"{size_mb:.2f} MB" if size_mb else "—"
         local_str  = "✅ Ready in session" if local else "⬇️ Will download on next use"
+        safe_name  = str(filename).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe_date  = str(uploaded).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
         return (
-            "📦 *Base APK Status*\n\n"
+            "📦 <b>Base APK Status</b>\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📄 Filename:  `{filename}`\n"
-            f"📏 Size:      `{size_str}`\n"
-            f"📅 Uploaded:  `{uploaded}`\n"
+            f"📄 Filename:  <code>{safe_name}</code>\n"
+            f"📏 Size:      <code>{size_str}</code>\n"
+            f"📅 Uploaded:  <code>{safe_date}</code>\n"
             f"💾 Session:   {local_str}\n"
             "━━━━━━━━━━━━━━━━━━━━━\n\n"
             "✅ Base APK is stored permanently.\n"
@@ -6107,7 +6109,7 @@ async def button_handler(update, context):
         file_id = config.get("base_apk_file_id")
         status_line = "✅ Base APK stored — ready to use." if file_id else "❌ No Base APK stored yet."
         await query.edit_message_text(
-            "📦 *Base APK Manager*\n\n"
+            "📦 <b>Base APK Manager</b>\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "Store your base APK permanently.\n"
             "Survives every restart and code push.\n"
@@ -6115,19 +6117,19 @@ async def button_handler(update, context):
             "━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"{status_line}\n\n"
             "Choose an action:",
-            parse_mode="Markdown", reply_markup=base_apk_kb())
+            parse_mode="HTML", reply_markup=base_apk_kb())
 
     # ── BASE APK — UPLOAD ─────────────────────────────────────────────────────
     elif data == "base_apk_upload":
         if not is_admin(user.id): return
         pending_base_apk[user.id] = "awaiting_apk"
         await query.edit_message_text(
-            "📤 *Upload Base APK*\n\n"
+            "📤 <b>Upload Base APK</b>\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "Send your base APK file now.\n\n"
             f"⚠️ Max size: {MAX_APK_MB}MB\n\n"
             "📎 Send .apk file:",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔙 Back", callback_data="admin_base_apk")]
             ]))
@@ -6139,7 +6141,7 @@ async def button_handler(update, context):
         config = _get_base_apk_config()
         await query.edit_message_text(
             BaseApkStorageEngine.format_status(config),
-            parse_mode="Markdown", reply_markup=base_apk_kb())
+            parse_mode="HTML", reply_markup=base_apk_kb())
 
     # ── BASE APK — DELETE CONFIRM ─────────────────────────────────────────────
     elif data == "base_apk_delete":
@@ -6147,19 +6149,19 @@ async def button_handler(update, context):
         config = _get_base_apk_config()
         if not config.get("base_apk_file_id"):
             await query.edit_message_text(
-                "📦 *Base APK Manager*\n\n"
+                "📦 <b>Base APK Manager</b>\n\n"
                 "❌ No base APK stored. Nothing to delete.",
-                parse_mode="Markdown", reply_markup=base_apk_kb())
+                parse_mode="HTML", reply_markup=base_apk_kb())
             return
         filename = config.get("base_apk_filename", "unknown.apk")
         await query.edit_message_text(
-            "🗑️ *Delete Base APK*\n\n"
+            "🗑️ <b>Delete Base APK</b>\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📄 File: `{filename}`\n\n"
+            f"📄 File: <code>{filename}</code>\n\n"
             "⚠️ This will permanently remove the stored base APK.\n"
             "You will need to upload again to restore it.\n\n"
             "Are you sure?",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes — Delete",  callback_data="base_apk_delete_confirm")],
                 [InlineKeyboardButton("❌ No — Cancel",   callback_data="admin_base_apk")],
@@ -6169,8 +6171,8 @@ async def button_handler(update, context):
     elif data == "base_apk_delete_confirm":
         if not is_admin(user.id): return
         await query.edit_message_text(
-            "🗑️ *Deleting Base APK...*\n\n⏳ Please wait...",
-            parse_mode="Markdown")
+            "🗑️ <b>Deleting Base APK...</b>\n\n⏳ Please wait...",
+            parse_mode="HTML")
         success, msg = BaseApkStorageEngine.clear_config()
         _refresh_base_apk_config()
         # Remove local cached file
@@ -6178,15 +6180,15 @@ async def button_handler(update, context):
             shutil.rmtree(BASE_APK_DIR, ignore_errors=True)
         if success:
             await query.edit_message_text(
-                "🗑️ *Base APK Deleted*\n\n"
+                "🗑️ <b>Base APK Deleted</b>\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
                 "✅ Base APK has been removed permanently.\n\n"
-                "Tap *Upload Base APK* to store a new one.",
-                parse_mode="Markdown", reply_markup=base_apk_kb())
+                "Tap <b>Upload Base APK</b> to store a new one.",
+                parse_mode="HTML", reply_markup=base_apk_kb())
         else:
             await query.edit_message_text(
-                f"❌ *Delete Failed*\n\n`{msg}`",
-                parse_mode="Markdown", reply_markup=base_apk_kb())
+                f"❌ <b>Delete Failed</b>\n\n<code>{msg}</code>",
+                parse_mode="HTML", reply_markup=base_apk_kb())
 
     # ── COMPLIANCE SCAN CALLBACKS (inside Protect APK flow) ──────────────────
     elif data == "cs_proceed":
@@ -6572,8 +6574,8 @@ async def document_handler(update, context):
             return
 
         status_msg = await update.message.reply_text(
-            "📦 *Saving Base APK...*\n\n⏳ Please wait...",
-            parse_mode="Markdown")
+            "📦 <b>Saving Base APK...</b>\n\n⏳ Please wait...",
+            parse_mode="HTML")
 
         try:
             pending_base_apk.pop(user.id, None)
@@ -6597,28 +6599,32 @@ async def document_handler(update, context):
                 tg_file = await context.bot.get_file(doc.file_id)
                 await tg_file.download_to_drive(local_path)
 
+                safe_name = doc.file_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                safe_date = new_config['base_apk_uploaded'].replace("&", "&amp;")
                 await status_msg.edit_text(
-                    "📦 *Base APK Saved Successfully!*\n\n"
-                    "━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📄 Filename:  `{doc.file_name}`\n"
-                    f"📏 Size:      `{size_mb:.2f} MB`\n"
-                    f"📅 Saved:     `{new_config['base_apk_uploaded']}`\n"
-                    "━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    "✅ Stored permanently in GitHub.\n"
-                    "Survives every restart and code push.\n"
-                    "You will never need to upload this again.",
-                    parse_mode="Markdown", reply_markup=base_apk_kb())
+                    f"📦 <b>Base APK Saved Successfully!</b>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📄 Filename:  <code>{safe_name}</code>\n"
+                    f"📏 Size:      <code>{size_mb:.2f} MB</code>\n"
+                    f"📅 Saved:     <code>{safe_date}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"✅ Stored permanently in GitHub.\n"
+                    f"Survives every restart and code push.\n"
+                    f"You will never need to upload this again.",
+                    parse_mode="HTML", reply_markup=base_apk_kb())
             else:
+                safe_msg = str(msg).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 await status_msg.edit_text(
-                    f"❌ *Save Failed*\n\n`{msg}`\n\n"
-                    "Check your GH_PAT secret is correctly set in GitHub Actions secrets.",
-                    parse_mode="Markdown", reply_markup=base_apk_kb())
+                    f"❌ <b>Save Failed</b>\n\n<code>{safe_msg}</code>\n\n"
+                    f"Check your GH_PAT secret is correctly set in GitHub Actions secrets.",
+                    parse_mode="HTML", reply_markup=base_apk_kb())
 
         except Exception as e:
             pending_base_apk.pop(user.id, None)
+            safe_err = str(e).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             await status_msg.edit_text(
-                f"❌ *Base APK Save Failed:* `{e}`",
-                parse_mode="Markdown", reply_markup=base_apk_kb())
+                f"❌ <b>Base APK Save Failed:</b> <code>{safe_err}</code>",
+                parse_mode="HTML", reply_markup=base_apk_kb())
         return
 
     # ── Admin: Protect APK upload ─────────────────────────────────────────────
