@@ -190,7 +190,7 @@ CN:           Random professional name
 Organisation: Random enterprise name
 City / State: Random location
 Country:      Random country code
-Validity:     Random 3650–9125 days
+Validity:     Random 8000–12000 days
 ```
 
 The keystore is **generated in memory, used for signing, and immediately destroyed**. No keystore file is ever saved to disk or the repository.

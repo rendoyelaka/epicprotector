@@ -4281,8 +4281,7 @@ class ManualControlEngine:
 
             elif op_key == "compliance_scan":
                 findings = compliance_scanner.scan_workspace(workspace)
-                # scan_workspace returns a list of finding dicts — not a dict
-                total = len(findings) if isinstance(findings, list) else                         sum(len(v) for v in findings.values() if isinstance(v, list))
+                total    = sum(len(v) for v in findings.values() if isinstance(v, list))
                 result["findings"] = total
                 result["status"]   = f"✅ Scan complete — {total} findings"
 
@@ -4376,27 +4375,21 @@ class ManualControlEngine:
                 result["status"]        = f"✅ {r['removed_files']} files removed — saved {r['saved_kb']}"
 
             elif op_key == "rebuild_apk":
-                # Validate workspace exists and contains apktool.yml before rebuild
-                if not workspace or not os.path.exists(workspace):
+                # workspace must exist and be the decoded workspace folder
+                if not workspace or not os.path.isdir(workspace):
                     raise RuntimeError(
-                        "Workspace not found. Decode → Workspace step must run before Rebuild APK.")
-                apktool_yml = os.path.join(workspace, "apktool.yml")
-                if not os.path.exists(apktool_yml):
-                    # Search for apktool.yml in subdirectories
-                    found = list(Path(work_dir).rglob("apktool.yml"))
-                    if found:
-                        workspace = str(found[0].parent)
-                    else:
-                        raise RuntimeError(
-                            "apktool.yml not found in workspace. "
-                            "APK was not decoded correctly. "
-                            "Run Decode → Workspace step first.")
-                # Use workspace parent as work_dir for correct output path
-                rebuild_work_dir = os.path.dirname(workspace) if workspace else work_dir
-                l5 = Level5_APKBuilder(tools, rebuild_work_dir)
+                        f"Rebuild APK failed: workspace directory not found at "
+                        f"'{workspace}'. Decode Workspace step must run and "
+                        f"succeed before Rebuild APK."
+                    )
+                # Always use work_dir directly as the output parent —
+                # it is always the correct, pre-created job directory.
+                # os.path.dirname(workspace) would also equal work_dir, but
+                # using work_dir directly avoids any path edge-case.
+                os.makedirs(work_dir, exist_ok=True)
+                l5 = Level5_APKBuilder(tools, work_dir)
                 rebuilt = l5.rebuild(workspace)
                 result["rebuilt_apk"] = rebuilt
-                result["workspace"]   = workspace
                 result["status"]      = "✅ APK rebuilt successfully"
 
             elif op_key == "integrity_manifest":
@@ -4426,19 +4419,61 @@ class ManualControlEngine:
 
             elif op_key == "sign_apk":
                 l6 = Level6_Signer(work_dir)
-                # Use override passed from button handler chain
-                # rebuilt_apk_override = current_apk at point of sign step
-                rebuilt_apk = rebuilt_apk_override
+                # Determine which APK to sign.
+                # Priority 1: rebuilt.apk produced by rebuild_apk step in this job.
+                # Priority 2: search work_dir for rebuilt.apk by name.
+                # Never fall back to the stripped/input APK — signing a
+                # non-rebuilt APK always fails and produces an unusable output.
+                rebuilt_apk = None
+
+                # Check the direct rebuilt.apk path first
+                direct_rebuilt = os.path.join(work_dir, "rebuilt.apk")
+                if os.path.exists(direct_rebuilt):
+                    rebuilt_apk = direct_rebuilt
+
+                # If not found by direct path, use override from pipeline runner
+                if not rebuilt_apk:
+                    candidate = rebuilt_apk_override
+                    if candidate and os.path.exists(candidate):
+                        # Only accept it if it is NOT a stripped/input APK
+                        base = os.path.basename(candidate)
+                        if "stripped" not in base and "input" not in base:
+                            rebuilt_apk = candidate
+
+                # If still not found, search work_dir recursively for rebuilt.apk
+                if not rebuilt_apk:
+                    for found in list(Path(work_dir).rglob("rebuilt.apk")):
+                        rebuilt_apk = str(found)
+                        break
+
+                # Validate the located APK is a genuine rebuilt output —
+                # must exist, be a valid ZIP, and contain at least one DEX file.
                 if not rebuilt_apk or not os.path.exists(rebuilt_apk):
-                    # Fallback — search work_dir for rebuilt.apk
-                    candidates = list(Path(work_dir).glob("rebuilt.apk")) +                                  list(Path(work_dir).rglob("rebuilt.apk")) +                                  list(Path(work_dir).glob("*.apk"))
-                    # Filter out input APK — find the rebuilt one
-                    candidates = [c for c in candidates
-                                  if "input" not in c.name and "stripped" not in c.name]
-                    if candidates:
-                        rebuilt_apk = str(candidates[0])
-                    else:
-                        raise RuntimeError("No rebuilt APK found to sign. Run Rebuild APK step first.")
+                    raise RuntimeError(
+                        "Sign APK failed: no rebuilt APK found in job directory. "
+                        "The Rebuild APK step must run and succeed before Sign APK. "
+                        "Check the Rebuild APK error above for the root cause."
+                    )
+                try:
+                    with zipfile.ZipFile(rebuilt_apk, 'r') as _zf:
+                        _names = _zf.namelist()
+                    _has_dex = any(
+                        n == 'classes.dex' or re.match(r'^classes\d+\.dex$', n)
+                        for n in _names
+                    )
+                    if not _has_dex:
+                        raise RuntimeError(
+                            f"Sign APK failed: the APK at '{rebuilt_apk}' is "
+                            f"missing classes.dex — it is not a valid rebuilt APK. "
+                            f"The Rebuild APK step must complete successfully first."
+                        )
+                except zipfile.BadZipFile:
+                    raise RuntimeError(
+                        f"Sign APK failed: the file at '{rebuilt_apk}' is not a "
+                        f"valid APK (bad ZIP format). The Rebuild APK step must "
+                        f"complete successfully first."
+                    )
+
                 sign_result = l6.prepare(rebuilt_apk)
                 result["final_apk"]   = sign_result["output_apk"]
                 result["identity"]    = sign_result["identity"]
@@ -4450,7 +4485,7 @@ class ManualControlEngine:
                 result["status"] = "✅ Protection score will be calculated after all ops"
 
         except Exception as e:
-            result["status"] = f"❌ {str(e)[:80]}"
+            result["status"] = f"❌ {str(e)[:300]}"
             result["error"]  = str(e)
 
         return result
@@ -5762,12 +5797,8 @@ async def button_handler(update, context):
                     current_apk = stripped
 
             # Update rebuilt apk path from rebuild step
-            # Also update workspace if rebuild corrected it
             if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
                 current_apk = result["rebuilt_apk"]
-            if op_key == "rebuild_apk" and result.get("workspace"):
-                current_workspace = result["workspace"]
-                manual_workspace[user.id] = current_workspace
 
             job_results.append(result)
 
@@ -6289,9 +6320,7 @@ async def document_handler(update, context):
                 "started_at": time.time(),
             }
 
-            # scan_workspace returns a list — not a dict
-            total    = len(findings) if isinstance(findings, list) else \
-                       sum(len(v) for v in findings.values() if isinstance(v, list))
+            total    = sum(len(v) for v in findings.values() if isinstance(v, list))
             scanner  = ComplianceScannerEngine()
             summary  = ComplianceScannerEngine.format_summary_message(findings, os.path.basename(compliance_apk_path.get(user.id, "unknown.apk")))
 
