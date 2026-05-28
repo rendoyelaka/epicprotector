@@ -4857,7 +4857,8 @@ class ManualControlEngine:
                       aes_key: bytes, tools: "ToolInstaller",
                       compliance_scanner: "ComplianceScannerEngine",
                       rebuilt_apk_override: str = None,
-                      keystore_ctx: dict = None) -> dict:
+                      keystore_ctx: dict = None,
+                      completed_ops: set = None) -> dict:
         """
         Runs a single operation from the pipeline.
         Returns result dict with status and details.
@@ -5150,28 +5151,26 @@ class ManualControlEngine:
                 os.makedirs(work_dir, exist_ok=True)
                 l5 = Level5_APKBuilder(tools, work_dir)
 
-                # Detect whether any previous step modified smali.
-                # Steps that modify smali content require full apktool rebuild.
-                # Steps that only read (compliance scan) or modify only resources
-                # can use bypass mode — copy stripped APK directly, skip apktool.
+                # Detect whether any previous step in this pipeline run
+                # modified smali. If not — bypass apktool entirely.
+                # The ops_run list is passed via the result accumulator.
                 SMALI_MODIFYING_OPS = {
                     "obfuscation", "safe_rename", "encryption",
                     "security_guard", "tamper_detection", "dex_repackaging",
                     "manifest_hardening", "proguard_hardening",
                     "native_methods_obfuscation", "dex_sourcefile_strip",
                 }
-                # Check done_steps from session if available
-                session_done = manual_done_steps.get(
-                    next(iter(manual_done_steps), None), set()
-                ) if manual_done_steps else set()
+                # Use completed_ops passed from caller — accurate per-session
+                # If no smali-modifying ops ran — bypass apktool entirely
+                _completed = completed_ops or set()
                 smali_was_modified = bool(
-                    session_done & SMALI_MODIFYING_OPS
+                    _completed & SMALI_MODIFYING_OPS
                 )
 
                 rebuilt = l5.rebuild(workspace,
                                      smali_modified=smali_was_modified)
-                result["rebuilt_apk"]     = rebuilt
-                result["bypass_used"]     = not smali_was_modified
+                result["rebuilt_apk"] = rebuilt
+                result["bypass_used"] = not smali_was_modified
                 result["status"] = (
                     "✅ APK rebuilt — bypass mode (smali unchanged, "
                     "original DEX preserved)"
@@ -8630,11 +8629,14 @@ async def button_handler(update, context):
             except Exception:
                 pass
 
+            # Before calling run_operation — pre-compute ops completed
+            # so rebuild bypass detection works correctly
             result = engine.run_operation(
                 op_key, current_apk, current_workspace,
                 work_dir, aes_key, tools, scanner,
                 rebuilt_apk_override=current_apk,
-                keystore_ctx=manual_keystore_ctx.setdefault(user.id, {}))
+                keystore_ctx=manual_keystore_ctx.setdefault(user.id, {}),
+                completed_ops=set(done_steps))
 
             # Update state from results
             if op_key == "decode_workspace" and result.get("workspace"):
