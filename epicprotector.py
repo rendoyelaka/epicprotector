@@ -9209,6 +9209,25 @@ async def button_handler(update, context):
         return
 
     # ── BACK TO SESSION CHECKLIST (from smali tree) ───────────────────────────
+    elif data == "mcp_show_presets":
+        if not is_admin(user.id): return
+        work_dir = manual_work_dir.get(user.id)
+        apk_path = manual_apk_path.get(user.id)
+        if not apk_path or not os.path.exists(apk_path):
+            await query.edit_message_text(
+                "❌ APK not found. Please restart Manual Control Panel.",
+                reply_markup=back_a())
+            return
+        apk_name = os.path.basename(apk_path)
+        engine   = ManualControlEngine(CryptoEngine(), work_dir or WORK_DIR)
+        await query.edit_message_text(
+            f"🎛️ *Manual Control Panel*\n\n"
+            f"📦 `{apk_name}` loaded\n\n"
+            f"Select a phase to run:\n"
+            f"━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="Markdown",
+            reply_markup=engine.build_preset_keyboard())
+
     elif data == "mcp_session_back":
         smali_tree_path.pop(user.id, None)
         smali_selected_files.pop(user.id, None)
@@ -9602,7 +9621,7 @@ async def button_handler(update, context):
                         caption=f"✅ *{phase_label} — Install & Test*\n\nInstall this APK on your device.",
                         parse_mode="Markdown",
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔄 Run Next Phase", callback_data="mcp_session_back")],
+                            [InlineKeyboardButton("🔄 Run Next Phase", callback_data="mcp_show_presets")],
                             [InlineKeyboardButton("⬅️ Back to Menu",   callback_data="back_admin")],
                         ]))
             else:
