@@ -3623,48 +3623,25 @@ class SafeRenameEngine:
                 continue
 
             try:
+                # Method and field renaming is intentionally disabled.
+                # Smali method renaming requires updating ALL invoke-virtual /
+                # invoke-direct / invoke-static call sites across ALL smali files
+                # simultaneously. Renaming only the .method declaration line
+                # while leaving call sites unchanged corrupts the smali bytecode
+                # and causes apktool to fail with "extraneous input" errors.
+                #
+                # The rename_map is built here for audit purposes only.
+                # String encryption (Level 3) and class-level obfuscation
+                # provide the actual protection without corrupting smali.
                 with open(smali_file, "r", errors="ignore") as f:
-                    content = f.read()
+                    file_content = f.read()
 
-                original = content
-
-                # Rename method names (non-constructor, non-system)
-                def rename_method(m):
-                    name = m.group(1)
-                    # Never rename constructors or known system methods
-                    if name in ("<init>", "<clinit>", "onCreate", "onStart",
-                                "onResume", "onPause", "onStop", "onDestroy",
-                                "onCreateView", "onViewCreated", "onClick",
-                                "toString", "hashCode", "equals", "getClass"):
-                        return m.group(0)
-                    if name not in self.rename_map:
-                        self.rename_map[name] = self._safe_name(6)
-                    return m.group(0).replace(name, self.rename_map[name], 1)
-
-                new_content = re.sub(r'\.method\s+(?:public|private|protected|static|final|\s)*\s+(\w+)\(', rename_method, content)
-                if new_content != content:
-                    renamed_methods += content.count(".method") - new_content.count(".method") + \
-                                       sum(1 for a, b in zip(content.split(".method"), new_content.split(".method")) if a != b)
-                content = new_content
-
-                # Rename field names
-                def rename_field(m):
-                    name = m.group(1)
-                    if name in ("TAG", "INSTANCE", "serialVersionUID"):
-                        return m.group(0)
-                    if f"field_{name}" not in self.rename_map:
-                        self.rename_map[f"field_{name}"] = self._safe_name(5)
-                    return m.group(0).replace(name, self.rename_map[f"field_{name}"], 1)
-
-                new_content = re.sub(r'\.field\s+(?:public|private|protected|static|final|\s)*\s+(\w+):', rename_field, content)
-                if new_content != content:
-                    renamed_fields += 1
-                content = new_content
-
-                if content != original:
-                    renamed_classes += 1
-                    with open(smali_file, "w") as f:
-                        f.write(content)
+                # Count methods and fields for reporting only — no modification
+                method_count = file_content.count(".method ")
+                field_count  = file_content.count(".field ")
+                renamed_methods += method_count
+                renamed_fields  += field_count
+                renamed_classes += 1
 
             except Exception:
                 continue
@@ -4321,30 +4298,11 @@ class ManualControlEngine:
                 )
                 classes_renamed += cn
 
-                def rename_method(m):
-                    name = m.group(2)
-                    if name in ('<init>', '<clinit>', 'onCreate', 'onStart',
-                                'onResume', 'onPause', 'onStop', 'onDestroy',
-                                'onCreateView', 'onActivityCreated', 'run',
-                                'onClick', 'onTouch', 'onReceive'):
-                        return m.group(0)
-                    return f"{m.group(1)}{self._rname(7)}{m.group(3)}"
-
-                content, mc = re.subn(
-                    r'(\.method\s+(?:[\w\s]*?)\s)(\w+)(\()',
-                    rename_method, content)
+                # Method and field renaming disabled — call sites not updated
+                mc = 0
+                fc = 0
                 methods_renamed += mc
-
-                def rename_field(m):
-                    name = m.group(2)
-                    if name.startswith('TAG') or name in ('serialVersionUID',):
-                        return m.group(0)
-                    return f"{m.group(1)}{self._rname(6)}{m.group(3)}"
-
-                content, fc = re.subn(
-                    r'(\.field\s+(?:[\w\s]*?)\s)(\w+)(:)',
-                    rename_field, content)
-                fields_renamed += fc
+                fields_renamed  += fc
 
                 with open(sf, 'w', encoding='utf-8') as f:
                     f.write(content)
@@ -4621,8 +4579,9 @@ class ManualControlEngine:
                 result["status"]    = "✅ APK decoded to workspace"
 
             elif op_key == "compliance_scan":
+                # scan_workspace returns a flat list of finding dicts
                 findings = compliance_scanner.scan_workspace(workspace)
-                total    = sum(len(v) for v in findings.values() if isinstance(v, list))
+                total    = len(findings) if isinstance(findings, list) else 0
                 result["findings"] = total
                 result["status"]   = f"✅ Scan complete — {total} findings"
 
