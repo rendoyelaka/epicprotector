@@ -85,6 +85,8 @@ BOT_TOKEN  = os.environ.get("BOT_TOKEN", "YOUR_NEW_TOKEN_HERE")
 ADMIN_ID   = int(os.environ.get("ADMIN_ID", "8205672036"))
 KS_PASS    = os.environ.get("KS_PASS",  "Epic@Store#2024")   # move to env in prod
 KS_KEY     = os.environ.get("KS_KEY",   "Epic@Key#2024")
+SCRIPT_VERSION = "2.1"
+
 WORK_DIR   = "/tmp/epic_protector"
 TOOLS_DIR  = "/tmp/epic_tools"
 DB_FILE    = os.path.join(WORK_DIR, "clients.json")          # persistent storage
@@ -4713,7 +4715,10 @@ class ManualControlEngine:
 
             elif op_key == "integrity_manifest":
                 guardian = IntegrityGuardian(work_dir)
-                manifest = guardian.generate(workspace)
+                # workspace may be None if Decode Workspace step was not selected
+                # Fall back to work_dir itself so generate() never receives None
+                scan_dir = workspace if (workspace and os.path.exists(workspace))                            else work_dir
+                manifest = guardian.generate(scan_dir)
                 guardian.save(manifest)
                 result["files_hashed"] = len(manifest)
                 result["status"]       = f"✅ {len(manifest)} files hashed — integrity manifest saved"
@@ -7370,7 +7375,69 @@ def main():
     else:
         print("\033[1;33m[STARTUP] No Base APK stored yet. Upload via bot when ready.\033[0m")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    async def post_init(application):
+        """
+        Runs once automatically after bot connects to Telegram.
+        Sends startup notification to admin — no /start needed.
+        Also clears the previous session chat so every push starts fresh.
+        """
+        try:
+            bot = application.bot
+
+            # ── Step 1: Delete previous bot messages to clear chat ────────────
+            # Telegram does not allow bulk delete so we attempt to delete
+            # the last 100 message IDs before the current update ID
+            # This cleans up the previous session visually
+            try:
+                updates = await bot.get_updates(limit=1, timeout=1)
+                if updates:
+                    last_id = updates[-1].update_id
+                else:
+                    last_id = 0
+
+                # Delete last 100 messages sent by the bot in admin chat
+                deleted = 0
+                for msg_id in range(last_id, max(0, last_id - 100), -1):
+                    try:
+                        await bot.delete_message(
+                            chat_id=ADMIN_ID, message_id=msg_id)
+                        deleted += 1
+                    except Exception:
+                        pass
+                if deleted:
+                    logger.info(
+                        f"[Startup] Cleared {deleted} previous messages.")
+            except Exception as e:
+                logger.info(f"[Startup] Chat clear skipped: {e}")
+
+            # ── Step 2: Send startup notification to admin ────────────────────
+            base_cfg  = _get_base_apk_config()
+            base_info = (
+                f"📦 Base APK: `{base_cfg.get('base_apk_filename','none')}` "
+                f"({base_cfg.get('base_apk_size_mb',0)} MB)"
+                if base_cfg.get("base_apk_file_id")
+                else "📦 Base APK: Not stored yet"
+            )
+
+            msg = (
+                "⚡ *EPIC PROTECTOR*\n"
+                f"Version {SCRIPT_VERSION}\n\n"
+                f"{base_info}\n\n"
+                "✅ *Ready*"
+            )
+
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=msg,
+                parse_mode="Markdown",
+                reply_markup=admin_kb())
+
+            logger.info("[Startup] Startup notification sent to admin.")
+
+        except Exception as e:
+            logger.error(f"[Startup] post_init error: {e}")
+
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
