@@ -5349,8 +5349,8 @@ class ManualControlEngine:
         """
         rows = []
         for op in self.PIPELINE_ORDER:
-            label  = self.STEP_LABELS[op]
-            tick   = "☑️" if op in selected else "☐"
+            label   = self.STEP_LABELS[op]
+            tick    = "☑️" if op in selected else "☐"
             display = f"{tick} {label}"
             rows.append([InlineKeyboardButton(
                 display, callback_data=f"mcp_toggle_{op}"
@@ -5358,53 +5358,19 @@ class ManualControlEngine:
 
         # Select All / Clear All row
         rows.append([
-            InlineKeyboardButton("☑️ Select All",  callback_data="mcp_select_all"),
-            InlineKeyboardButton("☐ Clear All",    callback_data="mcp_clear_all"),
+            InlineKeyboardButton("☑️ Select All", callback_data="mcp_select_all"),
+            InlineKeyboardButton("☐ Clear All",   callback_data="mcp_clear_all"),
         ])
         # Apply Selected
         rows.append([InlineKeyboardButton("✅ Apply Selected", callback_data="mcp_apply")])
-        # ── Tree Browsers ─────────────────────────────────────────────────────
-        rows.append([InlineKeyboardButton("── 🌲 Tree Browsers ──", callback_data="mcp_noop")])
-        rows.append([InlineKeyboardButton("🌲 Smali Tree Browser",      callback_data="smali_tree_open")])
-        rows.append([InlineKeyboardButton("📁 res/ Tree Browser",       callback_data="res_tree_open")])
-        rows.append([InlineKeyboardButton("📄 AndroidManifest Browser", callback_data="manifest_browse_open")])
-        rows.append([InlineKeyboardButton("📦 resources.arsc Browser",  callback_data="arsc_browse_open")])
-        # ── Analysis Tools ────────────────────────────────────────────────────
-        rows.append([InlineKeyboardButton("── 🔬 Analysis Tools ──", callback_data="mcp_noop")])
-        rows.append([InlineKeyboardButton("🛡️ Safety Analysis",    callback_data="safety_analyse")])
-        rows.append([InlineKeyboardButton("🔬 AV Trigger Scan",    callback_data="av_trigger_scan")])
-        rows.append([InlineKeyboardButton("👁️ Dry Run Preview",    callback_data="dry_run_preview")])
-        rows.append([InlineKeyboardButton("🔑 Permission Auditor", callback_data="perm_audit")])
-        rows.append([InlineKeyboardButton("📋 Session Report",     callback_data="session_report")])
         # Back
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_admin")])
 
         return InlineKeyboardMarkup(rows)
 
     def build_preset_keyboard(self) -> "InlineKeyboardMarkup":
-        """Preset profile selection keyboard — preflight first, then standard + 6 phase presets."""
+        """Preset keyboard — 6 phases only. Each runs immediately on tap."""
         return InlineKeyboardMarkup([
-            # ── Pre-flight Validation — always first ──────────────────────────
-            [InlineKeyboardButton(
-                "🧪 Pre-flight Validation",
-                callback_data="mcp_preflight_run")],
-            [InlineKeyboardButton(
-                "── Presets ──",
-                callback_data="mcp_noop")],
-            # ── Standard presets ──────────────────────────────────────────────
-            [InlineKeyboardButton(
-                "⚡ Quick Sign Only",
-                callback_data="mcp_preset_quick_sign")],
-            [InlineKeyboardButton(
-                "🔒 Full Protection",
-                callback_data="mcp_preset_full_protection")],
-            [InlineKeyboardButton(
-                "🎯 Custom (manual select)",
-                callback_data="mcp_preset_custom")],
-            # ── Phase testing presets — divider ───────────────────────────────
-            [InlineKeyboardButton(
-                "── Phase Testing ──",
-                callback_data="mcp_noop")],
             [InlineKeyboardButton(
                 "📋 Phase 1 — Setup (baseline APK)",
                 callback_data="mcp_preset_phase_1_setup")],
@@ -9497,6 +9463,158 @@ async def button_handler(update, context):
         preset_key = data[len("mcp_preset_"):]
         engine     = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
 
+        # Phase presets run immediately — no checkbox box shown
+        PHASE_KEYS = {
+            'phase_1_setup', 'phase_2_code_protection', 'phase_3_cleanup',
+            'phase_4_build', 'phase_5_av_clean', 'phase_6_complete'
+        }
+
+        if preset_key in PHASE_KEYS:
+            # Run phase immediately
+            ops      = engine.PRESETS.get(preset_key, [])
+            selected = engine.enforce_auto_sign(set(ops))
+            manual_selected[user.id] = selected
+            apk_path = manual_apk_path.get(user.id)
+            work_dir = manual_work_dir.get(user.id)
+
+            if not apk_path or not os.path.exists(apk_path):
+                await query.edit_message_text(
+                    "❌ APK not found. Please restart Manual Control Panel.",
+                    reply_markup=back_a())
+                return
+
+            phase_labels = {
+                'phase_1_setup':            '📋 Phase 1 — Setup',
+                'phase_2_code_protection':  '🛡️ Phase 2 — Code Protection',
+                'phase_3_cleanup':          '🧹 Phase 3 — Cleanup',
+                'phase_4_build':            '🔨 Phase 4 — Build + Integrity',
+                'phase_5_av_clean':         '🔬 Phase 5 — AV-Clean + Play Protect',
+                'phase_6_complete':         '🏆 Phase 6 — Complete',
+            }
+            phase_label = phase_labels.get(preset_key, preset_key)
+            apk_name    = os.path.basename(apk_path)
+            ordered_ops = engine.enforce_pipeline_order(selected)
+
+            status_msg = await query.edit_message_text(
+                f"🎛️ *{phase_label}*\n\n"
+                f"📦 `{apk_name}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏳ Running {len(ordered_ops)} operations...\n"
+                f"Please wait — APK will be delivered when complete.",
+                parse_mode="Markdown")
+
+            # Run the phase
+            aes_key     = manual_aes_key.get(user.id) or AESKeyManager.generate()
+            manual_aes_key[user.id]   = aes_key
+            start_time  = time.time()
+            done_steps  = manual_done_steps.get(user.id, set())
+            tools       = ToolInstaller()
+            tools.install_all()
+            scanner     = ComplianceScannerEngine()
+            ops_to_run  = [op for op in ordered_ops if op not in done_steps]
+
+            job_results       = []
+            current_workspace = manual_workspace.get(user.id)
+            current_apk       = apk_path
+            keystore_ctx      = manual_keystore_ctx.get(user.id, {})
+
+            for i, op_key in enumerate(ops_to_run):
+                label = engine.STEP_LABELS.get(op_key, op_key)
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=status_msg.message_id,
+                        text=f"🎛️ *{phase_label}*\n\n"
+                             f"Step {i+1}/{len(ops_to_run)}: {label}\n"
+                             f"⏳ Processing...",
+                        parse_mode="Markdown")
+                except Exception:
+                    pass
+
+                if op_key == "sign_apk":
+                    current_apk = current_apk
+
+                result = engine.run_operation(
+                    op_key, current_apk, current_workspace,
+                    work_dir, aes_key, tools, scanner,
+                    rebuilt_apk_override=current_apk if op_key == "sign_apk" else None,
+                    keystore_ctx=keystore_ctx,
+                    completed_ops=done_steps)
+
+                if op_key == "decode_workspace" and result.get("workspace"):
+                    current_workspace = result["workspace"]
+                    manual_workspace[user.id] = current_workspace
+                if op_key == "strip_signature":
+                    stripped = os.path.join(work_dir, "input_stripped.apk")
+                    if os.path.exists(stripped):
+                        current_apk = stripped
+                if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
+                    current_apk = result["rebuilt_apk"]
+                if op_key == "rebuild_apk" and result.get("workspace"):
+                    current_workspace = result["workspace"]
+                    manual_workspace[user.id] = current_workspace
+
+                if "❌" not in result.get("status", ""):
+                    done_steps.add(op_key)
+
+                job_results.append(result)
+
+            manual_done_steps[user.id]   = done_steps
+            manual_keystore_ctx[user.id] = keystore_ctx
+
+            # Build summary
+            applied    = [r["op"] for r in job_results if "❌" not in r.get("status","")]
+            scorer     = ProtectionScoreEngine()
+            score_r    = scorer.calculate(applied)
+            elapsed    = int(time.time() - start_time)
+            mins, secs = elapsed // 60, elapsed % 60
+
+            # Find final APK
+            final_apk = None
+            for r in reversed(job_results):
+                if r.get("final_apk") and os.path.exists(r["final_apk"]):
+                    final_apk = r["final_apk"]
+                    break
+
+            # Summary lines
+            lines = [
+                f"✅ *{phase_label} — Complete*\n",
+                "━━━━━━━━━━━━━━━━━━━━━",
+            ]
+            for r in job_results:
+                icon = "✅" if "❌" not in r.get("status","") else "❌"
+                lines.append(f"{icon} {r.get('label', r.get('op',''))}")
+            lines += [
+                "━━━━━━━━━━━━━━━━━━━━━",
+                f"🕐 Time: `{mins}m {secs}s`",
+                f"📊 Score: *{score_r['score']}/100 — {score_r['grade']}*",
+            ]
+
+            await status_msg.edit_text(
+                "\n".join(lines), parse_mode="Markdown")
+
+            if final_apk and os.path.exists(final_apk):
+                with open(final_apk, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=user.id,
+                        document=f,
+                        filename=f"EPIC_{preset_key.upper()}.apk",
+                        caption=f"✅ *{phase_label} — Install & Test*\n\nInstall this APK on your device.",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Run Next Phase", callback_data="mcp_session_back")],
+                            [InlineKeyboardButton("⬅️ Back to Menu",   callback_data="back_admin")],
+                        ]))
+            else:
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text="⚠️ No signed APK produced. Check summary above.",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("⬅️ Back", callback_data="back_admin")],
+                    ]))
+            return
+
+        # Non-phase presets — custom only now
         if preset_key == "custom":
             manual_selected[user.id] = set()
         else:
