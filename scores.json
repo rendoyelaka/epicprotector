@@ -1,5 +1,12 @@
 [
   {
+    "timestamp": "2026-05-28 20:29",
+    "apk_name": "base.apk",
+    "steps_run": 0,
+    "score": 0,
+    "passed": false
+  },
+  {
     "timestamp": "2026-05-28 07:19",
     "apk_name": "base.apk",
     "steps_run": 0,
