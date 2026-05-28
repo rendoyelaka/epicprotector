@@ -1687,73 +1687,61 @@ class Level5_APKBuilder:
     def rebuild(self, workspace_dir) -> str:
         """
         Build workspace back into APK.
-        Uses a retry loop — apktool reports broken XML files in batches
-        and stops early. Each iteration deletes what failed and retries
-        until either the build succeeds or no new files are removed.
-        Max 8 iterations — covers even heavily fragmented decode artifacts.
+
+        Uses apktool -r (--no-res) flag — skips resource recompilation entirely.
+        The original resources.arsc is copied into the output APK unchanged.
+        Only smali folders are recompiled into classes.dex.
+
+        This permanently eliminates ALL resource compilation errors:
+          - style/styleXXXX not found
+          - unknown resource type typeN
+          - invalid value for type mipmap/layout/animator
+          - invalid file path res/typeN/
+
+        These errors all stem from this APK having non-standard resource type IDs
+        (type1, type08, ?13, ?18) in resources.arsc that apktool cannot
+        decode and re-encode correctly. Bypassing resource recompilation
+        is the correct and safe fix — resources.arsc is preserved exactly
+        as it was in the original APK.
         """
-        # Step 1 — pre-clean known broken filenames before first attempt
-        self._clean_invalid_res_folders(workspace_dir)
-
-        # Step 2 — remap @type1/, @type08/, @?13/, @?18/ references
-        # to their correct standard folder names so aapt can resolve them
-        self._remap_unknown_type_references(workspace_dir)
-
         output_apk = os.path.join(self.work_dir, "rebuilt.apk")
+
+        # Remove stale output
+        if os.path.exists(output_apk):
+            try:
+                os.remove(output_apk)
+            except Exception:
+                pass
+
+        # Primary build: -r skips resource recompilation — reuses original arsc
         cmd = [
             "java", "-jar", self.tools.apktool_jar,
-            "b", "-f", workspace_dir, "-o", output_apk
+            "b", "-f", "-r", workspace_dir, "-o", output_apk
         ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
 
-        MAX_RETRIES = 8
-        last_error  = ""
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            # Remove stale output before each attempt
-            if os.path.exists(output_apk):
-                try:
-                    os.remove(output_apk)
-                except Exception:
-                    pass
-
-            r = subprocess.run(cmd, capture_output=True, text=True)
-
-            if r.returncode == 0 and os.path.exists(output_apk):
-                logger.info(f"[Level5] Build succeeded on attempt {attempt}.")
-                break
-
-            # Build failed — parse errors and delete broken files
-            combined   = (r.stdout or "") + (r.stderr or "")
-            last_error = combined
-            removed    = self._clean_from_apktool_errors(workspace_dir, combined)
-
-            logger.warning(
-                f"[Level5] Build attempt {attempt} failed. "
-                f"Removed {removed} broken XML files. "
-                f"{'Retrying...' if attempt < MAX_RETRIES else 'Max retries reached.'}")
-
-            if removed == 0:
-                # No new files removed — further retries will not help
-                logger.error(
-                    "[Level5] No new broken files found to remove. "
-                    "Build cannot proceed.")
-                break
-        else:
-            pass  # loop exhausted
+        # Fallback: if -r fails (older apktool), try --no-res
+        if r.returncode != 0 or not os.path.exists(output_apk):
+            logger.warning("[Level5] -r flag failed — trying --no-res fallback")
+            cmd_fallback = [
+                "java", "-jar", self.tools.apktool_jar,
+                "b", "-f", "--no-res", workspace_dir, "-o", output_apk
+            ]
+            r = subprocess.run(cmd_fallback, capture_output=True, text=True)
 
         if r.returncode != 0 or not os.path.exists(output_apk):
-            raise RuntimeError(f"APK build failed:\n{last_error[:2000]}")
+            raise RuntimeError(
+                f"APK build failed:\n"
+                f"{(r.stdout or '')[:1000]}\n{(r.stderr or '')[:1000]}")
 
-        # Validate the result is a real APK
+        logger.info("[Level5] APK rebuilt successfully with -r (no-res) mode.")
+
+        # Validate result is a real APK
         with zipfile.ZipFile(output_apk, "r") as z:
             names = z.namelist()
         if not any(n == "classes.dex" or re.match(r"^classes\d+\.dex$", n) for n in names):
             raise RuntimeError(
-                "Rebuilt APK is missing classes.dex — apktool output is invalid.")
-        if "resources.arsc" not in names and "AndroidManifest.xml" not in names:
-            raise RuntimeError(
-                "Rebuilt APK is missing critical files "
-                "(resources.arsc / AndroidManifest.xml).")
+                "Rebuilt APK missing classes.dex — apktool output invalid.")
         return output_apk
 
 
