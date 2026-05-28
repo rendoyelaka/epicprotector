@@ -5349,6 +5349,8 @@ class ManualControlEngine:
         ])
         # Apply Selected
         rows.append([InlineKeyboardButton("✅ Apply Selected", callback_data="mcp_apply")])
+        # Manual Smali Rename — tree browser
+        rows.append([InlineKeyboardButton("🌲 Manual Smali Rename", callback_data="smali_tree_open")])
         # Back
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_admin")])
 
