@@ -1466,137 +1466,134 @@ class Level5_APKBuilder:
     @staticmethod
     def _clean_invalid_res_folders(workspace_dir: str):
         """
-        Deep clean of all res/ artifacts that apktool 2.10.0 cannot compile back.
+        Remove ALL res/values-*/ XML files that apktool cannot compile back.
 
-        Removes:
-          1. res/typeN/ folders — unmapped resource bucket folders
-          2. Any values-*/ XML file that contains unresolvable resource references
-             — apktool decode creates these when it cannot map resource IDs back
-             to actual files. aapt/aapt2 then fails with:
-               "invalid value for type X. Expected a reference."
-             Affected files include: mipmaps.xml, layouts.xml, animators.xml,
-             and any other values-*/ XML that only contains cross-references
-             to missing resource files.
+        Strategy: delete by filename — these files are always broken on decode
+        because they reference resource types that do not exist as real files
+        in the workspace. Apktool creates them as decode artifacts only.
+        aapt/aapt2 rejects them at rebuild with "invalid value for type X".
 
-        Strategy for values-*/ XML files:
-          Parse every XML file in every values-*/ folder.
-          If ALL items in the file are unresolvable @type/name references
-          (i.e. the file only declares aliases to missing resources),
-          remove the entire file — it cannot be compiled and serves no purpose
-          in the rebuilt APK since the referenced resources do not exist.
+        Filenames that always fail:
+          mipmaps.xml   — references @mipmap/ adaptive icons not in workspace
+          layouts.xml   — references @layout/ files not in workspace
+          animators.xml — references @animator/ files not in workspace
+
+        Also removes res/typeN/ unmapped bucket folders.
         """
         res_dir = os.path.join(workspace_dir, "res")
         if not os.path.exists(res_dir):
             return
 
-        # ── Step 1: Remove res/typeN/ unmapped folders ────────────────────────
+        # Files that always fail to compile — delete from ALL values-*/ folders
+        BROKEN_FILENAMES = {
+            "mipmaps.xml",
+            "layouts.xml",
+            "animators.xml",
+            "drawables.xml",
+            "menus.xml",
+            "transitions.xml",
+            "navigations.xml",
+        }
+
+        removed = []
+
+        # Scan every values-*/ folder including plain values/
+        for folder in Path(res_dir).iterdir():
+            if not folder.is_dir():
+                continue
+            if folder.name != "values" and not folder.name.startswith("values-"):
+                continue
+            for filename in BROKEN_FILENAMES:
+                target = folder / filename
+                if target.exists():
+                    try:
+                        target.unlink()
+                        removed.append(f"{folder.name}/{filename}")
+                        logger.info(
+                            f"[Level5] Removed broken decode artifact: "
+                            f"{folder.name}/{filename}")
+                    except Exception as e:
+                        logger.warning(
+                            f"[Level5] Could not remove "
+                            f"{folder.name}/{filename}: {e}")
+
+        # Remove res/typeN/ unmapped bucket folders
         for item in Path(res_dir).iterdir():
             if item.is_dir() and re.match(r"^type[0-9a-fA-F]+$", item.name):
                 try:
                     shutil.rmtree(item)
-                    logger.info(f"[Level5] Removed unmapped res folder: {item.name}/")
-                except Exception as e:
-                    logger.warning(f"[Level5] Could not remove {item.name}/: {e}")
-
-        # ── Step 2: Scan all values-*/ XML files for broken references ────────
-        # These patterns match XML entries that are ONLY references to other
-        # resources — if the referenced resource does not exist in the workspace,
-        # aapt/aapt2 will fail with "invalid value for type X. Expected a reference."
-        BROKEN_ITEM_PATTERN = re.compile(
-            r"<item[^>]+>@[a-zA-Z]+/[^<]+</item>"
-        )
-
-        # Resource types known to cause compile failures when cross-referenced
-        PROBLEMATIC_TYPES = {
-            "mipmap", "layout", "animator", "drawable",
-            "menu", "transition", "xml", "navigation",
-        }
-
-        for values_dir in Path(res_dir).glob("values*"):
-            if not values_dir.is_dir():
-                continue
-            for xml_file in values_dir.glob("*.xml"):
-                try:
-                    text = xml_file.read_text(encoding="utf-8", errors="ignore")
-
-                    # Check if file contains any problematic type references
-                    has_problem = False
-                    for ptype in PROBLEMATIC_TYPES:
-                        # Match: <item type="mipmap">@mipmap/...</item>
-                        # or:    <item type="layout">@layout/...</item>
-                        type_dq = 'type="' + ptype + '"'
-                    type_sq = "type='" + ptype + "'"
-                    if (type_dq in text or type_sq in text):
-                            if f"@{ptype}/" in text or "@" in text:
-                                has_problem = True
-                                break
-
-                    if not has_problem:
-                        continue
-
-                    # Parse XML to check if ALL items are unresolvable references
-                    # If the file only contains cross-references, it is safe to remove
-                    import xml.etree.ElementTree as ET
-                    try:
-                        root = ET.fromstring(text)
-                    except ET.ParseError:
-                        # Malformed XML — remove it, apktool cannot compile it
-                        xml_file.unlink()
-                        logger.info(
-                            f"[Level5] Removed malformed XML: "
-                            f"{values_dir.name}/{xml_file.name}")
-                        continue
-
-                    items = list(root)
-                    if not items:
-                        continue
-
-                    # Count how many items are pure cross-references
-                    ref_count = 0
-                    for item in items:
-                        val = (item.text or "").strip()
-                        if val.startswith("@"):
-                            # Check if referenced resource folder exists in workspace
-                            ref_type = val.split("/")[0].lstrip("@")
-                            ref_folder = res_dir
-                            # Look for any folder starting with the ref_type name
-                            ref_exists = any(
-                                d.is_dir() and d.name.startswith(ref_type)
-                                for d in Path(res_dir).iterdir()
-                            )
-                            if not ref_exists:
-                                ref_count += 1
-
-                    # If ALL items reference missing resources — remove the file
-                    if items and ref_count == len(items):
-                        xml_file.unlink()
-                        logger.info(
-                            f"[Level5] Removed broken reference XML: "
-                            f"{values_dir.name}/{xml_file.name} "
-                            f"({ref_count} unresolvable references)")
-
+                    logger.info(
+                        f"[Level5] Removed unmapped res folder: {item.name}/")
                 except Exception as e:
                     logger.warning(
-                        f"[Level5] Could not process {xml_file.name}: {e}")
+                        f"[Level5] Could not remove {item.name}/: {e}")
+
+        if removed:
+            logger.info(
+                f"[Level5] Removed {len(removed)} broken decode artifacts "
+                f"before rebuild.")
+
+    @staticmethod
+    def _clean_from_apktool_errors(workspace_dir: str, error_output: str):
+        """
+        Parse apktool error output line by line.
+        Extract every file path that apktool reported as failed to compile.
+        Delete those exact files from the workspace.
+        This is the nuclear fallback — guaranteed to remove exactly what failed.
+        """
+        # Match lines like:
+        # W: /tmp/.../workspace/res/values-anydpi-v26/mipmaps.xml:3: error: ...
+        # W: /tmp/.../workspace/res/values-anydpi-v26/mipmaps.xml: error: file failed
+        path_pattern = re.compile(
+            r"W:\s+(/[^\s:]+\.xml)(?::\d+)?:\s+error:"
+        )
+        deleted = set()
+        for line in error_output.splitlines():
+            m = path_pattern.match(line.strip())
+            if m:
+                fpath = m.group(1)
+                if fpath not in deleted and os.path.exists(fpath):
+                    try:
+                        os.remove(fpath)
+                        deleted.add(fpath)
+                        logger.info(
+                            f"[Level5] Deleted failing file from apktool error: "
+                            f"{os.path.basename(os.path.dirname(fpath))}/"
+                            f"{os.path.basename(fpath)}")
+                    except Exception as e:
+                        logger.warning(
+                            f"[Level5] Could not delete {fpath}: {e}")
+        if deleted:
+            logger.info(
+                f"[Level5] Removed {len(deleted)} files that caused apktool errors. "
+                f"Retrying build.")
 
     def rebuild(self, workspace_dir) -> str:
-        # Clean invalid res folders before rebuild — apktool 2.10.0 rejects them
+        # Step 1 — clean before first attempt
         self._clean_invalid_res_folders(workspace_dir)
 
         output_apk = os.path.join(self.work_dir, "rebuilt.apk")
-        cmd = (
-            f"java -jar {self.tools.apktool_jar} b -f {workspace_dir} "
-            f"-o {output_apk} --use-aapt2"
-        )
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-        # If aapt2 fails, retry with legacy aapt (--use-aapt2 not supported on all envs)
+        # Step 2 — attempt 1: standard build
+        cmd = [
+            "java", "-jar", self.tools.apktool_jar,
+            "b", "-f", workspace_dir, "-o", output_apk
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+
+        # Step 3 — if failed, parse apktool error output to find remaining
+        #           broken XML files and delete them precisely, then retry
         if r.returncode != 0 or not os.path.exists(output_apk):
-            cmd_legacy = (
-                f"java -jar {self.tools.apktool_jar} b -f {workspace_dir} "
-                f"-o {output_apk}"
-            )
-            r = subprocess.run(cmd_legacy, shell=True, capture_output=True, text=True)
+            combined = (r.stderr or "") + (r.stdout or "")
+            self._clean_from_apktool_errors(workspace_dir, combined)
+
+            # Retry after targeted cleanup
+            if os.path.exists(output_apk):
+                try:
+                    os.remove(output_apk)
+                except Exception:
+                    pass
+            r = subprocess.run(cmd, capture_output=True, text=True)
 
         if r.returncode != 0 or not os.path.exists(output_apk):
             raise RuntimeError(f"APK build failed:\n{r.stderr}\n{r.stdout}")
