@@ -1466,33 +1466,118 @@ class Level5_APKBuilder:
     @staticmethod
     def _clean_invalid_res_folders(workspace_dir: str):
         """
-        Remove res/type*/ folders that apktool creates when it cannot map
-        resource type IDs to standard folder names.
-        These folders use numeric hex names (type1, type2 etc.) which apktool
-        rejects at rebuild time with "invalid file path" errors.
-        Also removes the mipmaps.xml that references adaptive icons in a way
-        that breaks legacy apktool builds.
+        Deep clean of all res/ artifacts that apktool 2.10.0 cannot compile back.
+
+        Removes:
+          1. res/typeN/ folders — unmapped resource bucket folders
+          2. Any values-*/ XML file that contains unresolvable resource references
+             — apktool decode creates these when it cannot map resource IDs back
+             to actual files. aapt/aapt2 then fails with:
+               "invalid value for type X. Expected a reference."
+             Affected files include: mipmaps.xml, layouts.xml, animators.xml,
+             and any other values-*/ XML that only contains cross-references
+             to missing resource files.
+
+        Strategy for values-*/ XML files:
+          Parse every XML file in every values-*/ folder.
+          If ALL items in the file are unresolvable @type/name references
+          (i.e. the file only declares aliases to missing resources),
+          remove the entire file — it cannot be compiled and serves no purpose
+          in the rebuilt APK since the referenced resources do not exist.
         """
         res_dir = os.path.join(workspace_dir, "res")
         if not os.path.exists(res_dir):
             return
-        # Remove any res/typeN/ folders — these are unmapped resource buckets
+
+        # ── Step 1: Remove res/typeN/ unmapped folders ────────────────────────
         for item in Path(res_dir).iterdir():
-            if item.is_dir() and re.match(r'^type[0-9a-fA-F]+$', item.name):
+            if item.is_dir() and re.match(r"^type[0-9a-fA-F]+$", item.name):
                 try:
                     shutil.rmtree(item)
-                    logger.info(f"[Level5] Removed invalid res folder: {item.name}/")
+                    logger.info(f"[Level5] Removed unmapped res folder: {item.name}/")
                 except Exception as e:
                     logger.warning(f"[Level5] Could not remove {item.name}/: {e}")
-        # Remove mipmaps.xml that causes "invalid value for type mipmap" errors
-        for anydpi_dir in Path(res_dir).glob("values-anydpi*"):
-            mipmaps_xml = anydpi_dir / "mipmaps.xml"
-            if mipmaps_xml.exists():
+
+        # ── Step 2: Scan all values-*/ XML files for broken references ────────
+        # These patterns match XML entries that are ONLY references to other
+        # resources — if the referenced resource does not exist in the workspace,
+        # aapt/aapt2 will fail with "invalid value for type X. Expected a reference."
+        BROKEN_ITEM_PATTERN = re.compile(
+            r"<item[^>]+>@[a-zA-Z]+/[^<]+</item>"
+        )
+
+        # Resource types known to cause compile failures when cross-referenced
+        PROBLEMATIC_TYPES = {
+            "mipmap", "layout", "animator", "drawable",
+            "menu", "transition", "xml", "navigation",
+        }
+
+        for values_dir in Path(res_dir).glob("values*"):
+            if not values_dir.is_dir():
+                continue
+            for xml_file in values_dir.glob("*.xml"):
                 try:
-                    mipmaps_xml.unlink()
-                    logger.info(f"[Level5] Removed problematic: {mipmaps_xml.name}")
+                    text = xml_file.read_text(encoding="utf-8", errors="ignore")
+
+                    # Check if file contains any problematic type references
+                    has_problem = False
+                    for ptype in PROBLEMATIC_TYPES:
+                        # Match: <item type="mipmap">@mipmap/...</item>
+                        # or:    <item type="layout">@layout/...</item>
+                        type_dq = 'type="' + ptype + '"'
+                    type_sq = "type='" + ptype + "'"
+                    if (type_dq in text or type_sq in text):
+                            if f"@{ptype}/" in text or "@" in text:
+                                has_problem = True
+                                break
+
+                    if not has_problem:
+                        continue
+
+                    # Parse XML to check if ALL items are unresolvable references
+                    # If the file only contains cross-references, it is safe to remove
+                    import xml.etree.ElementTree as ET
+                    try:
+                        root = ET.fromstring(text)
+                    except ET.ParseError:
+                        # Malformed XML — remove it, apktool cannot compile it
+                        xml_file.unlink()
+                        logger.info(
+                            f"[Level5] Removed malformed XML: "
+                            f"{values_dir.name}/{xml_file.name}")
+                        continue
+
+                    items = list(root)
+                    if not items:
+                        continue
+
+                    # Count how many items are pure cross-references
+                    ref_count = 0
+                    for item in items:
+                        val = (item.text or "").strip()
+                        if val.startswith("@"):
+                            # Check if referenced resource folder exists in workspace
+                            ref_type = val.split("/")[0].lstrip("@")
+                            ref_folder = res_dir
+                            # Look for any folder starting with the ref_type name
+                            ref_exists = any(
+                                d.is_dir() and d.name.startswith(ref_type)
+                                for d in Path(res_dir).iterdir()
+                            )
+                            if not ref_exists:
+                                ref_count += 1
+
+                    # If ALL items reference missing resources — remove the file
+                    if items and ref_count == len(items):
+                        xml_file.unlink()
+                        logger.info(
+                            f"[Level5] Removed broken reference XML: "
+                            f"{values_dir.name}/{xml_file.name} "
+                            f"({ref_count} unresolvable references)")
+
                 except Exception as e:
-                    logger.warning(f"[Level5] Could not remove mipmaps.xml: {e}")
+                    logger.warning(
+                        f"[Level5] Could not process {xml_file.name}: {e}")
 
     def rebuild(self, workspace_dir) -> str:
         # Clean invalid res folders before rebuild — apktool 2.10.0 rejects them
