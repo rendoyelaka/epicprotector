@@ -1695,27 +1695,48 @@ class Level5_APKBuilder:
                             f"[Level5] Could not delete {fpath}: {e}")
         return len(deleted)
 
-    def rebuild(self, workspace_dir) -> str:
+    def rebuild(self, workspace_dir, smali_modified: bool = True) -> str:
         """
         Build workspace back into APK.
 
-        Uses apktool -r (--no-res) flag — skips resource recompilation entirely.
-        The original resources.arsc is copied into the output APK unchanged.
-        Only smali folders are recompiled into classes.dex.
+        smali_modified=False: no smali changes — copy original DEX directly.
+        This completely bypasses apktool smali compilation and eliminates
+        ALL smali-related build failures for unmodified APKs (Phase 1 baseline).
 
-        This permanently eliminates ALL resource compilation errors:
-          - style/styleXXXX not found
-          - unknown resource type typeN
-          - invalid value for type mipmap/layout/animator
-          - invalid file path res/typeN/
-
-        These errors all stem from this APK having non-standard resource type IDs
-        (type1, type08, ?13, ?18) in resources.arsc that apktool cannot
-        decode and re-encode correctly. Bypassing resource recompilation
-        is the correct and safe fix — resources.arsc is preserved exactly
-        as it was in the original APK.
+        smali_modified=True: smali was changed — must recompile via apktool.
+        Uses apktool -r --api flags for correct compilation.
         """
         output_apk = os.path.join(self.work_dir, "rebuilt.apk")
+
+        # ── BYPASS MODE: no smali changes — copy stripped APK directly ────────
+        # When only Setup steps ran (Phase 1) — no smali modifications exist.
+        # The original DEX is still valid. Skip apktool entirely.
+        # Find the stripped APK and copy it as output — it already has the
+        # correct DEX, only needs signing.
+        if not smali_modified:
+            stripped_apk = os.path.join(self.work_dir, "input_stripped.apk")
+            if os.path.exists(stripped_apk):
+                try:
+                    import shutil as _shutil
+                    _shutil.copy2(stripped_apk, output_apk)
+                    logger.info(
+                        "[Level5] BYPASS MODE: smali unchanged — "
+                        "copied stripped APK directly (no apktool rebuild needed)")
+                    return output_apk
+                except Exception as e:
+                    logger.warning(
+                        f"[Level5] Bypass copy failed: {e} — "
+                        f"falling through to apktool rebuild")
+            else:
+                # Look for any input APK in work_dir
+                for candidate in ["base.apk", "input.apk"]:
+                    p = os.path.join(self.work_dir, candidate)
+                    if os.path.exists(p):
+                        import shutil as _shutil
+                        _shutil.copy2(p, output_apk)
+                        logger.info(
+                            f"[Level5] BYPASS MODE: used {candidate} directly")
+                        return output_apk
 
         # Remove stale output
         if os.path.exists(output_apk):
@@ -4847,6 +4868,16 @@ class ManualControlEngine:
         """
         result = {"op": op_key, "label": self.STEP_LABELS.get(op_key, op_key)}
 
+        # Track whether this step modifies smali — used by rebuild bypass logic
+        SMALI_MODIFYING_STEPS = {
+            "obfuscation", "safe_rename", "encryption", "security_guard",
+            "tamper_detection", "dex_repackaging", "manifest_hardening",
+            "proguard_hardening", "native_methods_obfuscation",
+            "dex_sourcefile_strip",
+        }
+        if op_key in SMALI_MODIFYING_STEPS:
+            result["smali_modified"] = True
+
         # Steps that require a decoded workspace — fail cleanly if not present
         NEEDS_WORKSPACE = {
             "compliance_scan", "manifest_hardening", "proguard_hardening",
@@ -5116,15 +5147,37 @@ class ManualControlEngine:
                         f"'{workspace}'. Decode Workspace step must run and "
                         f"succeed before Rebuild APK."
                     )
-                # Always use work_dir directly as the output parent —
-                # it is always the correct, pre-created job directory.
-                # os.path.dirname(workspace) would also equal work_dir, but
-                # using work_dir directly avoids any path edge-case.
                 os.makedirs(work_dir, exist_ok=True)
                 l5 = Level5_APKBuilder(tools, work_dir)
-                rebuilt = l5.rebuild(workspace)
-                result["rebuilt_apk"] = rebuilt
-                result["status"]      = "✅ APK rebuilt successfully"
+
+                # Detect whether any previous step modified smali.
+                # Steps that modify smali content require full apktool rebuild.
+                # Steps that only read (compliance scan) or modify only resources
+                # can use bypass mode — copy stripped APK directly, skip apktool.
+                SMALI_MODIFYING_OPS = {
+                    "obfuscation", "safe_rename", "encryption",
+                    "security_guard", "tamper_detection", "dex_repackaging",
+                    "manifest_hardening", "proguard_hardening",
+                    "native_methods_obfuscation", "dex_sourcefile_strip",
+                }
+                # Check done_steps from session if available
+                session_done = manual_done_steps.get(
+                    next(iter(manual_done_steps), None), set()
+                ) if manual_done_steps else set()
+                smali_was_modified = bool(
+                    session_done & SMALI_MODIFYING_OPS
+                )
+
+                rebuilt = l5.rebuild(workspace,
+                                     smali_modified=smali_was_modified)
+                result["rebuilt_apk"]     = rebuilt
+                result["bypass_used"]     = not smali_was_modified
+                result["status"] = (
+                    "✅ APK rebuilt — bypass mode (smali unchanged, "
+                    "original DEX preserved)"
+                    if not smali_was_modified else
+                    "✅ APK rebuilt via apktool — all smali changes compiled"
+                )
 
             elif op_key == "integrity_manifest":
                 guardian = IntegrityGuardian(work_dir)
