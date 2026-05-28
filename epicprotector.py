@@ -1526,19 +1526,42 @@ class Level5_APKBuilder:
                         logger.warning(
                             f"[Level5] Could not remove "
                             f"{folder.name}/{filename}: {e}")
-            # Delete typeN*.xml files — unknown resource type artifacts
+            # Rewrite typeN*.xml files — fix unknown type names to valid ones
+            # NEVER delete these — they contain style/animator definitions
+            # referenced by parent="@style/styleXXXX" in other XML files.
+            # Fix: replace type="type1" -> type="style", type="type08" -> type="style"
+            # so aapt can compile them as valid style declarations.
+            TYPE_REMAP = {
+                "type1":  "style",
+                "type08": "style",
+                "type2":  "style",
+                "type03": "attr",
+                "type04": "bool",
+                "type05": "color",
+                "type06": "dimen",
+            }
             for xml_file in folder.glob("*.xml"):
-                if TYPE_PATTERN.match(xml_file.name):
-                    try:
-                        xml_file.unlink()
-                        removed.append(f"{folder.name}/{xml_file.name}")
+                if not TYPE_PATTERN.match(xml_file.name):
+                    continue
+                try:
+                    original = xml_file.read_text(encoding="utf-8", errors="ignore")
+                    rewritten = original
+                    for bad_type, good_type in TYPE_REMAP.items():
+                        # Replace type="type1" and type='type1'
+                        rewritten = rewritten.replace(
+                            f'type="{bad_type}"', f'type="{good_type}"')
+                        rewritten = rewritten.replace(
+                            f"type='{bad_type}'", f"type='{good_type}'")
+                    if rewritten != original:
+                        xml_file.write_text(rewritten, encoding="utf-8")
+                        removed.append(f"{folder.name}/{xml_file.name} (rewritten)")
                         logger.info(
-                            f"[Level5] Removed unknown type artifact: "
+                            f"[Level5] Rewrote unknown type in: "
                             f"{folder.name}/{xml_file.name}")
-                    except Exception as e:
-                        logger.warning(
-                            f"[Level5] Could not remove "
-                            f"{folder.name}/{xml_file.name}: {e}")
+                except Exception as e:
+                    logger.warning(
+                        f"[Level5] Could not rewrite "
+                        f"{folder.name}/{xml_file.name}: {e}")
 
         # Remove res/typeN/ unmapped bucket folders
         for item in Path(res_dir).iterdir():
