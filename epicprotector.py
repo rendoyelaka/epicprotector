@@ -1899,13 +1899,15 @@ class Level6_Signer:
         cmd = (
             f"apksigner sign --ks {self.keystore} --ks-key-alias {self.alias} "
             f"--ks-pass pass:{self.sp} --key-pass pass:{self.kp} "
-            f"--out {out} {inp} 2>/dev/null"
+            f"--out {out} {inp}"
         )
-        r = subprocess.run(cmd, shell=True, capture_output=True)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         if r.returncode == 0 and os.path.exists(out):
             logger.info("[Level6] apksigner — signing complete.")
             return out
-        logger.warning(f"[Level6] apksigner failed — trying jarsigner fallback.")
+        logger.warning(
+            f"[Level6] apksigner failed (rc={r.returncode}) — "
+            f"stderr: {r.stderr.strip()[:200]} — trying jarsigner fallback.")
         return None
 
     def _sign_with_jarsigner(self, inp) -> str:
@@ -1921,12 +1923,14 @@ class Level6_Signer:
         signed_unaligned = os.path.join(self.work_dir, "signed_unaligned.apk")
         cmd = (
             f"jarsigner -keystore {self.keystore} -storepass {self.sp} "
-            f"-keypass {self.kp} -signedjar {signed_unaligned} {inp} {self.alias} 2>/dev/null"
+            f"-keypass {self.kp} -signedjar {signed_unaligned} {inp} {self.alias}"
         )
-        r = subprocess.run(cmd, shell=True, capture_output=True)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(signed_unaligned):
+            err = r.stderr.strip()[:300] if r.stderr else "no output"
             raise RuntimeError(
-                "Both apksigner and jarsigner failed — APK could not be signed."
+                f"Both apksigner and jarsigner failed — APK could not be signed. "
+                f"jarsigner error: {err}"
             )
         logger.info("[Level6] jarsigner — signing complete.")
 
@@ -4413,14 +4417,26 @@ class ManualControlEngine:
                 result["status"]          = "✅ AES-256 key generated — save this key securely"
 
             elif op_key == "keystore_generation":
-                # Keystore is generated in Level6_Signer — mark as ready
-                result["status"] = "✅ Fresh keystore will be generated at signing step"
+                # Keystore is always generated fresh inside Level6_Signer.prepare()
+                # at the sign_apk step — unique per build, destroyed after signing
+                result["status"] = "✅ Fresh keystore queued — generated at Sign APK step"
 
             elif op_key == "unique_fingerprint":
+                # Preview only — real identity is generated inside sign_apk
+                # by Level6_Signer.prepare() to ensure keystore is always fresh
                 gen      = EliteFingerprintGenerator()
                 identity = gen.generate(work_dir)
-                result["identity"] = identity
-                result["status"]   = f"✅ Unique identity: {identity.get('cn','')}"
+                # Immediately destroy this preview keystore — sign_apk generates its own
+                try:
+                    gen.destroy(identity.get("keystore_path",""))
+                except Exception:
+                    pass
+                result["status"] = (
+                    f"✅ Unique identity profile ready — "
+                    f"CN={identity.get('cn','')}, "
+                    f"O={identity.get('org','')}, "
+                    f"C={identity.get('country','')}"
+                )
 
             elif op_key == "zipalign":
                 result["status"] = "✅ zipalign will be applied at signing step"
@@ -4428,64 +4444,63 @@ class ManualControlEngine:
             elif op_key == "sign_apk":
                 l6 = Level6_Signer(work_dir)
                 # Determine which APK to sign.
-                # Priority 1: rebuilt.apk produced by rebuild_apk step in this job.
-                # Priority 2: search work_dir for rebuilt.apk by name.
-                # Never fall back to the stripped/input APK — signing a
-                # non-rebuilt APK always fails and produces an unusable output.
-                rebuilt_apk = None
+                # Priority 1: rebuilt.apk produced by rebuild_apk step this job.
+                # Priority 2: any .apk in work_dir that is not a stripped intermediate.
+                # Priority 3: the override APK passed from pipeline runner (base APK).
+                # This allows Sign APK to work even when Rebuild APK was not selected.
+                apk_to_sign = None
 
-                # Check the direct rebuilt.apk path first
+                # Priority 1 — rebuilt.apk in work_dir (direct path)
                 direct_rebuilt = os.path.join(work_dir, "rebuilt.apk")
                 if os.path.exists(direct_rebuilt):
-                    rebuilt_apk = direct_rebuilt
+                    apk_to_sign = direct_rebuilt
 
-                # If not found by direct path, use override from pipeline runner
-                if not rebuilt_apk:
-                    candidate = rebuilt_apk_override
-                    if candidate and os.path.exists(candidate):
-                        # Only accept it if it is NOT a stripped/input APK
-                        base = os.path.basename(candidate)
-                        if "stripped" not in base and "input" not in base:
-                            rebuilt_apk = candidate
-
-                # If still not found, search work_dir recursively for rebuilt.apk
-                if not rebuilt_apk:
+                # Priority 1b — search recursively for rebuilt.apk
+                if not apk_to_sign:
                     for found in list(Path(work_dir).rglob("rebuilt.apk")):
-                        rebuilt_apk = str(found)
+                        apk_to_sign = str(found)
                         break
 
-                # Validate the located APK is a genuine rebuilt output —
-                # must exist, be a valid ZIP, and contain at least one DEX file.
-                if not rebuilt_apk or not os.path.exists(rebuilt_apk):
+                # Priority 2 — override APK from pipeline runner
+                # This is current_apk which may be base APK or stripped APK
+                if not apk_to_sign:
+                    candidate = rebuilt_apk_override
+                    if candidate and os.path.exists(candidate):
+                        apk_to_sign = candidate
+
+                # Priority 3 — apk_path directly (original input)
+                if not apk_to_sign:
+                    if apk_path and os.path.exists(apk_path):
+                        apk_to_sign = apk_path
+
+                # Validate — must exist and be a valid ZIP with DEX
+                if not apk_to_sign or not os.path.exists(apk_to_sign):
                     raise RuntimeError(
-                        "Sign APK failed: no rebuilt APK found in job directory. "
-                        "The Rebuild APK step must run and succeed before Sign APK. "
-                        "Check the Rebuild APK error above for the root cause."
+                        "Sign APK: no APK found to sign. "
+                        "Ensure Base APK is loaded correctly."
                     )
+
                 try:
-                    with zipfile.ZipFile(rebuilt_apk, 'r') as _zf:
+                    with zipfile.ZipFile(apk_to_sign, "r") as _zf:
                         _names = _zf.namelist()
                     _has_dex = any(
-                        n == 'classes.dex' or re.match(r'^classes\d+\.dex$', n)
+                        n == "classes.dex" or re.match(r"^classes\d+\.dex$", n)
                         for n in _names
                     )
                     if not _has_dex:
                         raise RuntimeError(
-                            f"Sign APK failed: the APK at '{rebuilt_apk}' is "
-                            f"missing classes.dex — it is not a valid rebuilt APK. "
-                            f"The Rebuild APK step must complete successfully first."
+                            f"Sign APK: the APK is missing classes.dex "
+                            f"— not a valid APK."
                         )
                 except zipfile.BadZipFile:
                     raise RuntimeError(
-                        f"Sign APK failed: the file at '{rebuilt_apk}' is not a "
-                        f"valid APK (bad ZIP format). The Rebuild APK step must "
-                        f"complete successfully first."
+                        "Sign APK: APK file is not a valid ZIP/APK format."
                     )
 
-                sign_result = l6.prepare(rebuilt_apk)
+                sign_result = l6.prepare(apk_to_sign)
                 result["final_apk"]   = sign_result["output_apk"]
                 result["identity"]    = sign_result["identity"]
-                result["fingerprint"] = sign_result.get("fingerprint","")
+                result["fingerprint"] = sign_result.get("fingerprint", "")
                 result["status"]      = f"✅ Signed & zipaligned — {sign_result['signing_method']}"
 
             elif op_key == "protection_score":
