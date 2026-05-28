@@ -9516,6 +9516,18 @@ async def button_handler(update, context):
             manual_aes_key[user.id]   = aes_key
             start_time  = time.time()
             done_steps  = manual_done_steps.get(user.id, set())
+
+            # Always clear signing steps from done_steps for each phase run.
+            # This ensures every phase produces a fresh signed installable APK.
+            # Signing steps must always re-run — never skipped between phases.
+            ALWAYS_RERUN_STEPS = {
+                "rebuild_apk", "keystore_generation",
+                "unique_fingerprint", "zipalign",
+                "sign_apk", "protection_score",
+                "integrity_manifest", "aes_key_management",
+            }
+            done_steps -= ALWAYS_RERUN_STEPS
+
             tools       = ToolInstaller()
             tools.install_all()
             scanner     = ComplianceScannerEngine()
