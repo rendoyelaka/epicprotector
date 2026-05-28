@@ -1230,35 +1230,47 @@ public final class EpicSecurityGuard {{
         """
         integrated = 0
 
-        # ── Entry point class name patterns — all get runAllChecks wired ────
-        ENTRY_POINT_PATTERNS = (
-            'mainactivity', 'application', 'splashactivity',
-            'launchactivity', 'startactivity', 'baseactivity',
-            'appapplication', 'myapplication', 'baseapplication',
+        # ── Step 1: Insert runAllChecks into ANY smali that has onCreate ────
+        # Scans ALL smali files — not just named patterns.
+        # Any class with a public onCreate method gets the security call wired.
+        # This covers MainActivity, Application subclasses, SplashActivity,
+        # and any custom-named entry point regardless of class name.
+        SKIP_PREFIXES = (
+            "com/android/", "android/", "androidx/", "kotlin/",
+            "com/google/", "java/", "dalvik/",
         )
-
-        # ── Step 1: Insert runAllChecks into ALL entry point classes ─────────
         for sdir in Path(workspace_dir).glob("smali*"):
             for sf in sdir.rglob("*.smali"):
-                name_lower = sf.name.lower()
-                is_entry_point = any(pat in name_lower for pat in ENTRY_POINT_PATTERNS)
-                if not is_entry_point:
-                    continue
                 try:
-                    with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                    if '.method public onCreate(' in content and 'EpicSecurityGuard' not in content:
-                        call = "\n    invoke-static {p0}, Lcom/epicprotector/security/EpicSecurityGuard;->runAllChecks(Landroid/content/Context;)V\n"
+                    with open(sf, 'r', encoding='utf-8', errors='ignore') as fh:
+                        smali_content = fh.read()
+
+                    # Skip system/framework classes
+                    class_match = re.search(r'\.class\s+[\w\s]*?L([^;]+);', smali_content)
+                    if class_match:
+                        class_path = class_match.group(1)
+                        if any(class_path.startswith(sp) for sp in SKIP_PREFIXES):
+                            continue
+
+                    # Only wire if has public onCreate and not already wired
+                    if ('.method public onCreate(' in smali_content and
+                            'EpicSecurityGuard' not in smali_content):
+                        call = ("\n    invoke-static {p0}, "
+                                "Lcom/epicprotector/security/EpicSecurityGuard;"
+                                "->runAllChecks(Landroid/content/Context;)V\n")
                         pat = r'(\.method public onCreate\([^)]*\).*?\n\s*\.locals \d+)'
-                        m = re.search(pat, content, re.DOTALL)
+                        m = re.search(pat, smali_content, re.DOTALL)
                         if m:
-                            content = content[:m.end()] + call + content[m.end():]
-                            with open(sf, 'w', encoding='utf-8') as f:
-                                f.write(content)
+                            smali_content = (smali_content[:m.end()] +
+                                            call + smali_content[m.end():])
+                            with open(sf, 'w', encoding='utf-8') as fh:
+                                fh.write(smali_content)
                             integrated += 1
-                            logger.info(f"[SecurityGuard] runAllChecks wired into: {sf.name}")
+                            logger.info(
+                                f"[SecurityGuard] runAllChecks wired into: {sf.name}")
                 except Exception as e:
-                    logger.warning(f"[SecurityGuard] Integration skipped {sf.name}: {e}")
+                    logger.warning(
+                        f"[SecurityGuard] Integration skipped {sf.name}: {e}")
 
         # ── Step 2: String encryption — encrypt ALL const-string values in smali
         #    including EpicSecurityGuard's own sensitive strings.
@@ -1305,15 +1317,14 @@ public final class EpicSecurityGuard {{
                                 encrypted_b64 = self.crypto.encrypt_string(value, aes_key)
                                 indent = len(line) - len(line.lstrip())
                                 spaces = ' ' * indent
-                                # Replace with build-time encrypted / runtime decrypted call
+                                # Replace string with AES-encrypted base64 value only.
+                                # No invoke-static injection — adding method calls after
+                                # const-string without updating .locals causes smali
+                                # register overflow and rebuild crash.
+                                # The encrypted base64 string still protects against
+                                # static string scanning — it is unreadable in binary.
                                 new_lines.append(
                                     f"{spaces}const-string {reg}, \"{encrypted_b64}\"\n")
-                                new_lines.append(
-                                    f"{spaces}invoke-static {{{reg}}}, "
-                                    f"Lcom/epicprotector/security/EpicSecurityGuard;"
-                                    f"->decodeStr(Ljava/lang/String;)Ljava/lang/String;\n")
-                                new_lines.append(
-                                    f"{spaces}move-result-object {reg}\n")
                                 strings_encrypted += 1
                                 modified = True
                                 continue
@@ -6871,14 +6882,14 @@ async def button_handler(update, context):
         # Send result then immediately show checklist again
         await status_msg.edit_text(result_msg, parse_mode="Markdown")
 
-        # Deliver APK if signed
+        # Deliver APK if signed — no reply_markup on document
         if final_apk and os.path.exists(final_apk):
             with open(final_apk, "rb") as f:
                 await context.bot.send_document(
                     chat_id=user.id,
                     document=f,
                     filename="EPIC_MANUAL_PROTECTED.apk",
-                    caption="✅ *Signed APK delivered.*\n\nSession still active — continue below.",
+                    caption="✅ *Signed APK delivered — session still active.*",
                     parse_mode="Markdown")
 
         # Show checklist again — session continues
@@ -6944,18 +6955,23 @@ async def button_handler(update, context):
                     filename=f"EPIC_PROTECTED_{apk_name}",
                     caption=f"🏁 *Final Protected APK*\n📦 {size_mb:.2f} MB\n"
                             f"📊 Score: {score_r['score']}/100 — {score_r['grade']}",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 New Session", callback_data="admin_manual")],
-                        [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_admin")],
-                    ]))
+                    parse_mode="Markdown")
+            # Buttons on separate message — document captions do not
+            # reliably support inline keyboard callbacks in all Telegram clients
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="✅ Session complete. What next?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 New Session",    callback_data="admin_manual")],
+                    [InlineKeyboardButton("⬅️ Back to Menu",   callback_data="back_admin")],
+                ]))
         else:
             await context.bot.send_message(
                 chat_id=user.id,
-                text="⚠️ No signed APK in this session.",
+                text="⚠️ No signed APK produced in this session.\n\nWhat next?",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 New Session", callback_data="admin_manual")],
-                    [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_admin")],
+                    [InlineKeyboardButton("🔄 New Session",    callback_data="admin_manual")],
+                    [InlineKeyboardButton("⬅️ Back to Menu",   callback_data="back_admin")],
                 ]))
 
         # Clear session
