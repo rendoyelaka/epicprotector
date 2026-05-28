@@ -1724,26 +1724,59 @@ class Level5_APKBuilder:
             except Exception:
                 pass
 
-        # Primary build: -r skips resource recompilation — reuses original arsc
+        # Read targetSdkVersion from apktool.yml so smali compiler
+        # uses the correct instruction set for this APK
+        api_level = "30"  # default — matches TARGET_SDK of base.apk
+        apktool_yml = os.path.join(workspace_dir, "apktool.yml")
+        if os.path.exists(apktool_yml):
+            try:
+                with open(apktool_yml, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if "targetSdkVersion" in line:
+                            m = re.search(r"[0-9]+", line)
+                            if m:
+                                api_level = m.group(1)
+                                break
+            except Exception:
+                pass
+        logger.info(f"[Level5] Using API level: {api_level} for smali compilation")
+
+        # Primary build: -r skips resource recompilation + -api sets correct
+        # smali instruction set — prevents "Smaling smali f..." crash
         cmd = [
             "java", "-jar", self.tools.apktool_jar,
-            "b", "-f", "-r", workspace_dir, "-o", output_apk
+            "b", "-f", "-r",
+            "--api", api_level,
+            workspace_dir, "-o", output_apk
         ]
         r = subprocess.run(cmd, capture_output=True, text=True)
 
-        # Fallback: if -r fails (older apktool), try --no-res
+        # Fallback 1: --no-res instead of -r (older apktool versions)
         if r.returncode != 0 or not os.path.exists(output_apk):
-            logger.warning("[Level5] -r flag failed — trying --no-res fallback")
+            logger.warning("[Level5] Primary build failed — trying --no-res fallback")
             cmd_fallback = [
                 "java", "-jar", self.tools.apktool_jar,
-                "b", "-f", "--no-res", workspace_dir, "-o", output_apk
+                "b", "-f", "--no-res",
+                "--api", api_level,
+                workspace_dir, "-o", output_apk
             ]
             r = subprocess.run(cmd_fallback, capture_output=True, text=True)
+
+        # Fallback 2: without -r (full rebuild) + correct API level
+        if r.returncode != 0 or not os.path.exists(output_apk):
+            logger.warning("[Level5] no-res fallback failed — trying full rebuild")
+            cmd_full = [
+                "java", "-jar", self.tools.apktool_jar,
+                "b", "-f",
+                "--api", api_level,
+                workspace_dir, "-o", output_apk
+            ]
+            r = subprocess.run(cmd_full, capture_output=True, text=True)
 
         if r.returncode != 0 or not os.path.exists(output_apk):
             raise RuntimeError(
                 f"APK build failed:\n"
-                f"{(r.stdout or '')[:1000]}\n{(r.stderr or '')[:1000]}")
+                f"{(r.stdout or '')[:2000]}\n{(r.stderr or '')[:500]}")
 
         logger.info("[Level5] APK rebuilt successfully with -r (no-res) mode.")
 
