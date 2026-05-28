@@ -1735,16 +1735,17 @@ class EliteFingerprintGenerator:
     def _gen_password(self) -> str:
         """
         Generate a structured human-looking password.
-        Format: Word + digits + symbol + Word + digits
-        Example: Cipher847#Atlas293
-        Never purely random — looks human-created.
+        Format: Word + digits + Word + digits
+        Example: Cipher847Atlas293
+        Avoids all special shell characters (#, @, !, $, %, &) that
+        some JDK versions misparse even in list-args mode.
+        Uses only alphanumeric — fully safe for keytool, jarsigner, apksigner.
         """
-        w1     = random.choice(self.PASS_WORDS)
-        w2     = random.choice([w for w in self.PASS_WORDS if w != w1])
-        n1     = random.randint(100, 999)
-        n2     = random.randint(100, 999)
-        symbol = random.choice(["#", "@", "!", "$"])
-        return f"{w1}{n1}{symbol}{w2}{n2}"
+        w1 = random.choice(self.PASS_WORDS)
+        w2 = random.choice([w for w in self.PASS_WORDS if w != w1])
+        n1 = random.randint(1000, 9999)
+        n2 = random.randint(1000, 9999)
+        return f"{w1}{n1}{w2}{n2}"
 
     def _gen_alphanumeric(self, length: int) -> str:
         """Generate a purely alphanumeric random string."""
@@ -1799,20 +1800,38 @@ class EliteFingerprintGenerator:
         ks_path     = os.path.join(work_dir, ks_filename)
 
         # ── Generate keystore using keytool ──────────────────────────────────
-        cmd = (
-            f'keytool -genkeypair -v '
-            f'-keystore "{ks_path}" '
-            f'-alias "{alias}" '
-            f'-keyalg RSA '
-            f'-keysize 2048 '
-            f'-validity {validity} '
-            f'-storepass "{ks_pass}" '
-            f'-keypass "{key_pass}" '
-            f'-dname "{dname}" '
-            f'2>/dev/null'
-        )
+        # Use list args — NO shell=True — prevents shell from interpreting
+        # special characters in passwords ($, #, @, !) or breaking dname
+        cmd = [
+            "keytool", "-genkeypair", "-v",
+            "-keystore",  ks_path,
+            "-alias",     alias,
+            "-keyalg",    "RSA",
+            "-keysize",   "2048",
+            "-validity",  str(validity),
+            "-storepass", ks_pass,
+            "-keypass",   key_pass,
+            "-dname",     dname,
+            "-storetype", "JKS",
+        ]
 
-        result = subprocess.run(cmd, shell=True, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True)
+
+        if result.returncode != 0 or not os.path.exists(ks_path):
+            # Retry with PKCS12 storetype — some JDK versions prefer it
+            cmd_p12 = [
+                "keytool", "-genkeypair", "-v",
+                "-keystore",  ks_path,
+                "-alias",     alias,
+                "-keyalg",    "RSA",
+                "-keysize",   "2048",
+                "-validity",  str(validity),
+                "-storepass", ks_pass,
+                "-keypass",   key_pass,
+                "-dname",     dname,
+                "-storetype", "PKCS12",
+            ]
+            result = subprocess.run(cmd_p12, capture_output=True)
 
         if result.returncode != 0 or not os.path.exists(ks_path):
             raise RuntimeError(
@@ -1847,14 +1866,13 @@ class EliteFingerprintGenerator:
         Extract SHA-256 fingerprint from generated keystore.
         Returns fingerprint string or empty string on failure.
         """
-        cmd = (
-            f'keytool -list -v '
-            f'-keystore "{ks_path}" '
-            f'-alias "{alias}" '
-            f'-storepass "{ks_pass}" '
-            f'2>/dev/null'
-        )
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        cmd = [
+            "keytool", "-list", "-v",
+            "-keystore",  ks_path,
+            "-alias",     alias,
+            "-storepass", ks_pass,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
         for line in r.stdout.splitlines():
             if "SHA256:" in line or "SHA-256" in line:
                 return line.strip()
