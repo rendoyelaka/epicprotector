@@ -3853,6 +3853,10 @@ class APKSizeOptimizer:
         removed_files = 0
         saved_bytes   = 0
 
+        if not workspace or not os.path.isdir(workspace):
+            return {"removed_files": 0, "saved_kb": "0.0 KB",
+                    "status": "⚠️ Skipped — no workspace"}
+
         # Remove files matching removable patterns
         for pattern in self.REMOVABLE_PATTERNS:
             for f in Path(workspace).rglob(pattern):
@@ -4574,6 +4578,22 @@ class ManualControlEngine:
         Returns result dict with status and details.
         """
         result = {"op": op_key, "label": self.STEP_LABELS.get(op_key, op_key)}
+
+        # Steps that require a decoded workspace — fail cleanly if not present
+        NEEDS_WORKSPACE = {
+            "compliance_scan", "manifest_hardening", "proguard_hardening",
+            "safe_rename", "obfuscation", "security_guard", "tamper_detection",
+            "encryption", "dex_repackaging", "metadata_stripping",
+            "apk_size_optimizer", "rebuild_apk", "string_splitting",
+        }
+        if op_key in NEEDS_WORKSPACE:
+            if not workspace or not os.path.isdir(workspace):
+                result["status"] = (
+                    f"⚠️ Skipped — Decode Workspace must run first. "
+                    f"Select Decode → Workspace and rerun."
+                )
+                result["skipped"] = True
+                return result
 
         try:
             if op_key == "preflight_validation":
