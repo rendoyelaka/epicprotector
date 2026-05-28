@@ -1485,6 +1485,8 @@ class Level5_APKBuilder:
             return
 
         # Files that always fail to compile — delete from ALL values-*/ folders
+        # Also matches typeNs.xml and xmls.xml — apktool decode artifacts
+        # for unknown resource types that aapt cannot compile.
         BROKEN_FILENAMES = {
             "mipmaps.xml",
             "layouts.xml",
@@ -1493,7 +1495,12 @@ class Level5_APKBuilder:
             "menus.xml",
             "transitions.xml",
             "navigations.xml",
+            "xmls.xml",
         }
+        # Also delete any file matching typeN*.xml pattern (type1s.xml, type08s.xml etc.)
+        # Matches: type1s.xml, type08s.xml, ?13s.xml, ?18s.xml
+        # — all unknown resource type decode artifacts
+        TYPE_PATTERN = re.compile(r"^(?:type[0-9a-fA-F]+|\?\d+)s?\.xml$")
 
         removed = []
 
@@ -1503,6 +1510,7 @@ class Level5_APKBuilder:
                 continue
             if folder.name != "values" and not folder.name.startswith("values-"):
                 continue
+            # Delete known broken filenames
             for filename in BROKEN_FILENAMES:
                 target = folder / filename
                 if target.exists():
@@ -1516,6 +1524,19 @@ class Level5_APKBuilder:
                         logger.warning(
                             f"[Level5] Could not remove "
                             f"{folder.name}/{filename}: {e}")
+            # Delete typeN*.xml files — unknown resource type artifacts
+            for xml_file in folder.glob("*.xml"):
+                if TYPE_PATTERN.match(xml_file.name):
+                    try:
+                        xml_file.unlink()
+                        removed.append(f"{folder.name}/{xml_file.name}")
+                        logger.info(
+                            f"[Level5] Removed unknown type artifact: "
+                            f"{folder.name}/{xml_file.name}")
+                    except Exception as e:
+                        logger.warning(
+                            f"[Level5] Could not remove "
+                            f"{folder.name}/{xml_file.name}: {e}")
 
         # Remove res/typeN/ unmapped bucket folders
         for item in Path(res_dir).iterdir():
@@ -1534,22 +1555,95 @@ class Level5_APKBuilder:
                 f"before rebuild.")
 
     @staticmethod
-    def _clean_from_apktool_errors(workspace_dir: str, error_output: str):
+    def _remap_unknown_type_references(workspace_dir: str):
+        """
+        After apktool decode, fix cross-references to unknown resource types.
+
+        This APK has non-standard resource type IDs in its resources.arsc:
+          type1  (0x02) — apktool decodes these files into res/animator/
+          type08 (0x08) — apktool decodes these files into res/animator/
+          ?13    (0x0D) — no standard folder mapping
+          ?18    (0x12) — no standard folder mapping
+
+        Style XML files and other resources reference them as:
+          @type1/anim000d, @type08/something, @?13/something
+
+        But after decode the actual files live in res/animator/ or
+        their standard folder. We must rewrite all @typeN/ and @?N/
+        references to point to the correct standard folder.
+
+        Mapping (derived from resources.arsc type string pool):
+          @type1/   → @animator/
+          @type08/  → @animator/
+          @?13/     → removed (empty type, no files)
+          @?18/     → removed (empty type, no files)
+        """
+        REMAP = {
+            "@type1/":  "@animator/",
+            "@type08/": "@animator/",
+        }
+        # Unknown types with no file mapping — replace with @null
+        REMOVE = {"@?13/", "@?18/"}
+
+        fixed_files = 0
+        fixed_refs  = 0
+
+        for root, dirs, files in os.walk(workspace_dir):
+            for fname in files:
+                if not fname.endswith(".xml"):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                        original = f.read()
+
+                    updated = original
+                    for old_ref, new_ref in REMAP.items():
+                        if old_ref in updated:
+                            count   = updated.count(old_ref)
+                            updated = updated.replace(old_ref, new_ref)
+                            fixed_refs += count
+                    for bad_ref in REMOVE:
+                        if bad_ref in updated:
+                            # Replace @?13/something with @null
+                            # Use a character class that avoids quote conflicts
+                            pat_str = re.escape(bad_ref) + "[^ \t\n<>]+"
+                            pattern = re.compile(pat_str)
+                            count   = len(pattern.findall(updated))
+                            updated = pattern.sub("@null", updated)
+                            fixed_refs += count
+
+                    if updated != original:
+                        with open(fpath, "w", encoding="utf-8") as f:
+                            f.write(updated)
+                        fixed_files += 1
+                except Exception as e:
+                    logger.warning(
+                        f"[Level5] Could not remap references in {fname}: {e}")
+
+        if fixed_refs > 0:
+            logger.info(
+                f"[Level5] Remapped {fixed_refs} unknown type references "
+                f"across {fixed_files} XML files.")
+
+    @staticmethod
+    def _clean_from_apktool_errors(workspace_dir: str, error_output: str) -> int:
         """
         Parse apktool error output line by line.
-        Extract every file path that apktool reported as failed to compile.
+        Extract every file path reported as failed to compile.
         Delete those exact files from the workspace.
-        This is the nuclear fallback — guaranteed to remove exactly what failed.
+        Returns count of files deleted — caller uses this to decide
+        whether to retry (0 deleted = no point retrying).
         """
-        # Match lines like:
-        # W: /tmp/.../workspace/res/values-anydpi-v26/mipmaps.xml:3: error: ...
-        # W: /tmp/.../workspace/res/values-anydpi-v26/mipmaps.xml: error: file failed
         path_pattern = re.compile(
             r"W:\s+(/[^\s:]+\.xml)(?::\d+)?:\s+error:"
         )
         deleted = set()
         for line in error_output.splitlines():
             m = path_pattern.match(line.strip())
+            if not m:
+                # Also try search() in case of leading whitespace variation
+                m = path_pattern.search(line)
             if m:
                 fpath = m.group(1)
                 if fpath not in deleted and os.path.exists(fpath):
@@ -1557,48 +1651,75 @@ class Level5_APKBuilder:
                         os.remove(fpath)
                         deleted.add(fpath)
                         logger.info(
-                            f"[Level5] Deleted failing file from apktool error: "
+                            f"[Level5] Removed broken XML: "
                             f"{os.path.basename(os.path.dirname(fpath))}/"
                             f"{os.path.basename(fpath)}")
                     except Exception as e:
                         logger.warning(
                             f"[Level5] Could not delete {fpath}: {e}")
-        if deleted:
-            logger.info(
-                f"[Level5] Removed {len(deleted)} files that caused apktool errors. "
-                f"Retrying build.")
+        return len(deleted)
 
     def rebuild(self, workspace_dir) -> str:
-        # Step 1 — clean before first attempt
+        """
+        Build workspace back into APK.
+        Uses a retry loop — apktool reports broken XML files in batches
+        and stops early. Each iteration deletes what failed and retries
+        until either the build succeeds or no new files are removed.
+        Max 8 iterations — covers even heavily fragmented decode artifacts.
+        """
+        # Step 1 — pre-clean known broken filenames before first attempt
         self._clean_invalid_res_folders(workspace_dir)
 
-        output_apk = os.path.join(self.work_dir, "rebuilt.apk")
+        # Step 2 — remap @type1/, @type08/, @?13/, @?18/ references
+        # to their correct standard folder names so aapt can resolve them
+        self._remap_unknown_type_references(workspace_dir)
 
-        # Step 2 — attempt 1: standard build
+        output_apk = os.path.join(self.work_dir, "rebuilt.apk")
         cmd = [
             "java", "-jar", self.tools.apktool_jar,
             "b", "-f", workspace_dir, "-o", output_apk
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
 
-        # Step 3 — if failed, parse apktool error output to find remaining
-        #           broken XML files and delete them precisely, then retry
-        if r.returncode != 0 or not os.path.exists(output_apk):
-            combined = (r.stderr or "") + (r.stdout or "")
-            self._clean_from_apktool_errors(workspace_dir, combined)
+        MAX_RETRIES = 8
+        last_error  = ""
 
-            # Retry after targeted cleanup
+        for attempt in range(1, MAX_RETRIES + 1):
+            # Remove stale output before each attempt
             if os.path.exists(output_apk):
                 try:
                     os.remove(output_apk)
                 except Exception:
                     pass
+
             r = subprocess.run(cmd, capture_output=True, text=True)
 
-        if r.returncode != 0 or not os.path.exists(output_apk):
-            raise RuntimeError(f"APK build failed:\n{r.stderr}\n{r.stdout}")
+            if r.returncode == 0 and os.path.exists(output_apk):
+                logger.info(f"[Level5] Build succeeded on attempt {attempt}.")
+                break
 
-        # Validate the result is a real APK (has classes.dex at root)
+            # Build failed — parse errors and delete broken files
+            combined   = (r.stdout or "") + (r.stderr or "")
+            last_error = combined
+            removed    = self._clean_from_apktool_errors(workspace_dir, combined)
+
+            logger.warning(
+                f"[Level5] Build attempt {attempt} failed. "
+                f"Removed {removed} broken XML files. "
+                f"{'Retrying...' if attempt < MAX_RETRIES else 'Max retries reached.'}")
+
+            if removed == 0:
+                # No new files removed — further retries will not help
+                logger.error(
+                    "[Level5] No new broken files found to remove. "
+                    "Build cannot proceed.")
+                break
+        else:
+            pass  # loop exhausted
+
+        if r.returncode != 0 or not os.path.exists(output_apk):
+            raise RuntimeError(f"APK build failed:\n{last_error[:2000]}")
+
+        # Validate the result is a real APK
         with zipfile.ZipFile(output_apk, "r") as z:
             names = z.namelist()
         if not any(n == "classes.dex" or re.match(r"^classes\d+\.dex$", n) for n in names):
@@ -1606,7 +1727,8 @@ class Level5_APKBuilder:
                 "Rebuilt APK is missing classes.dex — apktool output is invalid.")
         if "resources.arsc" not in names and "AndroidManifest.xml" not in names:
             raise RuntimeError(
-                "Rebuilt APK is missing critical files (resources.arsc / AndroidManifest.xml).")
+                "Rebuilt APK is missing critical files "
+                "(resources.arsc / AndroidManifest.xml).")
         return output_apk
 
 
