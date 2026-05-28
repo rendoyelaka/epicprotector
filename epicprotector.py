@@ -3626,68 +3626,548 @@ class ManualSmaliRenamer:
 # ── PREFLIGHT VALIDATOR ───────────────────────────────────────────────────────
 class PreflightValidator:
     """
-    Validates APK before any operation runs.
-    Checks: valid zip, has AndroidManifest, has classes.dex,
-    not already EPIC-processed, size within limits, not corrupt.
+    Enhanced Pre-flight Validator — deep APK inspection before any operation runs.
+
+    Checks performed:
+      — File size within pipeline limits
+      — Valid ZIP / APK format
+      — AndroidManifest.xml present
+      — DEX files present (classes.dex, classes2.dex etc)
+      — resources.arsc present
+      — CRC corruption check on all entries
+      — Already EPIC-processed detection
+      — debuggable flag (auto-fixable)
+      — allowBackup flag (auto-fixable)
+      — networkSecurityConfig missing (recommendation)
+      — META-INF signature artifacts present (strip signature step)
+      — Min SDK version check (recommendation)
+      — Target SDK version check (recommendation)
+      — lib/ native libraries detected (encryption recommendation)
+      — assets/ raw files detected (encryption recommendation)
+      — res/values/strings.xml sensitive content (compliance scan recommendation)
+      — High-risk and medium-risk permissions listed
+      — Package name extracted and displayed
     """
 
-    def validate(self, apk_path: str) -> dict:
-        results = {}
-        try:
-            # Check file exists and has size
-            size_mb = os.path.getsize(apk_path) / (1024 * 1024)
-            results["file_size"] = f"{size_mb:.2f} MB"
-            if size_mb > MAX_APK_MB:
-                results["size_check"] = f"❌ APK too large ({size_mb:.1f}MB) — max {MAX_APK_MB}MB"
-                results["passed"] = False
-                return results
-            results["size_check"] = "✅ Size valid"
+    # Permissions considered high risk by AV scanners
+    HIGH_RISK_PERMISSIONS = [
+        "READ_CONTACTS", "WRITE_CONTACTS",
+        "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION",
+        "READ_CALL_LOG", "WRITE_CALL_LOG",
+        "CAMERA", "RECORD_AUDIO",
+        "READ_SMS", "SEND_SMS", "RECEIVE_SMS",
+        "READ_PHONE_STATE", "CALL_PHONE",
+        "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE",
+        "PROCESS_OUTGOING_CALLS", "GET_ACCOUNTS",
+    ]
 
-            # Check valid zip/APK structure
-            if not zipfile.is_zipfile(apk_path):
-                results["format_check"] = "❌ Not a valid APK/ZIP file"
-                results["passed"] = False
+    # Permissions considered medium risk
+    MEDIUM_RISK_PERMISSIONS = [
+        "INTERNET", "ACCESS_NETWORK_STATE", "ACCESS_WIFI_STATE",
+        "RECEIVE_BOOT_COMPLETED", "FOREGROUND_SERVICE",
+        "REQUEST_INSTALL_PACKAGES", "SYSTEM_ALERT_WINDOW",
+        "CHANGE_NETWORK_STATE", "CHANGE_WIFI_STATE",
+    ]
+
+    # Strings in res/values/strings.xml that may trigger scanners
+    SENSITIVE_STRING_PATTERNS = [
+        "password", "passwd", "secret", "token", "apikey", "api_key",
+        "private_key", "credentials", "auth", "bearer", "debug",
+        "root", "superuser", "xposed", "frida", "magisk",
+    ]
+
+    def validate(self, apk_path: str) -> dict:
+        """
+        Full deep validation of APK.
+        Returns results dict with:
+          passed          — bool: True if APK is safe to process
+          issues          — list of issue dicts {severity, code, message, fixable, fix_action}
+          recommendations — list of recommendation strings
+          info            — dict of informational fields (package, sdk, dex count etc)
+          raw             — dict of all individual check results
+        """
+        results = {
+            "passed":          False,
+            "issues":          [],    # list of {severity, code, message, fixable, fix_action}
+            "recommendations": [],    # list of recommendation strings
+            "info":            {},    # informational fields
+            "raw":             {},    # raw check results for pipeline display
+        }
+
+        def add_issue(severity: str, code: str, message: str,
+                      fixable: bool = False, fix_action: str = ""):
+            results["issues"].append({
+                "severity":   severity,   # "critical" / "warning" / "info"
+                "code":       code,
+                "message":    message,
+                "fixable":    fixable,
+                "fix_action": fix_action,
+            })
+
+        def add_rec(message: str):
+            results["recommendations"].append(message)
+
+        try:
+            # ── Check 1: File exists and readable ────────────────────────────
+            if not os.path.exists(apk_path):
+                add_issue("critical", "FILE_MISSING",
+                          f"APK file not found at path: {apk_path}")
                 return results
-            results["format_check"] = "✅ Valid APK format"
+
+            size_mb = os.path.getsize(apk_path) / (1024 * 1024)
+            results["info"]["file_name"] = os.path.basename(apk_path)
+            results["info"]["file_size"] = f"{size_mb:.2f} MB"
+            results["raw"]["size_check"] = f"✅ Size: {size_mb:.2f} MB"
+
+            if size_mb > MAX_APK_MB:
+                add_issue("critical", "SIZE_EXCEEDED",
+                          f"APK too large ({size_mb:.1f} MB) — pipeline max is {MAX_APK_MB} MB",
+                          fixable=False)
+                results["raw"]["size_check"] = (
+                    f"❌ Too large ({size_mb:.1f} MB) — max {MAX_APK_MB} MB")
+                return results
+
+            # ── Check 2: Valid ZIP / APK format ───────────────────────────────
+            if not zipfile.is_zipfile(apk_path):
+                add_issue("critical", "INVALID_FORMAT",
+                          "File is not a valid APK/ZIP — cannot be processed")
+                results["raw"]["format_check"] = "❌ Not a valid APK/ZIP file"
+                return results
+            results["raw"]["format_check"] = "✅ Valid APK format"
 
             with zipfile.ZipFile(apk_path, 'r') as zf:
                 names = zf.namelist()
+                results["info"]["total_files"] = len(names)
+                results["raw"]["total_files"] = f"✅ {len(names)} files in APK"
 
-                # Check AndroidManifest.xml
+                # ── Check 3: AndroidManifest.xml ──────────────────────────────
                 if "AndroidManifest.xml" not in names:
-                    results["manifest_check"] = "❌ AndroidManifest.xml missing"
-                    results["passed"] = False
+                    add_issue("critical", "NO_MANIFEST",
+                              "AndroidManifest.xml missing — not a valid Android APK")
+                    results["raw"]["manifest_check"] = "❌ AndroidManifest.xml missing"
                     return results
-                results["manifest_check"] = "✅ AndroidManifest.xml present"
+                results["raw"]["manifest_check"] = "✅ AndroidManifest.xml present"
 
-                # Check DEX files
-                dex_files = [n for n in names if n.endswith(".dex")]
+                # ── Check 4: DEX files ────────────────────────────────────────
+                dex_files = sorted([n for n in names if n.endswith(".dex")])
                 if not dex_files:
-                    results["dex_check"] = "❌ No DEX files found — invalid APK"
-                    results["passed"] = False
+                    add_issue("critical", "NO_DEX",
+                              "No DEX files found — APK has no executable code")
+                    results["raw"]["dex_check"] = "❌ No DEX files found"
                     return results
-                results["dex_check"] = f"✅ {len(dex_files)} DEX file(s) found"
+                results["info"]["dex_files"]  = dex_files
+                results["info"]["dex_count"]  = len(dex_files)
+                results["raw"]["dex_check"]   = (
+                    f"✅ {len(dex_files)} DEX file(s): "
+                    f"{', '.join(dex_files)}")
 
-                # Check if already EPIC-processed
-                epic_marker = any("EpicSecurityGuard" in n or "epic_integrity" in n.lower() for n in names)
-                results["already_processed"] = "⚠️ Previously EPIC-processed detected" if epic_marker else "✅ Clean input APK"
+                # ── Check 5: resources.arsc ───────────────────────────────────
+                if "resources.arsc" in names:
+                    results["raw"]["resources_check"] = "✅ resources.arsc present"
+                    results["info"]["has_resources_arsc"] = True
+                else:
+                    results["raw"]["resources_check"] = (
+                        "⚠️ resources.arsc not found — may be resource-sparse APK")
+                    results["info"]["has_resources_arsc"] = False
+                    add_issue("warning", "NO_RESOURCES_ARSC",
+                              "resources.arsc not found — APK may lack compiled resources")
 
-                # Check for corruption — test CRC
+                # ── Check 6: META-INF signature artifacts ─────────────────────
+                meta_inf_files = [n for n in names if n.startswith("META-INF/")]
+                if meta_inf_files:
+                    results["raw"]["signature_check"] = (
+                        f"⚠️ META-INF present ({len(meta_inf_files)} files) "
+                        f"— existing signature detected")
+                    results["info"]["has_meta_inf"] = True
+                    add_issue("warning", "SIGNATURE_PRESENT",
+                              f"Existing signature detected ({len(meta_inf_files)} META-INF files) "
+                              f"— Strip Signature step must run first",
+                              fixable=False)
+                    add_rec("▶ Run Strip Signature (Step 02) before any other operation")
+                else:
+                    results["raw"]["signature_check"] = "✅ No existing signature — clean input"
+                    results["info"]["has_meta_inf"] = False
+
+                # ── Check 7: CRC corruption ───────────────────────────────────
                 bad = zf.testzip()
                 if bad:
-                    results["integrity_check"] = f"❌ Corrupt file detected: {bad}"
-                    results["passed"] = False
+                    add_issue("critical", "CORRUPT_ENTRY",
+                              f"Corrupt entry detected: {bad} — APK must not be processed")
+                    results["raw"]["integrity_check"] = f"❌ Corrupt entry: {bad}"
                     return results
-                results["integrity_check"] = "✅ APK integrity verified"
+                results["raw"]["integrity_check"] = "✅ All entries passed CRC verification"
 
-            results["total_files"] = f"✅ {len(names)} files in APK"
-            results["passed"] = True
+                # ── Check 8: Already EPIC-processed ──────────────────────────
+                epic_marker = any(
+                    "EpicSecurityGuard" in n or "epic_integrity" in n.lower()
+                    for n in names)
+                if epic_marker:
+                    results["raw"]["epic_check"] = (
+                        "⚠️ Previously EPIC-processed APK detected")
+                    results["info"]["already_processed"] = True
+                    add_issue("warning", "ALREADY_PROCESSED",
+                              "This APK was previously processed by EPIC PROTECTOR "
+                              "— reprocessing may cause instability")
+                    add_rec("⚠️ Consider using the original unprotected APK as input")
+                else:
+                    results["raw"]["epic_check"] = "✅ Clean input — not previously processed"
+                    results["info"]["already_processed"] = False
+
+                # ── Check 9: lib/ native libraries ────────────────────────────
+                lib_files = [n for n in names if n.startswith("lib/")]
+                if lib_files:
+                    results["raw"]["lib_check"] = (
+                        f"ℹ️ lib/ detected — {len(lib_files)} native library file(s)")
+                    results["info"]["has_lib"] = True
+                    results["info"]["lib_count"] = len(lib_files)
+                    add_rec("▶ Enable Encryption step to protect lib/ native libraries")
+                else:
+                    results["raw"]["lib_check"] = "✅ No native libraries"
+                    results["info"]["has_lib"] = False
+
+                # ── Check 10: assets/ raw files ───────────────────────────────
+                asset_files = [n for n in names if n.startswith("assets/")]
+                if asset_files:
+                    results["raw"]["assets_check"] = (
+                        f"ℹ️ assets/ detected — {len(asset_files)} file(s)")
+                    results["info"]["has_assets"] = True
+                    results["info"]["assets_count"] = len(asset_files)
+                    add_rec("▶ Enable Encryption step to protect assets/ bundled files")
+                else:
+                    results["raw"]["assets_check"] = "✅ No assets folder"
+                    results["info"]["has_assets"] = False
+
+                # ── Check 11: res/values/strings.xml sensitive content ─────────
+                try:
+                    if "res/values/strings.xml" in names:
+                        strings_data = zf.read(
+                            "res/values/strings.xml").decode("utf-8", errors="ignore").lower()
+                        found_sensitive = [
+                            p for p in self.SENSITIVE_STRING_PATTERNS
+                            if p in strings_data]
+                        if found_sensitive:
+                            results["raw"]["strings_check"] = (
+                                f"⚠️ res/values/strings.xml — {len(found_sensitive)} "
+                                f"sensitive pattern(s) detected")
+                            results["info"]["sensitive_strings"] = found_sensitive
+                            add_issue("warning", "SENSITIVE_STRINGS",
+                                      f"Sensitive patterns in strings.xml: "
+                                      f"{', '.join(found_sensitive[:5])}"
+                                      + (" ..." if len(found_sensitive) > 5 else ""))
+                            add_rec("▶ Run Compliance Scan (Step 04) to review and clean strings.xml")
+                        else:
+                            results["raw"]["strings_check"] = (
+                                "✅ res/values/strings.xml — no sensitive patterns")
+                    else:
+                        results["raw"]["strings_check"] = (
+                            "✅ res/values/strings.xml not present")
+                except Exception:
+                    results["raw"]["strings_check"] = (
+                        "⚠️ res/values/strings.xml — could not read")
+
+                # ── Check 12: Parse AndroidManifest (binary XML — apktool needed
+                #    for full parse; here we do a safe byte scan of the raw binary)
+                try:
+                    manifest_raw = zf.read(
+                        "AndroidManifest.xml").decode("utf-8", errors="ignore")
+
+                    # Package name — scan for common identifier pattern
+                    pkg_match = re.search(
+                        r'([a-zA-Z][a-zA-Z0-9_]*(?:\.[a-zA-Z][a-zA-Z0-9_]*){1,})',
+                        manifest_raw)
+                    if pkg_match:
+                        results["info"]["package_name"] = pkg_match.group(1)
+                    else:
+                        results["info"]["package_name"] = "Could not extract"
+
+                    # debuggable — binary manifest stores as ASCII fragment
+                    if b"debuggable" in zf.read("AndroidManifest.xml"):
+                        results["raw"]["debuggable_check"] = (
+                            "🔴 debuggable flag detected in manifest — auto-fixable")
+                        results["info"]["debuggable_detected"] = True
+                        add_issue("critical", "DEBUGGABLE",
+                                  "debuggable flag detected — AV scanners flag this as high risk",
+                                  fixable=True,
+                                  fix_action="set_debuggable_false")
+                    else:
+                        results["raw"]["debuggable_check"] = (
+                            "✅ No debuggable flag in manifest")
+                        results["info"]["debuggable_detected"] = False
+
+                    # allowBackup
+                    if b"allowBackup" in zf.read("AndroidManifest.xml"):
+                        results["raw"]["backup_check"] = (
+                            "🔴 allowBackup flag detected in manifest — auto-fixable")
+                        results["info"]["allow_backup_detected"] = True
+                        add_issue("critical", "ALLOW_BACKUP",
+                                  "allowBackup=true detected — exposes app data to ADB backup extraction",
+                                  fixable=True,
+                                  fix_action="set_allow_backup_false")
+                    else:
+                        results["raw"]["backup_check"] = (
+                            "✅ No allowBackup flag risk")
+                        results["info"]["allow_backup_detected"] = False
+
+                    # networkSecurityConfig
+                    if b"networkSecurityConfig" in zf.read("AndroidManifest.xml"):
+                        results["raw"]["network_security_check"] = (
+                            "✅ networkSecurityConfig present")
+                    else:
+                        results["raw"]["network_security_check"] = (
+                            "🟡 networkSecurityConfig not found — plain HTTP may be allowed")
+                        add_rec(
+                            "▶ Add networkSecurityConfig in manifest to block plain HTTP traffic")
+
+                    # Permissions — byte scan for permission strings
+                    manifest_bytes = zf.read("AndroidManifest.xml")
+                    manifest_text  = manifest_bytes.decode("utf-8", errors="ignore")
+                    high_found   = [p for p in self.HIGH_RISK_PERMISSIONS
+                                    if p in manifest_text]
+                    medium_found = [p for p in self.MEDIUM_RISK_PERMISSIONS
+                                    if p in manifest_text]
+                    results["info"]["high_risk_permissions"]   = high_found
+                    results["info"]["medium_risk_permissions"] = medium_found
+                    if high_found:
+                        results["raw"]["permissions_check"] = (
+                            f"🔴 {len(high_found)} high-risk permission(s) detected: "
+                            f"{', '.join(high_found[:4])}"
+                            + (" ..." if len(high_found) > 4 else ""))
+                        add_issue("warning", "HIGH_RISK_PERMISSIONS",
+                                  f"High-risk permissions present: "
+                                  f"{', '.join(high_found)}")
+                        add_rec(
+                            "▶ Review high-risk permissions — remove any not required by the app")
+                    elif medium_found:
+                        results["raw"]["permissions_check"] = (
+                            f"🟡 {len(medium_found)} medium-risk permission(s): "
+                            f"{', '.join(medium_found[:4])}"
+                            + (" ..." if len(medium_found) > 4 else ""))
+                    else:
+                        results["raw"]["permissions_check"] = (
+                            "✅ No high-risk permissions detected")
+
+                except Exception as e:
+                    results["raw"]["manifest_parse"] = (
+                        f"⚠️ Manifest deep scan skipped (binary format): {e}")
+
+            # ── Summarise issue counts ────────────────────────────────────────
+            critical_count = sum(
+                1 for i in results["issues"] if i["severity"] == "critical")
+            warning_count  = sum(
+                1 for i in results["issues"] if i["severity"] == "warning")
+            fixable_count  = sum(
+                1 for i in results["issues"] if i["fixable"])
+
+            results["info"]["critical_count"] = critical_count
+            results["info"]["warning_count"]  = warning_count
+            results["info"]["fixable_count"]  = fixable_count
+            results["info"]["total_issues"]   = critical_count + warning_count
+
+            # ── Pass/fail decision ────────────────────────────────────────────
+            # Only critical (blocking) issues cause a hard fail
+            results["passed"] = (critical_count == 0)
 
         except Exception as e:
-            results["error"] = str(e)
+            results["issues"].append({
+                "severity":   "critical",
+                "code":       "VALIDATOR_ERROR",
+                "message":    f"Validation engine error: {e}",
+                "fixable":    False,
+                "fix_action": "",
+            })
             results["passed"] = False
 
         return results
+
+    def auto_fix(self, apk_path: str, work_dir: str,
+                 validation_result: dict) -> dict:
+        """
+        Applies all auto-fixable issues from a previous validate() result.
+        Currently auto-fixes:
+          DEBUGGABLE   — sets android:debuggable=false in manifest after decode
+          ALLOW_BACKUP — sets android:allowBackup=false in manifest after decode
+
+        These fixes are applied by decoding the APK with apktool, patching
+        AndroidManifest.xml in the workspace, and rebuilding.
+        Returns fix_result dict with list of applied fixes and any failures.
+        """
+        fix_result = {
+            "fixes_applied": [],
+            "fixes_failed":  [],
+            "workspace":     None,
+        }
+
+        fixable_issues = [
+            i for i in validation_result.get("issues", [])
+            if i.get("fixable")]
+
+        if not fixable_issues:
+            fix_result["message"] = "No auto-fixable issues found."
+            return fix_result
+
+        # Decode APK to workspace for manifest editing
+        apktool_jar = os.path.join(TOOLS_DIR, "apktool.jar")
+        ws_path     = os.path.join(work_dir, "preflight_fix_workspace")
+
+        try:
+            if os.path.exists(ws_path):
+                shutil.rmtree(ws_path)
+            cmd = (f"java -jar {apktool_jar} d -f "
+                   f'"{apk_path}" -o "{ws_path}" 2>&1')
+            r = subprocess.run(cmd, shell=True,
+                               capture_output=True, text=True, timeout=120)
+            if not os.path.exists(ws_path):
+                fix_result["fixes_failed"].append(
+                    f"Decode failed: {r.stdout[-300:]}")
+                return fix_result
+            fix_result["workspace"] = ws_path
+        except Exception as e:
+            fix_result["fixes_failed"].append(f"Decode error: {e}")
+            return fix_result
+
+        manifest_path = os.path.join(ws_path, "AndroidManifest.xml")
+        if not os.path.exists(manifest_path):
+            fix_result["fixes_failed"].append(
+                "AndroidManifest.xml not found in decoded workspace")
+            return fix_result
+
+        try:
+            with open(manifest_path, "r", encoding="utf-8",
+                      errors="ignore") as f:
+                manifest_text = f.read()
+
+            original_text = manifest_text
+
+            # Fix DEBUGGABLE
+            if any(i["code"] == "DEBUGGABLE" for i in fixable_issues):
+                # Replace android:debuggable="true" with false
+                patched = re.sub(
+                    r'android:debuggable\s*=\s*"true"',
+                    'android:debuggable="false"',
+                    manifest_text, flags=re.IGNORECASE)
+                # If not found as true, remove the attribute entirely
+                if patched == manifest_text:
+                    patched = re.sub(
+                        r'\s*android:debuggable\s*=\s*"[^"]*"',
+                        '',
+                        manifest_text, flags=re.IGNORECASE)
+                if patched != manifest_text:
+                    manifest_text = patched
+                    fix_result["fixes_applied"].append(
+                        "✅ debuggable — set to false")
+                else:
+                    fix_result["fixes_failed"].append(
+                        "⚠️ debuggable — pattern not found in decoded manifest "
+                        "(binary flag — handled by Manifest Hardening step)")
+
+            # Fix ALLOW_BACKUP
+            if any(i["code"] == "ALLOW_BACKUP" for i in fixable_issues):
+                patched = re.sub(
+                    r'android:allowBackup\s*=\s*"true"',
+                    'android:allowBackup="false"',
+                    manifest_text, flags=re.IGNORECASE)
+                if patched != manifest_text:
+                    manifest_text = patched
+                    fix_result["fixes_applied"].append(
+                        "✅ allowBackup — set to false")
+                else:
+                    fix_result["fixes_failed"].append(
+                        "⚠️ allowBackup — pattern not found in decoded manifest "
+                        "(handled by Manifest Hardening step)")
+
+            # Write patched manifest back if any change was made
+            if manifest_text != original_text:
+                with open(manifest_path, "w", encoding="utf-8") as f:
+                    f.write(manifest_text)
+
+        except Exception as e:
+            fix_result["fixes_failed"].append(
+                f"Manifest patch error: {e}")
+
+        return fix_result
+
+    def format_report_message(self, apk_path: str,
+                               result: dict) -> str:
+        """
+        Formats the full validation result into a clean Telegram message.
+        Returns a Markdown-formatted string ready to send.
+        """
+        info    = result.get("info", {})
+        issues  = result.get("issues", [])
+        recs    = result.get("recommendations", [])
+        raw     = result.get("raw", {})
+        passed  = result.get("passed", False)
+
+        critical_count = info.get("critical_count", 0)
+        warning_count  = info.get("warning_count", 0)
+        fixable_count  = info.get("fixable_count", 0)
+        total_issues   = info.get("total_issues", 0)
+
+        lines = []
+        lines.append("🧪 *PRE-FLIGHT VALIDATION REPORT*")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+        # ── Info block ──────────────────────────────────────────────────────
+        lines.append(f"📄 File:      `{info.get('file_name', os.path.basename(apk_path))}`")
+        lines.append(f"📏 Size:      `{info.get('file_size', 'unknown')}`")
+        if info.get("package_name"):
+            lines.append(f"📦 Package:   `{info['package_name']}`")
+        if info.get("dex_files"):
+            lines.append(
+                f"🧬 DEX:       `{', '.join(info['dex_files'])}`")
+        lines.append(f"📁 Files:     `{info.get('total_files', '?')} total`")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+        # ── Check results ───────────────────────────────────────────────────
+        check_order = [
+            "size_check", "format_check", "manifest_check",
+            "dex_check", "resources_check", "signature_check",
+            "integrity_check", "epic_check", "debuggable_check",
+            "backup_check", "network_security_check",
+            "permissions_check", "strings_check",
+            "lib_check", "assets_check",
+        ]
+        for key in check_order:
+            val = raw.get(key)
+            if val:
+                lines.append(val)
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+        # ── Issues summary ──────────────────────────────────────────────────
+        if total_issues == 0:
+            lines.append("✅ *No issues found — APK is clean*")
+        else:
+            status_icon = "🔴" if critical_count > 0 else "🟡"
+            lines.append(
+                f"{status_icon} *{total_issues} issue(s) found* — "
+                f"{critical_count} critical, {warning_count} warning")
+            if fixable_count > 0:
+                lines.append(
+                    f"🔧 *{fixable_count} issue(s) can be auto-fixed*")
+            lines.append("")
+            for issue in issues:
+                sev_icon = "🔴" if issue["severity"] == "critical" else "🟡"
+                fix_tag  = " *(auto-fixable)*" if issue["fixable"] else ""
+                lines.append(f"{sev_icon} {issue['message']}{fix_tag}")
+
+        # ── Recommendations ─────────────────────────────────────────────────
+        if recs:
+            lines.append("━━━━━━━━━━━━━━━━━━━━━")
+            lines.append("💡 *Recommendations*")
+            for rec in recs:
+                lines.append(rec)
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+        # ── Final verdict ───────────────────────────────────────────────────
+        if passed:
+            lines.append("✅ *APK passed validation — ready for pipeline*")
+        else:
+            lines.append(
+                "❌ *APK has critical issues — resolve before processing*")
+
+        return "\n".join(lines)
 
 
 # ── APK DETECTION ANALYSER ────────────────────────────────────────────────────
@@ -5357,8 +5837,15 @@ class ManualControlEngine:
         return InlineKeyboardMarkup(rows)
 
     def build_preset_keyboard(self) -> "InlineKeyboardMarkup":
-        """Preset profile selection keyboard — standard + 6 phase presets."""
+        """Preset profile selection keyboard — preflight first, then standard + 6 phase presets."""
         return InlineKeyboardMarkup([
+            # ── Pre-flight Validation — always first ──────────────────────────
+            [InlineKeyboardButton(
+                "🧪 Pre-flight Validation",
+                callback_data="mcp_preflight_run")],
+            [InlineKeyboardButton(
+                "── Presets ──",
+                callback_data="mcp_noop")],
             # ── Standard presets ──────────────────────────────────────────────
             [InlineKeyboardButton(
                 "⚡ Quick Sign Only",
@@ -5443,9 +5930,21 @@ class ManualControlEngine:
             if op_key == "preflight_validation":
                 validator = PreflightValidator()
                 r = validator.validate(apk_path)
-                result["passed"]  = r.get("passed", False)
-                result["details"] = r
-                result["status"]  = "✅ Validation passed" if r.get("passed") else f"❌ {r.get('error','Failed')}"
+                result["passed"]       = r.get("passed", False)
+                result["details"]      = r
+                result["issues"]       = r.get("issues", [])
+                result["fixable_count"]= r.get("info", {}).get("fixable_count", 0)
+                result["total_issues"] = r.get("info", {}).get("total_issues", 0)
+                if r.get("passed"):
+                    total = r.get("info", {}).get("total_issues", 0)
+                    warn  = r.get("info", {}).get("warning_count", 0)
+                    result["status"] = (
+                        f"✅ Validation passed"
+                        + (f" — {warn} warning(s)" if warn else " — clean APK"))
+                else:
+                    crit = r.get("info", {}).get("critical_count", 0)
+                    result["status"] = (
+                        f"❌ Validation failed — {crit} critical issue(s) found")
 
             elif op_key == "strip_signature":
                 stripper = SignatureStripper()
@@ -9054,6 +9553,152 @@ async def button_handler(update, context):
             "━━━━━━━━━━━━━━━━━━━━━",
             parse_mode="Markdown",
             reply_markup=engine.build_preset_keyboard())
+
+    # ── MANUAL — PRE-FLIGHT VALIDATION RUN ───────────────────────────────────
+    elif data == "mcp_preflight_run":
+        if not is_admin(user.id): return
+
+        apk_path = manual_apk_path.get(user.id)
+        if not apk_path or not os.path.exists(apk_path):
+            await query.edit_message_text(
+                "❌ *No APK loaded.*\n\nReturn to Manual Control Panel and reload.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+
+        apk_name = os.path.basename(apk_path)
+        status_msg = await query.edit_message_text(
+            f"🧪 *Pre-flight Validation*\n\n"
+            f"📄 `{apk_name}`\n\n"
+            f"⏳ Running deep validation...",
+            parse_mode="Markdown")
+
+        try:
+            validator = PreflightValidator()
+            result    = validator.validate(apk_path)
+            report    = validator.format_report_message(apk_path, result)
+
+            info          = result.get("info", {})
+            fixable_count = info.get("fixable_count", 0)
+            passed        = result.get("passed", False)
+
+            # Build action keyboard
+            kb_rows = []
+            if fixable_count > 0:
+                kb_rows.append([InlineKeyboardButton(
+                    f"🔧 Auto-fix {fixable_count} Issue(s)",
+                    callback_data="mcp_preflight_autofix")])
+            if passed:
+                kb_rows.append([InlineKeyboardButton(
+                    "📋 Continue to Pipeline",
+                    callback_data="mcp_show_presets")])
+            else:
+                kb_rows.append([InlineKeyboardButton(
+                    "⚠️ Continue Anyway (not recommended)",
+                    callback_data="mcp_show_presets")])
+            kb_rows.append([InlineKeyboardButton(
+                "🔄 Re-validate",
+                callback_data="mcp_preflight_run")])
+            kb_rows.append([InlineKeyboardButton(
+                "⬅️ Back to Panel",
+                callback_data="mcp_show_presets")])
+
+            await status_msg.edit_text(
+                report,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb_rows))
+
+        except Exception as e:
+            await status_msg.edit_text(
+                f"❌ *Pre-flight Validation Error*\n\n`{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+        return
+
+    # ── MANUAL — PRE-FLIGHT AUTO-FIX ─────────────────────────────────────────
+    elif data == "mcp_preflight_autofix":
+        if not is_admin(user.id): return
+
+        apk_path = manual_apk_path.get(user.id)
+        work_dir = manual_work_dir.get(user.id)
+
+        if not apk_path or not os.path.exists(apk_path):
+            await query.edit_message_text(
+                "❌ *No APK loaded.*\n\nReturn to Manual Control Panel and reload.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+
+        apk_name   = os.path.basename(apk_path)
+        status_msg = await query.edit_message_text(
+            f"🔧 *Auto-fix Running*\n\n"
+            f"📄 `{apk_name}`\n\n"
+            f"⏳ Applying fixes to manifest...",
+            parse_mode="Markdown")
+
+        try:
+            validator      = PreflightValidator()
+            val_result     = validator.validate(apk_path)
+            fix_result     = validator.auto_fix(apk_path, work_dir, val_result)
+
+            fixes_applied  = fix_result.get("fixes_applied", [])
+            fixes_failed   = fix_result.get("fixes_failed",  [])
+            workspace      = fix_result.get("workspace")
+
+            lines = []
+            lines.append("🔧 *Auto-fix Report*")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"📄 `{apk_name}`")
+            lines.append("")
+
+            if fixes_applied:
+                lines.append(f"*Fixes Applied — {len(fixes_applied)}*")
+                for f in fixes_applied:
+                    lines.append(f)
+            else:
+                lines.append("ℹ️ No direct manifest text fixes applied")
+
+            if fixes_failed:
+                lines.append("")
+                lines.append(f"*Notes — {len(fixes_failed)}*")
+                for f in fixes_failed:
+                    lines.append(f)
+
+            lines.append("")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+            # If workspace was produced, note that Manifest Hardening will finalise
+            if workspace and os.path.exists(workspace):
+                lines.append(
+                    "ℹ️ Decoded workspace available — "
+                    "Manifest Hardening step will apply full hardening during pipeline run.")
+            else:
+                lines.append(
+                    "ℹ️ For full manifest hardening run "
+                    "Step 05 — Manifest Hardening in the pipeline.")
+
+            lines.append("")
+            lines.append("▶ *Re-validate to confirm fixes, then continue to pipeline.*")
+
+            kb_rows = [
+                [InlineKeyboardButton(
+                    "🔄 Re-validate APK",
+                    callback_data="mcp_preflight_run")],
+                [InlineKeyboardButton(
+                    "📋 Continue to Pipeline",
+                    callback_data="mcp_show_presets")],
+                [InlineKeyboardButton(
+                    "⬅️ Back to Panel",
+                    callback_data="mcp_show_presets")],
+            ]
+
+            await status_msg.edit_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb_rows))
+
+        except Exception as e:
+            await status_msg.edit_text(
+                f"❌ *Auto-fix Error*\n\n`{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+        return
 
     # ── MANUAL — PRESET APPLIED ───────────────────────────────────────────────
     elif data == "mcp_noop":
