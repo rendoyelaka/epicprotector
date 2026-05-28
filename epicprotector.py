@@ -9209,25 +9209,6 @@ async def button_handler(update, context):
         return
 
     # ── BACK TO SESSION CHECKLIST (from smali tree) ───────────────────────────
-    elif data == "mcp_show_presets":
-        if not is_admin(user.id): return
-        work_dir = manual_work_dir.get(user.id)
-        apk_path = manual_apk_path.get(user.id)
-        if not apk_path or not os.path.exists(apk_path):
-            await query.edit_message_text(
-                "❌ APK not found. Please restart Manual Control Panel.",
-                reply_markup=back_a())
-            return
-        apk_name = os.path.basename(apk_path)
-        engine   = ManualControlEngine(CryptoEngine(), work_dir or WORK_DIR)
-        await query.edit_message_text(
-            f"🎛️ *Manual Control Panel*\n\n"
-            f"📦 `{apk_name}` loaded\n\n"
-            f"Select a phase to run:\n"
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode="Markdown",
-            reply_markup=engine.build_preset_keyboard())
-
     elif data == "mcp_session_back":
         smali_tree_path.pop(user.id, None)
         smali_selected_files.pop(user.id, None)
@@ -9314,15 +9295,13 @@ async def button_handler(update, context):
     # ── MANUAL — PRESET SELECTION ─────────────────────────────────────────────
     elif data == "mcp_show_presets":
         if not is_admin(user.id): return
-        engine = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
+        engine   = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
+        apk_name = os.path.basename(manual_apk_path.get(user.id, "your.apk"))
         await query.edit_message_text(
-            "🎛️ *Manual Control Panel*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "Select a preset or choose custom:\n\n"
-            "⚡ *Quick Sign Only* — Strip, Decode, Keystore, Fingerprint, Sign\n"
-            "🔒 *Full Protection* — All 22 steps\n"
-            "🎯 *Custom* — You choose manually\n"
-            "━━━━━━━━━━━━━━━━━━━━━",
+            f"🎛️ *Manual Control Panel*\n\n"
+            f"📦 `{apk_name}` loaded\n\n"
+            f"Select a phase to run:\n"
+            f"━━━━━━━━━━━━━━━━━━━━━",
             parse_mode="Markdown",
             reply_markup=engine.build_preset_keyboard())
 
