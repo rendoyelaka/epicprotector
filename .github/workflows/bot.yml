@@ -27,6 +27,7 @@ name: EPIC PROTECTOR — Bot 24/7 Elite
 #  14. 22-Step pipeline reflected in all step labels
 #  15. apt package cache — JDK and tools cached between runs
 #  16. Full cache restore — startup time reduced from 9min to ~1min
+#  17. Concurrency lock — old bot stops instantly when new push detected
 # ══════════════════════════════════════════════════════════════════
 
 on:
@@ -36,6 +37,10 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '0 */5 * * *'
+
+concurrency:
+  group: epic-protector-bot
+  cancel-in-progress: true
 
 jobs:
   run-bot:
@@ -61,7 +66,6 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
-          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           echo "🔍 Validating required secrets..."
           if [ -z "$BOT_TOKEN" ]; then
@@ -70,10 +74,6 @@ jobs:
           fi
           if [ -z "$ADMIN_ID" ]; then
             echo "❌ ERROR: ADMIN_ID secret is missing."
-            exit 1
-          fi
-          if [ -z "$GH_PAT" ]; then
-            echo "❌ ERROR: GH_PAT secret is missing."
             exit 1
           fi
           echo "✅ All required secrets are present."
@@ -204,7 +204,6 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
-          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           echo "🚀 Starting EPIC PROTECTOR Elite Bot (22-Step Pipeline)..."
           echo "⏰ Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
