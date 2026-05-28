@@ -1596,6 +1596,10 @@ class SignatureStripper:
         """
         Strip all META-INF signature files from the APK.
         Writes clean APK to out_path.
+
+        CRITICAL: Must preserve exact compression method and compress_type
+        for every entry — especially classes.dex which MUST remain stored
+        as STORED (uncompressed) otherwise apksigner rejects the APK.
         APK Signing Block v2/v3 is handled by apktool rebuild — not touched here.
         Returns report of what was stripped.
         """
@@ -1603,9 +1607,14 @@ class SignatureStripper:
         kept          = []
         files_written = 0
 
+        # Files that must always be stored uncompressed in a valid APK
+        MUST_STORE_UNCOMPRESSED = (
+            "classes.dex", "resources.arsc",
+        )
+
         try:
             with zipfile.ZipFile(apk_path, 'r') as src:
-                with zipfile.ZipFile(out_path, 'w', zipfile.ZIP_DEFLATED) as dst:
+                with zipfile.ZipFile(out_path, 'w') as dst:
                     for item in src.infolist():
                         is_sig = any(
                             pat.match(item.filename)
@@ -1615,12 +1624,23 @@ class SignatureStripper:
                             stripped.append(item.filename)
                             logger.info(
                                 f"[SignatureStripper] Stripped: {item.filename}")
-                        else:
-                            # Preserve original compression for non-signature files
-                            data = src.read(item.filename)
-                            dst.writestr(item, data)
-                            kept.append(item.filename)
-                            files_written += 1
+                            continue
+
+                        # Read raw compressed bytes to preserve original compression
+                        data = src.read(item.filename)
+
+                        # Force uncompressed for critical APK entries
+                        fname = item.filename
+                        if (fname == "classes.dex" or
+                                re.match(r"^classes\d+\.dex$", fname) or
+                                fname == "resources.arsc" or
+                                any(fname.endswith(u) for u in MUST_STORE_UNCOMPRESSED)):
+                            item.compress_type = zipfile.ZIP_STORED
+
+                        # Write preserving the original ZipInfo (compression, dates etc.)
+                        dst.writestr(item, data)
+                        kept.append(fname)
+                        files_written += 1
 
         except Exception as e:
             raise RuntimeError(f"Signature strip failed: {e}")
@@ -1927,13 +1947,19 @@ class Level6_Signer:
         optimally aligned on older Android versions.
         """
         if out is None:
-            out = inp.replace('.apk', '_aligned.apk')
+            base = inp[:-4] if inp.endswith(".apk") else inp
+            out  = base + "_aligned.apk"
+        # Ensure output path does not collide with input
+        if out == inp:
+            out = inp[:-4] + "_aligned.apk" if inp.endswith(".apk") else inp + "_aligned"
         r = subprocess.run(
-            f"zipalign -v 4 {inp} {out} 2>/dev/null",
-            shell=True, capture_output=True
+            ["zipalign", "-f", "-v", "4", inp, out],
+            capture_output=True
         )
         if r.returncode != 0 or not os.path.exists(out):
-            logger.warning("[Level6] zipalign not available or failed — copying unaligned APK.")
+            logger.warning(
+                f"[Level6] zipalign failed (rc={r.returncode}) — "
+                f"copying unaligned APK as fallback.")
             shutil.copy(inp, out)
         return out
 
@@ -1945,17 +1971,22 @@ class Level6_Signer:
         Returns path to signed APK or None if apksigner failed.
         """
         out = os.path.join(self.work_dir, "EPIC_PROTECTED.apk")
-        cmd = (
-            f"apksigner sign --ks {self.keystore} --ks-key-alias {self.alias} "
-            f"--ks-pass pass:{self.sp} --key-pass pass:{self.kp} "
-            f"--out {out} {inp}"
-        )
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        cmd = [
+            "apksigner", "sign",
+            "--ks",            self.keystore,
+            "--ks-key-alias",  self.alias,
+            "--ks-pass",       f"pass:{self.sp}",
+            "--key-pass",      f"pass:{self.kp}",
+            "--out",           out,
+            inp,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode == 0 and os.path.exists(out):
             logger.info("[Level6] apksigner — signing complete.")
             return out
         logger.warning(
             f"[Level6] apksigner failed (rc={r.returncode}) — "
+            f"stdout: {r.stdout.strip()[:200]} "
             f"stderr: {r.stderr.strip()[:200]} — trying jarsigner fallback.")
         return None
 
@@ -1970,13 +2001,18 @@ class Level6_Signer:
         """
         # Step 1 — jarsigner signs the UNALIGNED APK first
         signed_unaligned = os.path.join(self.work_dir, "signed_unaligned.apk")
-        cmd = (
-            f"jarsigner -keystore {self.keystore} -storepass {self.sp} "
-            f"-keypass {self.kp} -signedjar {signed_unaligned} {inp} {self.alias}"
-        )
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        cmd = [
+            "jarsigner",
+            "-keystore",  self.keystore,
+            "-storepass", self.sp,
+            "-keypass",   self.kp,
+            "-signedjar", signed_unaligned,
+            inp,
+            self.alias,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0 or not os.path.exists(signed_unaligned):
-            err = r.stderr.strip()[:300] if r.stderr else "no output"
+            err = (r.stderr.strip() or r.stdout.strip())[:300] or "no output"
             raise RuntimeError(
                 f"Both apksigner and jarsigner failed — APK could not be signed. "
                 f"jarsigner error: {err}"
