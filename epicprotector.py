@@ -1463,19 +1463,68 @@ class Level5_APKBuilder:
         self.tools = tools
         self.work_dir = work_dir
 
+    @staticmethod
+    def _clean_invalid_res_folders(workspace_dir: str):
+        """
+        Remove res/type*/ folders that apktool creates when it cannot map
+        resource type IDs to standard folder names.
+        These folders use numeric hex names (type1, type2 etc.) which apktool
+        rejects at rebuild time with "invalid file path" errors.
+        Also removes the mipmaps.xml that references adaptive icons in a way
+        that breaks legacy apktool builds.
+        """
+        res_dir = os.path.join(workspace_dir, "res")
+        if not os.path.exists(res_dir):
+            return
+        # Remove any res/typeN/ folders — these are unmapped resource buckets
+        for item in Path(res_dir).iterdir():
+            if item.is_dir() and re.match(r'^type[0-9a-fA-F]+$', item.name):
+                try:
+                    shutil.rmtree(item)
+                    logger.info(f"[Level5] Removed invalid res folder: {item.name}/")
+                except Exception as e:
+                    logger.warning(f"[Level5] Could not remove {item.name}/: {e}")
+        # Remove mipmaps.xml that causes "invalid value for type mipmap" errors
+        for anydpi_dir in Path(res_dir).glob("values-anydpi*"):
+            mipmaps_xml = anydpi_dir / "mipmaps.xml"
+            if mipmaps_xml.exists():
+                try:
+                    mipmaps_xml.unlink()
+                    logger.info(f"[Level5] Removed problematic: {mipmaps_xml.name}")
+                except Exception as e:
+                    logger.warning(f"[Level5] Could not remove mipmaps.xml: {e}")
+
     def rebuild(self, workspace_dir) -> str:
+        # Clean invalid res folders before rebuild — apktool 2.10.0 rejects them
+        self._clean_invalid_res_folders(workspace_dir)
+
         output_apk = os.path.join(self.work_dir, "rebuilt.apk")
-        cmd = f"java -jar {self.tools.apktool_jar} b -f {workspace_dir} -o {output_apk}"
+        cmd = (
+            f"java -jar {self.tools.apktool_jar} b -f {workspace_dir} "
+            f"-o {output_apk} --use-aapt2"
+        )
         r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+        # If aapt2 fails, retry with legacy aapt (--use-aapt2 not supported on all envs)
+        if r.returncode != 0 or not os.path.exists(output_apk):
+            cmd_legacy = (
+                f"java -jar {self.tools.apktool_jar} b -f {workspace_dir} "
+                f"-o {output_apk}"
+            )
+            r = subprocess.run(cmd_legacy, shell=True, capture_output=True, text=True)
+
         if r.returncode != 0 or not os.path.exists(output_apk):
             raise RuntimeError(f"APK build failed:\n{r.stderr}\n{r.stdout}")
+
         # Validate the result is a real APK (has classes.dex at root)
-        with zipfile.ZipFile(output_apk, 'r') as z:
+        with zipfile.ZipFile(output_apk, "r") as z:
             names = z.namelist()
-        if not any(n == 'classes.dex' or re.match(r'^classes\d+\.dex$', n) for n in names):
-            raise RuntimeError("Rebuilt APK is missing classes.dex — apktool output is invalid.")
-        if 'resources.arsc' not in names and 'AndroidManifest.xml' not in names:
-            raise RuntimeError("Rebuilt APK is missing critical files (resources.arsc / AndroidManifest.xml).")
+        if not any(n == "classes.dex" or re.match(r"^classes\d+\.dex$", n) for n in names):
+            raise RuntimeError(
+                "Rebuilt APK is missing classes.dex — apktool output is invalid.")
+        if "resources.arsc" not in names and "AndroidManifest.xml" not in names:
+            raise RuntimeError(
+                "Rebuilt APK is missing critical files (resources.arsc / AndroidManifest.xml).")
         return output_apk
 
 
