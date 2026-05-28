@@ -9297,13 +9297,23 @@ async def button_handler(update, context):
         if not is_admin(user.id): return
         engine   = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
         apk_name = os.path.basename(manual_apk_path.get(user.id, "your.apk"))
-        await query.edit_message_text(
+        text     = (
             f"🎛️ *Manual Control Panel*\n\n"
             f"📦 `{apk_name}` loaded\n\n"
             f"Select a phase to run:\n"
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode="Markdown",
-            reply_markup=engine.build_preset_keyboard())
+            f"━━━━━━━━━━━━━━━━━━━━━"
+        )
+        kb = engine.build_preset_keyboard()
+        # Use reply instead of edit — works on document messages too
+        try:
+            await query.edit_message_text(
+                text, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=kb)
 
     # ── MANUAL — PRE-FLIGHT VALIDATION RUN ───────────────────────────────────
     elif data == "mcp_preflight_run":
@@ -11259,7 +11269,6 @@ async def message_handler(update, context):
                 f"✅ Word `{word}` added to compliance scan list.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Proceed to Protection", callback_data="cs_proceed")],
                     [InlineKeyboardButton("⬅️ Back", callback_data="back_admin")],
                 ]))
         return
