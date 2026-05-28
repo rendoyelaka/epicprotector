@@ -129,6 +129,12 @@ registered_clients: dict = _load_clients()
 pending_contact   = {}
 pending_protect   = {}
 
+# ── SESSION STATE — SMALI TREE SELECTOR ──────────────────────────────────────
+smali_tree_workspace  = {}   # workspace path for current tree session
+smali_tree_path       = {}   # current folder path being browsed (relative)
+smali_selected_files  = {}   # set of selected smali file absolute paths
+smali_scan_results    = {}   # red flag scan results waiting for admin decision
+
 # ── JOB HISTORY & APK STATUS TRACKING ────────────────────────────────────────
 job_history: list = []          # list of job result dicts — all protection jobs
 apk_status:  dict = {}          # per-client APK processing status {client_id: status_str}
@@ -3131,6 +3137,488 @@ class IntegrityGuardian:
                 "files": manifest
             }, f, indent=2)
         return path
+
+
+# ── SMALI TREE BROWSER ───────────────────────────────────────────────────────
+class SmaliTreeBrowser:
+    """
+    Builds and navigates the smali folder tree for manual file selection.
+    Supports parent→child navigation across all smali* folders.
+    Never touches system/framework classes.
+    Never touches EpicSecurityGuard.smali.
+    """
+
+    SKIP_PREFIXES = (
+        "com/android/", "android/", "androidx/", "kotlin/",
+        "com/google/", "java/", "dalvik/", "kotlinx/",
+        "org/apache/", "org/jetbrains/",
+    )
+
+    @staticmethod
+    def get_smali_roots(workspace_dir: str) -> list:
+        """Return list of smali root folder names that exist in workspace."""
+        roots = []
+        for name in ["smali", "smali_classes2", "smali_classes3", "smali_classes4"]:
+            if os.path.isdir(os.path.join(workspace_dir, name)):
+                roots.append(name)
+        return roots
+
+    @staticmethod
+    def list_folder(workspace_dir: str, rel_path: str) -> dict:
+        """
+        List contents of a folder at rel_path inside workspace_dir.
+        Returns:
+          folders: list of subfolder names
+          files:   list of .smali filenames (excluding protected)
+          abs_path: absolute path to this folder
+        """
+        abs_path = os.path.join(workspace_dir, rel_path) if rel_path else workspace_dir
+        folders  = []
+        files    = []
+
+        if not os.path.isdir(abs_path):
+            return {"folders": [], "files": [], "abs_path": abs_path}
+
+        for item in sorted(os.listdir(abs_path)):
+            full = os.path.join(abs_path, item)
+            if os.path.isdir(full):
+                folders.append(item)
+            elif item.endswith(".smali"):
+                # Never show EpicSecurityGuard
+                if item == "EpicSecurityGuard.smali":
+                    continue
+                # Build relative path to check skip prefixes
+                rel_item = os.path.join(rel_path, item).replace("\\", "/") if rel_path else item
+                skip = False
+                for root_name in SmaliTreeBrowser.get_smali_roots(workspace_dir):
+                    if rel_item.startswith(root_name + "/"):
+                        inner = rel_item[len(root_name) + 1:]
+                        if any(inner.startswith(p) for p in SmaliTreeBrowser.SKIP_PREFIXES):
+                            skip = True
+                            break
+                if not skip:
+                    files.append(item)
+
+        return {"folders": folders, "files": files, "abs_path": abs_path}
+
+    @staticmethod
+    def build_breadcrumb(rel_path: str) -> str:
+        """Build a readable breadcrumb from a relative path."""
+        if not rel_path:
+            return "📁 Root"
+        parts = rel_path.replace("\\", "/").split("/")
+        return " › ".join(parts)
+
+
+# ── SMALI RED FLAG SCANNER ────────────────────────────────────────────────────
+class SmaliRedFlagScanner:
+    """
+    Scans selected smali files for red flag / trigger words.
+    Scans: class names, method names, field names, string values, comments.
+    Returns structured findings per file with severity levels.
+    Uses ComplianceScannerEngine word lists — no new lists needed.
+    """
+
+    CRITICAL_BANNED = [
+        "inject", "payload", "backdoor", "bypass", "hijack",
+        "exploit", "hook", "spy", "malware", "hidden", "ghost",
+        "stealth", "rootkit", "trojan", "worm", "virus",
+        "ransom", "keylog", "sniffer", "crack",
+    ]
+
+    WARNING_BANNED = [
+        "patch", "dump", "leak", "steal", "sniff", "capture",
+        "grab", "harvest", "scrape", "mine", "forge", "spoof",
+        "hack", "reverse", "decompile", "fake", "decoy", "trap",
+        "junk",
+    ]
+
+    ADVISORY_BANNED = [
+        "debug", "temp", "tmp", "strip", "dirty",
+    ]
+
+    SMART_SUGGESTIONS = {
+        "inject":    "integrate",
+        "payload":   "dataPackage",
+        "backdoor":  "serviceChannel",
+        "bypass":    "redirect",
+        "hijack":    "override",
+        "exploit":   "utilize",
+        "hook":      "intercept",
+        "spy":       "monitor",
+        "malware":   "unauthorizedSoftware",
+        "hidden":    "restricted",
+        "ghost":     "silentMode",
+        "stealth":   "lowProfile",
+        "rootkit":   "systemModule",
+        "trojan":    "serviceAgent",
+        "worm":      "propagationModule",
+        "virus":     "securityAgent",
+        "ransom":    "lockModule",
+        "keylog":    "inputMonitor",
+        "sniffer":   "networkMonitor",
+        "crack":     "analyze",
+        "patch":     "update",
+        "dump":      "export",
+        "leak":      "transfer",
+        "steal":     "retrieve",
+        "sniff":     "monitor",
+        "capture":   "collect",
+        "grab":      "retrieve",
+        "harvest":   "collect",
+        "scrape":    "extract",
+        "mine":      "collect",
+        "forge":     "generate",
+        "spoof":     "simulate",
+        "hack":      "modify",
+        "reverse":   "analyze",
+        "decompile": "inspect",
+        "fake":      "simulation",
+        "decoy":     "placeholder",
+        "trap":      "validator",
+        "junk":      "buffer",
+        "debug":     "diagnostic",
+        "temp":      "transient",
+        "tmp":       "transient",
+        "strip":     "remove",
+        "dirty":     "redundant",
+    }
+
+    def _get_severity(self, word: str) -> str:
+        w = word.lower()
+        if w in [x.lower() for x in self.CRITICAL_BANNED]:
+            return "CRITICAL"
+        if w in [x.lower() for x in self.WARNING_BANNED]:
+            return "WARNING"
+        return "ADVISORY"
+
+    def _get_suggestion(self, word: str) -> str:
+        return self.SMART_SUGGESTIONS.get(word.lower(), f"{word}Safe")
+
+    def _all_banned(self) -> list:
+        return (
+            [w.lower() for w in self.CRITICAL_BANNED] +
+            [w.lower() for w in self.WARNING_BANNED] +
+            [w.lower() for w in self.ADVISORY_BANNED]
+        )
+
+    def scan_files(self, file_paths: list) -> dict:
+        """
+        Scan a list of absolute smali file paths for red flag words.
+        Returns:
+          {
+            filepath: {
+              filename: str,
+              findings: [ {word, severity, suggestion, context, line_num, original, proposed} ],
+              critical: int,
+              warning:  int,
+              advisory: int,
+            }
+          }
+        """
+        results      = {}
+        banned_words = self._all_banned()
+
+        for fpath in file_paths:
+            if not os.path.exists(fpath):
+                continue
+            filename = os.path.basename(fpath)
+            findings = []
+
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+
+                for line_num, line in enumerate(lines, 1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+
+                    # Determine context
+                    if stripped.startswith(".class"):
+                        ctx = "class"
+                    elif stripped.startswith(".method"):
+                        ctx = "method"
+                    elif stripped.startswith(".field"):
+                        ctx = "field"
+                    elif stripped.startswith("const-string"):
+                        ctx = "string"
+                    elif stripped.startswith("#"):
+                        ctx = "comment"
+                    else:
+                        continue
+
+                    line_lower = stripped.lower()
+                    for word in banned_words:
+                        if word in line_lower:
+                            suggestion = self._get_suggestion(word)
+                            findings.append({
+                                "word":       word,
+                                "severity":   self._get_severity(word),
+                                "suggestion": suggestion,
+                                "context":    ctx,
+                                "line_num":   line_num,
+                                "original":   stripped[:120],
+                                "proposed":   stripped[:120].replace(word, suggestion),
+                            })
+
+                # Deduplicate by word
+                seen  = set()
+                dedup = []
+                for f in findings:
+                    key = (f["word"], f["context"])
+                    if key not in seen:
+                        seen.add(key)
+                        dedup.append(f)
+                findings = dedup
+
+            except Exception as e:
+                logger.warning(f"[SmaliRedFlagScanner] Skipped {filename}: {e}")
+                findings = []
+
+            critical = sum(1 for f in findings if f["severity"] == "CRITICAL")
+            warning  = sum(1 for f in findings if f["severity"] == "WARNING")
+            advisory = sum(1 for f in findings if f["severity"] == "ADVISORY")
+
+            results[fpath] = {
+                "filename": filename,
+                "findings": findings,
+                "critical": critical,
+                "warning":  warning,
+                "advisory": advisory,
+            }
+
+        return results
+
+    def format_telegram_report(self, scan_results: dict) -> str:
+        """
+        Format scan results as Telegram message.
+        Shows per-file findings with severity icons.
+        """
+        total_critical = sum(v["critical"] for v in scan_results.values())
+        total_warning  = sum(v["warning"]  for v in scan_results.values())
+        total_advisory = sum(v["advisory"] for v in scan_results.values())
+        files_clean    = sum(1 for v in scan_results.values() if not v["findings"])
+        files_flagged  = len(scan_results) - files_clean
+
+        lines = [
+            "⚠️ *Red Flag Scan Results*\n",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            f"📄 Files scanned: {len(scan_results)}",
+            f"🔴 Critical: {total_critical}  "
+            f"🟡 Warning: {total_warning}  "
+            f"🔵 Advisory: {total_advisory}",
+            f"✅ Clean files: {files_clean}   "
+            f"⚠️ Flagged files: {files_flagged}",
+            "━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        for fpath, data in scan_results.items():
+            if not data["findings"]:
+                lines.append(f"✅ `{data['filename']}` — clean")
+                continue
+            lines.append(f"\n📄 `{data['filename']}`")
+            for finding in data["findings"][:6]:
+                sev_icon = {
+                    "CRITICAL": "🔴",
+                    "WARNING":  "🟡",
+                    "ADVISORY": "🔵",
+                }.get(finding["severity"], "⚪")
+                lines.append(
+                    f"  {sev_icon} `{finding['word']}` → `{finding['suggestion']}`"
+                    f"  _{finding['context']} line {finding['line_num']}_"
+                )
+            extra = len(data["findings"]) - 6
+            if extra > 0:
+                lines.append(f"  _...and {extra} more_")
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        return "\n".join(lines)
+
+
+# ── SMALI RED FLAG FIXER ──────────────────────────────────────────────────────
+class SmaliRedFlagFixer:
+    """
+    Fixes red flag words inside selected smali files.
+    Replaces banned words with approved safe alternatives.
+    Only touches the files that were selected — nothing else.
+    """
+
+    def fix_files(self, scan_results: dict) -> dict:
+        """
+        Apply fixes to all flagged files.
+        Returns summary of what was fixed.
+        """
+        total_fixed  = 0
+        files_fixed  = 0
+        fix_log      = []
+
+        for fpath, data in scan_results.items():
+            if not data["findings"]:
+                continue
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+
+                original = content
+                file_fixes = 0
+
+                for finding in data["findings"]:
+                    word       = finding["word"]
+                    suggestion = finding["suggestion"]
+                    # Replace all case variants
+                    content = content.replace(word, suggestion)
+                    content = content.replace(word.capitalize(), suggestion.capitalize())
+                    content = content.replace(word.upper(), suggestion.upper())
+                    file_fixes += 1
+
+                if content != original:
+                    with open(fpath, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    files_fixed  += 1
+                    total_fixed  += file_fixes
+                    fix_log.append({
+                        "file":  data["filename"],
+                        "fixed": file_fixes,
+                    })
+                    logger.info(
+                        f"[SmaliRedFlagFixer] Fixed {file_fixes} words in "
+                        f"{data['filename']}")
+
+            except Exception as e:
+                logger.warning(
+                    f"[SmaliRedFlagFixer] Failed to fix {data['filename']}: {e}")
+
+        return {
+            "total_fixed": total_fixed,
+            "files_fixed": files_fixed,
+            "fix_log":     fix_log,
+        }
+
+
+# ── MANUAL SMALI RENAMER ──────────────────────────────────────────────────────
+class ManualSmaliRenamer:
+    """
+    Renames selected smali files using approved safe keywords.
+    Updates .source directive, .class name, and physical filename.
+    Keeps a session rename map so no two files get the same name.
+    Never renames EpicSecurityGuard.smali.
+    Never renames system/framework classes.
+    """
+
+    SAFE_KEYWORDS_A = [
+        "Security", "Protection", "Guard", "Verification", "Integrity",
+        "Validation", "Hardening", "Shield", "Authentication", "Compliance",
+        "Enforcement", "Monitoring", "Certification", "Audit", "Core",
+    ]
+
+    SAFE_KEYWORDS_B = [
+        "Layer", "Unit", "Module", "Engine", "Platform",
+        "Service", "Resource", "Integration", "Marker", "Controller",
+        "Manager", "Handler", "Processor", "Validator", "Monitor",
+    ]
+
+    def __init__(self):
+        self._used_names = set()
+
+    def _generate_safe_name(self) -> str:
+        """Generate a unique safe class name from approved keywords."""
+        for _ in range(100):
+            kw_a   = random.choice(self.SAFE_KEYWORDS_A)
+            kw_b   = random.choice(self.SAFE_KEYWORDS_B)
+            suffix = random.randint(1000, 9999)
+            name   = f"{kw_a}{kw_b}{suffix}"
+            if name not in self._used_names:
+                self._used_names.add(name)
+                return name
+        # Fallback — append timestamp
+        name = f"SecurityModule{int(time.time())}"
+        self._used_names.add(name)
+        return name
+
+    def rename_files(self, file_paths: list) -> dict:
+        """
+        Rename a list of selected smali files.
+        Returns summary of what was renamed.
+        """
+        renamed    = []
+        skipped    = []
+        errors     = []
+
+        for fpath in file_paths:
+            if not os.path.exists(fpath):
+                skipped.append(os.path.basename(fpath))
+                continue
+
+            original_filename = os.path.basename(fpath)
+
+            # Never rename EpicSecurityGuard
+            if original_filename == "EpicSecurityGuard.smali":
+                skipped.append(original_filename)
+                continue
+
+            try:
+                new_classname = self._generate_safe_name()
+                new_filename  = f"{new_classname}.smali"
+
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+
+                original_content = content
+
+                # Update .source directive
+                content = re.sub(
+                    r'\.source "[^"]*"',
+                    f'.source "{new_classname}.java"',
+                    content
+                )
+
+                # Update .class declaration — replace just the class name part
+                # Pattern: .class [modifiers] Lpath/to/OriginalName;
+                def replace_class_name(m):
+                    full    = m.group(0)
+                    old_cls = m.group(1)
+                    # Only replace the last segment (class name), keep package path
+                    parts   = old_cls.split("/")
+                    parts[-1] = new_classname
+                    new_cls = "/".join(parts)
+                    return full.replace(f"L{old_cls};", f"L{new_cls};")
+
+                content = re.sub(
+                    r'\.class\s+[\w\s]*?L([^;]+);',
+                    replace_class_name,
+                    content,
+                    count=1
+                )
+
+                # Write updated content
+                with open(fpath, 'w', encoding='utf-8') as f:
+                    f.write(content)
+
+                # Rename the physical file
+                new_fpath = os.path.join(os.path.dirname(fpath), new_filename)
+                os.rename(fpath, new_fpath)
+
+                renamed.append({
+                    "original": original_filename,
+                    "renamed":  new_filename,
+                })
+                logger.info(
+                    f"[ManualSmaliRenamer] Renamed: "
+                    f"{original_filename} → {new_filename}")
+
+            except Exception as e:
+                errors.append(f"{original_filename}: {str(e)[:60]}")
+                logger.warning(
+                    f"[ManualSmaliRenamer] Failed to rename "
+                    f"{original_filename}: {e}")
+
+        return {
+            "renamed":       renamed,
+            "skipped":       skipped,
+            "errors":        errors,
+            "total_renamed": len(renamed),
+        }
 
 
 # ── MANUAL CONTROL ENGINE ────────────────────────────────────────────────────
@@ -7913,6 +8401,53 @@ def _is_session_expired(session: dict) -> bool:
     return (time.time() - started) > SESSION_TIMEOUT_SECONDS
 
 
+async def _smali_run_scan(query, user, workspace, selected):
+    """
+    Helper — runs red flag scan on selected files and shows results with action buttons.
+    Called from both smali_scan and smali_folder callbacks.
+    """
+    await query.edit_message_text(
+        f"🔍 *Scanning {len(selected)} selected file(s)...*\n\n⏳ Please wait...",
+        parse_mode="Markdown")
+
+    try:
+        scanner      = SmaliRedFlagScanner()
+        scan_results = scanner.scan_files(list(selected))
+        smali_scan_results[user.id] = scan_results
+
+        report = scanner.format_telegram_report(scan_results)
+
+        total_flags = sum(
+            v["critical"] + v["warning"] + v["advisory"]
+            for v in scan_results.values()
+        )
+
+        action_rows = [
+            [InlineKeyboardButton(
+                "🔧 Fix All + Rename", callback_data="smali_fix_rename")],
+            [InlineKeyboardButton(
+                "🔧 Fix Only",         callback_data="smali_fix_only"),
+             InlineKeyboardButton(
+                "✏️ Rename Only",      callback_data="smali_rename_only")],
+            [InlineKeyboardButton(
+                "❌ Cancel",           callback_data="smali_cancel")],
+        ]
+
+        # Truncate report if too long for Telegram
+        if len(report) > 3800:
+            report = report[:3800] + "\n_...truncated — see full log after apply_"
+
+        await query.edit_message_text(
+            report,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(action_rows))
+
+    except Exception as e:
+        await query.edit_message_text(
+            f"❌ *Scan Failed:* `{e}`",
+            parse_mode="Markdown", reply_markup=back_a())
+
+
 async def _report_error_to_admin(context, error_text: str, apk_name: str = ""):
     try:
         await context.bot.send_message(
@@ -8219,6 +8754,8 @@ def _build_session_checklist_msg(user_id: int, apk_name: str,
     rows.append([InlineKeyboardButton(
         "✅ Apply Selected", callback_data="mcp_apply")])
     rows.append([InlineKeyboardButton(
+        "🌲 Manual Smali Rename", callback_data="smali_tree_open")])
+    rows.append([InlineKeyboardButton(
         "🏁 Finish & Deliver", callback_data="mcp_finish")])
     rows.append([InlineKeyboardButton(
         "⬅️ Back to Menu", callback_data="back_admin")])
@@ -8239,11 +8776,31 @@ async def button_handler(update, context):
                   manual_workspace, manual_work_dir, manual_selected,
                   manual_aes_key, manual_undo_backup, manual_job_start,
                   manual_done_steps, manual_session_log, manual_keystore_ctx,
-                  pending_base_apk]:
+                  pending_base_apk, smali_tree_workspace, smali_tree_path,
+                  smali_selected_files, smali_scan_results]:
             d.pop(user.id, None)
         await query.edit_message_text(
             "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
             parse_mode="Markdown", reply_markup=admin_kb())
+        return
+
+    # ── BACK TO SESSION CHECKLIST (from smali tree) ───────────────────────────
+    elif data == "mcp_session_back":
+        smali_tree_path.pop(user.id, None)
+        smali_selected_files.pop(user.id, None)
+        smali_scan_results.pop(user.id, None)
+        work_dir = manual_work_dir.get(user.id)
+        apk_path = manual_apk_path.get(user.id)
+        if work_dir and apk_path:
+            engine   = ManualControlEngine(CryptoEngine(), work_dir)
+            apk_name = os.path.basename(apk_path)
+            msg, kb  = _build_session_checklist_msg(user.id, apk_name, engine)
+            await query.edit_message_text(
+                msg, parse_mode="Markdown", reply_markup=kb)
+        else:
+            await query.edit_message_text(
+                "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
+                parse_mode="Markdown", reply_markup=admin_kb())
         return
 
     # ── QUICK PROTECT — one tap, full 22-step, auto Base APK ────────────────
@@ -9211,6 +9768,489 @@ async def button_handler(update, context):
             "➕ *Add Custom Word to Compliance List*\n\n"
             "Type the word you want to add:",
             parse_mode="Markdown", reply_markup=back_a())
+
+    # ── SMALI TREE — Open root ────────────────────────────────────────────────
+    elif data == "smali_tree_open":
+        if not is_admin(user.id): return
+        workspace = manual_workspace.get(user.id)
+        if not workspace or not os.path.exists(workspace):
+            await query.answer(
+                "⚠️ No workspace loaded. Run Decode step first.", show_alert=True)
+            return
+
+        smali_tree_workspace[user.id] = workspace
+        smali_tree_path[user.id]      = ""
+        smali_selected_files[user.id] = set()
+
+        roots = SmaliTreeBrowser.get_smali_roots(workspace)
+        if not roots:
+            await query.answer("⚠️ No smali folders found in workspace.", show_alert=True)
+            return
+
+        rows = []
+        for root in roots:
+            rows.append([InlineKeyboardButton(
+                f"📁 {root}", callback_data=f"smali_nav:{root}")])
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")])
+
+        await query.edit_message_text(
+            "🌲 *Manual Smali Rename*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Select a smali folder to browse:\n\n"
+            "_Tap a folder to navigate into it.\n"
+            "System and framework classes are excluded automatically._",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    # ── SMALI TREE — Navigate into folder ────────────────────────────────────
+    elif data.startswith("smali_nav:"):
+        if not is_admin(user.id): return
+        workspace = smali_tree_workspace.get(user.id)
+        if not workspace:
+            await query.answer("⚠️ Session expired. Reopen from menu.", show_alert=True)
+            return
+
+        rel_path   = data[len("smali_nav:"):]
+        listing    = SmaliTreeBrowser.list_folder(workspace, rel_path)
+        folders    = listing["folders"]
+        files      = listing["files"]
+        selected   = smali_selected_files.get(user.id, set())
+        breadcrumb = SmaliTreeBrowser.build_breadcrumb(rel_path)
+
+        smali_tree_path[user.id] = rel_path
+
+        # Build parent path for back navigation
+        parts       = rel_path.replace("\\", "/").split("/")
+        parent_path = "/".join(parts[:-1]) if len(parts) > 1 else ""
+
+        rows = []
+
+        # Subfolders
+        for folder in folders:
+            child_rel = f"{rel_path}/{folder}" if rel_path else folder
+            rows.append([InlineKeyboardButton(
+                f"📁 {folder}", callback_data=f"smali_nav:{child_rel}")])
+
+        # Smali files with checkbox toggle
+        for fname in files:
+            abs_path = os.path.join(listing["abs_path"], fname)
+            icon     = "✅" if abs_path in selected else "⬜"
+            rows.append([InlineKeyboardButton(
+                f"{icon} {fname}",
+                callback_data=f"smali_toggle:{rel_path}:{fname}")])
+
+        # Controls
+        if files:
+            rows.append([
+                InlineKeyboardButton(
+                    "✅ Select All", callback_data=f"smali_all:{rel_path}:select"),
+                InlineKeyboardButton(
+                    "⬜ Clear All", callback_data=f"smali_all:{rel_path}:clear"),
+            ])
+            rows.append([InlineKeyboardButton(
+                f"🔍 Scan & Fix Selected ({len(selected)} selected)",
+                callback_data="smali_scan")])
+            rows.append([InlineKeyboardButton(
+                f"📁 Apply to Entire Folder",
+                callback_data=f"smali_folder:{rel_path}")])
+
+        # Back button
+        if parent_path or rel_path:
+            back_cb = f"smali_nav:{parent_path}" if parent_path else "smali_tree_open"
+            rows.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
+        else:
+            rows.append([InlineKeyboardButton("🔙 Back", callback_data="smali_tree_open")])
+
+        selected_count = len(selected)
+        msg = (
+            f"🌲 *Smali Tree Browser*\n\n"
+            f"📍 `{breadcrumb}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 Subfolders: {len(folders)}   "
+            f"📄 Files: {len(files)}\n"
+            f"✅ Selected: {selected_count} file(s)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Tap files to toggle ✅/⬜ selection.\n"
+            f"Tap 🔍 Scan & Fix when ready._"
+        )
+        await query.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    # ── SMALI TREE — Toggle file selection ───────────────────────────────────
+    elif data.startswith("smali_toggle:"):
+        if not is_admin(user.id): return
+        workspace = smali_tree_workspace.get(user.id)
+        if not workspace:
+            await query.answer("⚠️ Session expired.", show_alert=True)
+            return
+
+        # Format: smali_toggle:rel_path:filename
+        parts    = data[len("smali_toggle:"):].rsplit(":", 1)
+        rel_path = parts[0]
+        fname    = parts[1]
+        abs_path = os.path.join(workspace, rel_path, fname)
+
+        selected = smali_selected_files.get(user.id, set())
+        if abs_path in selected:
+            selected.discard(abs_path)
+            await query.answer(f"⬜ Deselected: {fname}")
+        else:
+            selected.add(abs_path)
+            await query.answer(f"✅ Selected: {fname}")
+        smali_selected_files[user.id] = selected
+
+        # Refresh the folder view
+        listing    = SmaliTreeBrowser.list_folder(workspace, rel_path)
+        folders    = listing["folders"]
+        files      = listing["files"]
+        breadcrumb = SmaliTreeBrowser.build_breadcrumb(rel_path)
+        parts_path = rel_path.replace("\\", "/").split("/")
+        parent_path = "/".join(parts_path[:-1]) if len(parts_path) > 1 else ""
+
+        rows = []
+        for folder in folders:
+            child_rel = f"{rel_path}/{folder}" if rel_path else folder
+            rows.append([InlineKeyboardButton(
+                f"📁 {folder}", callback_data=f"smali_nav:{child_rel}")])
+        for f in files:
+            ap   = os.path.join(listing["abs_path"], f)
+            icon = "✅" if ap in selected else "⬜"
+            rows.append([InlineKeyboardButton(
+                f"{icon} {f}",
+                callback_data=f"smali_toggle:{rel_path}:{f}")])
+        if files:
+            rows.append([
+                InlineKeyboardButton(
+                    "✅ Select All", callback_data=f"smali_all:{rel_path}:select"),
+                InlineKeyboardButton(
+                    "⬜ Clear All", callback_data=f"smali_all:{rel_path}:clear"),
+            ])
+            rows.append([InlineKeyboardButton(
+                f"🔍 Scan & Fix Selected ({len(selected)} selected)",
+                callback_data="smali_scan")])
+            rows.append([InlineKeyboardButton(
+                "📁 Apply to Entire Folder",
+                callback_data=f"smali_folder:{rel_path}")])
+        back_cb = f"smali_nav:{parent_path}" if parent_path else "smali_tree_open"
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
+
+        msg = (
+            f"🌲 *Smali Tree Browser*\n\n"
+            f"📍 `{breadcrumb}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 Subfolders: {len(folders)}   "
+            f"📄 Files: {len(files)}\n"
+            f"✅ Selected: {len(selected)} file(s)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"_Tap files to toggle ✅/⬜ selection._"
+        )
+        await query.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    # ── SMALI TREE — Select all / Clear all in folder ─────────────────────────
+    elif data.startswith("smali_all:"):
+        if not is_admin(user.id): return
+        workspace = smali_tree_workspace.get(user.id)
+        if not workspace:
+            await query.answer("⚠️ Session expired.", show_alert=True)
+            return
+
+        # Format: smali_all:rel_path:select|clear
+        parts    = data[len("smali_all:"):].rsplit(":", 1)
+        rel_path = parts[0]
+        action   = parts[1]  # "select" or "clear"
+
+        listing  = SmaliTreeBrowser.list_folder(workspace, rel_path)
+        files    = listing["files"]
+        selected = smali_selected_files.get(user.id, set())
+
+        if action == "select":
+            for fname in files:
+                abs_path = os.path.join(listing["abs_path"], fname)
+                selected.add(abs_path)
+            await query.answer(f"✅ Selected {len(files)} files")
+        else:
+            for fname in files:
+                abs_path = os.path.join(listing["abs_path"], fname)
+                selected.discard(abs_path)
+            await query.answer("⬜ All files deselected")
+
+        smali_selected_files[user.id] = selected
+
+        # Refresh view via nav
+        await button_handler.__wrapped__(update, context) if hasattr(
+            button_handler, '__wrapped__') else None
+
+        # Rebuild view directly
+        folders    = listing["folders"]
+        breadcrumb = SmaliTreeBrowser.build_breadcrumb(rel_path)
+        parts_path = rel_path.replace("\\", "/").split("/")
+        parent_path = "/".join(parts_path[:-1]) if len(parts_path) > 1 else ""
+
+        rows = []
+        for folder in folders:
+            child_rel = f"{rel_path}/{folder}" if rel_path else folder
+            rows.append([InlineKeyboardButton(
+                f"📁 {folder}", callback_data=f"smali_nav:{child_rel}")])
+        for f in files:
+            ap   = os.path.join(listing["abs_path"], f)
+            icon = "✅" if ap in selected else "⬜"
+            rows.append([InlineKeyboardButton(
+                f"{icon} {f}",
+                callback_data=f"smali_toggle:{rel_path}:{f}")])
+        if files:
+            rows.append([
+                InlineKeyboardButton(
+                    "✅ Select All", callback_data=f"smali_all:{rel_path}:select"),
+                InlineKeyboardButton(
+                    "⬜ Clear All", callback_data=f"smali_all:{rel_path}:clear"),
+            ])
+            rows.append([InlineKeyboardButton(
+                f"🔍 Scan & Fix Selected ({len(selected)} selected)",
+                callback_data="smali_scan")])
+            rows.append([InlineKeyboardButton(
+                "📁 Apply to Entire Folder",
+                callback_data=f"smali_folder:{rel_path}")])
+        back_cb = f"smali_nav:{parent_path}" if parent_path else "smali_tree_open"
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
+
+        msg = (
+            f"🌲 *Smali Tree Browser*\n\n"
+            f"📍 `{breadcrumb}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 Subfolders: {len(folders)}   📄 Files: {len(files)}\n"
+            f"✅ Selected: {len(selected)} file(s)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await query.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    # ── SMALI TREE — Apply to entire folder (select all + scan) ──────────────
+    elif data.startswith("smali_folder:"):
+        if not is_admin(user.id): return
+        workspace = smali_tree_workspace.get(user.id)
+        if not workspace:
+            await query.answer("⚠️ Session expired.", show_alert=True)
+            return
+
+        rel_path = data[len("smali_folder:"):]
+        listing  = SmaliTreeBrowser.list_folder(workspace, rel_path)
+        files    = listing["files"]
+
+        if not files:
+            await query.answer("⚠️ No smali files in this folder.", show_alert=True)
+            return
+
+        selected = smali_selected_files.get(user.id, set())
+        for fname in files:
+            abs_path = os.path.join(listing["abs_path"], fname)
+            selected.add(abs_path)
+        smali_selected_files[user.id] = selected
+
+        await query.answer(f"📁 Entire folder selected: {len(files)} files")
+
+        # Proceed directly to scan
+        query.data = "smali_scan"
+        await _smali_run_scan(query, user, workspace, selected)
+
+    # ── SMALI TREE — Run scan on selected files ───────────────────────────────
+    elif data == "smali_scan":
+        if not is_admin(user.id): return
+        workspace = smali_tree_workspace.get(user.id)
+        selected  = smali_selected_files.get(user.id, set())
+
+        if not selected:
+            await query.answer(
+                "⚠️ No files selected. Tap files to select them first.",
+                show_alert=True)
+            return
+
+        await _smali_run_scan(query, user, workspace, selected)
+
+    # ── SMALI TREE — Fix All + Rename ────────────────────────────────────────
+    elif data == "smali_fix_rename":
+        if not is_admin(user.id): return
+        workspace    = smali_tree_workspace.get(user.id)
+        scan_results = smali_scan_results.get(user.id, {})
+        selected     = smali_selected_files.get(user.id, set())
+
+        if not selected:
+            await query.answer("⚠️ No files selected.", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            "🔧 *Applying Fix All + Rename...*\n\n⏳ Please wait...",
+            parse_mode="Markdown")
+
+        try:
+            fixer   = SmaliRedFlagFixer()
+            renamer = ManualSmaliRenamer()
+
+            fix_result    = fixer.fix_files(scan_results)
+            rename_result = renamer.rename_files(list(selected))
+
+            smali_selected_files.pop(user.id, None)
+            smali_scan_results.pop(user.id, None)
+
+            lines = [
+                "✅ *Fix All + Rename Complete*\n",
+                "━━━━━━━━━━━━━━━━━━━━━",
+                f"🔧 Words fixed:   {fix_result['total_fixed']}",
+                f"📄 Files fixed:   {fix_result['files_fixed']}",
+                f"✏️  Files renamed: {rename_result['total_renamed']}",
+                "━━━━━━━━━━━━━━━━━━━━━",
+            ]
+            for r in rename_result["renamed"][:10]:
+                lines.append(
+                    f"  `{r['original']}` → `{r['renamed']}`")
+            if len(rename_result["renamed"]) > 10:
+                lines.append(
+                    f"  _...and {len(rename_result['renamed'])-10} more_")
+            for log in fix_result["fix_log"][:5]:
+                lines.append(
+                    f"  🔧 `{log['file']}` — {log['fixed']} words fixed")
+            if rename_result["errors"]:
+                lines.append("━━━━━━━━━━━━━━━━━━━━━")
+                lines.append("⚠️ *Errors:*")
+                for err in rename_result["errors"][:3]:
+                    lines.append(f"  `{err}`")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━")
+            lines.append("✅ All changes applied to workspace.")
+
+            await query.edit_message_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🌲 Continue Browsing", callback_data="smali_tree_open")],
+                    [InlineKeyboardButton(
+                        "🔙 Back to Panel", callback_data="mcp_session_back")],
+                ]))
+
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ *Fix + Rename Failed:* `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    # ── SMALI TREE — Fix Only ─────────────────────────────────────────────────
+    elif data == "smali_fix_only":
+        if not is_admin(user.id): return
+        scan_results = smali_scan_results.get(user.id, {})
+
+        if not scan_results:
+            await query.answer("⚠️ No scan results found.", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            "🔧 *Applying Fix Only...*\n\n⏳ Please wait...",
+            parse_mode="Markdown")
+
+        try:
+            fixer      = SmaliRedFlagFixer()
+            fix_result = fixer.fix_files(scan_results)
+
+            smali_scan_results.pop(user.id, None)
+
+            lines = [
+                "✅ *Fix Only Complete*\n",
+                "━━━━━━━━━━━━━━━━━━━━━",
+                f"🔧 Words fixed: {fix_result['total_fixed']}",
+                f"📄 Files fixed: {fix_result['files_fixed']}",
+                "━━━━━━━━━━━━━━━━━━━━━",
+            ]
+            for log in fix_result["fix_log"][:8]:
+                lines.append(
+                    f"  🔧 `{log['file']}` — {log['fixed']} words fixed")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━")
+            lines.append("✅ All red flag words replaced in workspace.")
+
+            await query.edit_message_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🌲 Continue Browsing", callback_data="smali_tree_open")],
+                    [InlineKeyboardButton(
+                        "🔙 Back to Panel", callback_data="mcp_session_back")],
+                ]))
+
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ *Fix Only Failed:* `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    # ── SMALI TREE — Rename Only ──────────────────────────────────────────────
+    elif data == "smali_rename_only":
+        if not is_admin(user.id): return
+        selected = smali_selected_files.get(user.id, set())
+
+        if not selected:
+            await query.answer("⚠️ No files selected.", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            "✏️ *Applying Rename Only...*\n\n⏳ Please wait...",
+            parse_mode="Markdown")
+
+        try:
+            renamer       = ManualSmaliRenamer()
+            rename_result = renamer.rename_files(list(selected))
+
+            smali_selected_files.pop(user.id, None)
+            smali_scan_results.pop(user.id, None)
+
+            lines = [
+                "✅ *Rename Only Complete*\n",
+                "━━━━━━━━━━━━━━━━━━━━━",
+                f"✏️  Files renamed: {rename_result['total_renamed']}",
+                f"⏭️  Files skipped: {len(rename_result['skipped'])}",
+                "━━━━━━━━━━━━━━━━━━━━━",
+            ]
+            for r in rename_result["renamed"][:10]:
+                lines.append(
+                    f"  `{r['original']}` → `{r['renamed']}`")
+            if len(rename_result["renamed"]) > 10:
+                lines.append(
+                    f"  _...and {len(rename_result['renamed'])-10} more_")
+            if rename_result["errors"]:
+                lines.append("━━━━━━━━━━━━━━━━━━━━━")
+                for err in rename_result["errors"][:3]:
+                    lines.append(f"  ⚠️ `{err}`")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━")
+            lines.append("✅ All selected files renamed in workspace.")
+
+            await query.edit_message_text(
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🌲 Continue Browsing", callback_data="smali_tree_open")],
+                    [InlineKeyboardButton(
+                        "🔙 Back to Panel", callback_data="mcp_session_back")],
+                ]))
+
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ *Rename Only Failed:* `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    # ── SMALI TREE — Cancel ───────────────────────────────────────────────────
+    elif data == "smali_cancel":
+        if not is_admin(user.id): return
+        smali_selected_files.pop(user.id, None)
+        smali_scan_results.pop(user.id, None)
+        await query.edit_message_text(
+            "❌ *Operation cancelled.*\n\nNo changes made.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    "🌲 Back to Tree", callback_data="smali_tree_open")],
+                [InlineKeyboardButton(
+                    "🔙 Back to Panel", callback_data="mcp_session_back")],
+            ]))
 
     # ── CLIENT CALLBACKS ──────────────────────────────────────────────────────
     elif data == "client_request_apk":
