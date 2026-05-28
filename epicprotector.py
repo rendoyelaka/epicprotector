@@ -5324,6 +5324,23 @@ class ManualControlEngine:
         """
         return [op for op in self.PIPELINE_ORDER if op in selected_ops]
 
+    def enforce_auto_sign(self, selected_ops: set) -> set:
+        """
+        Auto-append signing — ensures every output APK is installable.
+        Automatically adds rebuild + sign steps if not already selected.
+        Admin only needs to select protection operations.
+        Signing always happens — admin never receives unsigned APK.
+        """
+        MANDATORY_SIGN_STEPS = {
+            "rebuild_apk",
+            "keystore_generation",
+            "unique_fingerprint",
+            "zipalign",
+            "sign_apk",
+        }
+        # Always append mandatory sign steps
+        return selected_ops | MANDATORY_SIGN_STEPS
+
     def build_selection_keyboard(self, selected: set) -> "InlineKeyboardMarkup":
         """
         Builds the single unified 22-step checkbox keyboard.
@@ -5346,8 +5363,19 @@ class ManualControlEngine:
         ])
         # Apply Selected
         rows.append([InlineKeyboardButton("✅ Apply Selected", callback_data="mcp_apply")])
-        # Manual Smali Rename — tree browser
-        rows.append([InlineKeyboardButton("🌲 Manual Smali Rename", callback_data="smali_tree_open")])
+        # ── Tree Browsers ─────────────────────────────────────────────────────
+        rows.append([InlineKeyboardButton("── 🌲 Tree Browsers ──", callback_data="mcp_noop")])
+        rows.append([InlineKeyboardButton("🌲 Smali Tree Browser",      callback_data="smali_tree_open")])
+        rows.append([InlineKeyboardButton("📁 res/ Tree Browser",       callback_data="res_tree_open")])
+        rows.append([InlineKeyboardButton("📄 AndroidManifest Browser", callback_data="manifest_browse_open")])
+        rows.append([InlineKeyboardButton("📦 resources.arsc Browser",  callback_data="arsc_browse_open")])
+        # ── Analysis Tools ────────────────────────────────────────────────────
+        rows.append([InlineKeyboardButton("── 🔬 Analysis Tools ──", callback_data="mcp_noop")])
+        rows.append([InlineKeyboardButton("🛡️ Safety Analysis",    callback_data="safety_analyse")])
+        rows.append([InlineKeyboardButton("🔬 AV Trigger Scan",    callback_data="av_trigger_scan")])
+        rows.append([InlineKeyboardButton("👁️ Dry Run Preview",    callback_data="dry_run_preview")])
+        rows.append([InlineKeyboardButton("🔑 Permission Auditor", callback_data="perm_audit")])
+        rows.append([InlineKeyboardButton("📋 Session Report",     callback_data="session_report")])
         # Back
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_admin")])
 
@@ -8164,6 +8192,14 @@ manual_selected     = {}   # set of selected operation keys
 manual_aes_key      = {}   # AES key for this job session
 manual_undo_backup  = {}   # backup dir for undo last job
 manual_job_start    = {}   # job start timestamp
+# ── New tree browser session state ───────────────────────────────────────────
+res_tree_workspace  = {}   # workspace for res/ tree browser
+res_tree_path       = {}   # current path in res/ tree
+res_tree_selected   = {}   # selected files in res/ tree
+manifest_workspace  = {}   # workspace for manifest browser
+arsc_workspace      = {}   # workspace for resources.arsc browser
+arsc_entries        = {}   # cached string entries for arsc browser
+session_reports     = {}   # SessionReportEngine per user
 manual_keystore_ctx = {}   # keystore context shared across steps {keystore_path, alias, ks_pass, key_pass, sha256}
 
 # ── ADMIN KEYBOARD ───────────────────────────────────────────────────────────
@@ -8352,6 +8388,538 @@ async def _report_error_to_admin(context, error_text: str, apk_name: str = ""):
 
 
 # ── BASE APK PERSISTENT STORAGE ENGINE ───────────────────────────────────────
+# ── RES FOLDER TREE BROWSER ───────────────────────────────────────────────────
+class ResFolderTreeBrowser:
+    """
+    Browses res/ folder tree — drawable, mipmap, raw, values, layout, xml.
+    Shows risk badge per file. Provides action menu per file.
+    """
+
+    # Folders safe to rename files inside
+    SAFE_RENAME_FOLDERS = {"drawable", "mipmap", "raw", "font"}
+
+    # Folders where files CANNOT be renamed
+    UNSAFE_RENAME_FOLDERS = {"values", "layout", "xml", "menu", "anim", "color"}
+
+    # Safe keyword pool for rename suggestions
+    SAFE_KEYWORDS = [
+        "shield", "guard", "security", "protection", "compliance",
+        "verification", "integrity", "authentication", "audit",
+        "certification", "enforcement", "monitoring", "validation",
+        "core", "layer", "unit", "module", "engine", "platform",
+        "service", "resource", "asset", "data", "config", "base",
+    ]
+
+    # Trigger words to scan for in file content
+    TRIGGER_WORDS = [
+        "password", "passwd", "secret", "token", "apikey", "api_key",
+        "private_key", "credentials", "auth", "bearer",
+        "debug", "root", "su ", "superuser",
+    ]
+
+    @staticmethod
+    def list_res_roots(workspace_dir: str) -> list:
+        """List all sub-folders inside res/ folder."""
+        res_path = Path(workspace_dir) / "res"
+        if not res_path.exists():
+            return []
+        folders = sorted([
+            d.name for d in res_path.iterdir()
+            if d.is_dir()
+        ])
+        return folders
+
+    @staticmethod
+    def list_folder(workspace_dir: str, rel_path: str) -> dict:
+        """List files and subfolders inside a res/ subfolder."""
+        base = Path(workspace_dir) / "res" / rel_path
+        if not base.exists():
+            return {"folders": [], "files": [], "abs_path": str(base)}
+
+        folders = sorted([d.name for d in base.iterdir() if d.is_dir()])
+        files   = sorted([f.name for f in base.iterdir() if f.is_file()])
+        return {"folders": folders, "files": files, "abs_path": str(base)}
+
+    @staticmethod
+    def get_file_risk(folder_name: str, filename: str, abs_path: str) -> tuple:
+        """
+        Returns (risk_icon, risk_label, safe_to_rename, reason).
+        risk_icon: 🔴 🟡 🟢 ⚠️
+        """
+        name_lower = filename.lower()
+        folder_lower = folder_name.split("/")[0].lower()
+        # Strip qualifier suffixes: drawable-hdpi -> drawable
+        base_folder = folder_lower.split("-")[0]
+
+        # Cannot rename XML files in layout/values/xml
+        if filename.endswith(".xml") and base_folder in ResFolderTreeBrowser.UNSAFE_RENAME_FOLDERS:
+            return ("⚠️", "Cannot rename", False,
+                    f"{base_folder}/ XML files require exact names for apktool")
+
+        # Cannot rename strings.xml, public.xml, attrs.xml anywhere
+        if filename in ("strings.xml", "public.xml", "attrs.xml",
+                        "styles.xml", "colors.xml", "dimens.xml"):
+            return ("⚠️", "Cannot rename", False,
+                    "Resource table file — apktool requires exact name")
+
+        # Check content for triggers if text file
+        trigger_found = False
+        if abs_path and os.path.exists(abs_path):
+            try:
+                if os.path.getsize(abs_path) < 512000:  # skip >500KB
+                    with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read().lower()
+                    trigger_found = any(
+                        tw in content for tw in ResFolderTreeBrowser.TRIGGER_WORDS)
+            except Exception:
+                pass
+
+        if trigger_found:
+            return ("🔴", "High risk — trigger words found", True,
+                    "Contains trigger words — fix recommended")
+
+        # Image files in drawable/mipmap — safe
+        if filename.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")):
+            return ("🟢", "Safe to rename", True, "Image file — safe")
+
+        # Raw files
+        if base_folder == "raw":
+            return ("🟡", "Medium risk", True, "Raw file — review content")
+
+        return ("🟢", "Safe", True, "No issues detected")
+
+    @staticmethod
+    def get_rename_suggestions(filename: str) -> list:
+        """Return 3 safe keyword rename suggestions preserving extension."""
+        ext = os.path.splitext(filename)[1]
+        kws = random.sample(ResFolderTreeBrowser.SAFE_KEYWORDS, 6)
+        suggestions = []
+        for i in range(0, 6, 2):
+            suggestions.append(f"{kws[i]}_{kws[i+1]}{ext}")
+        return suggestions[:3]
+
+    @staticmethod
+    def rename_file(workspace_dir: str, rel_folder: str,
+                    old_name: str, new_name: str) -> dict:
+        """Rename a file in res/ folder. Returns result dict."""
+        old_path = Path(workspace_dir) / "res" / rel_folder / old_name
+        new_path = Path(workspace_dir) / "res" / rel_folder / new_name
+
+        if not old_path.exists():
+            return {"success": False, "error": f"{old_name} not found"}
+        if new_path.exists():
+            return {"success": False, "error": f"{new_name} already exists"}
+
+        try:
+            old_path.rename(new_path)
+            return {
+                "success":  True,
+                "old_name": old_name,
+                "new_name": new_name,
+                "folder":   rel_folder,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    @staticmethod
+    def scan_file_triggers(abs_path: str) -> list:
+        """Scan a single file for trigger words. Returns list of found words."""
+        found = []
+        if not os.path.exists(abs_path):
+            return found
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read().lower()
+            for tw in ResFolderTreeBrowser.TRIGGER_WORDS:
+                if tw in content:
+                    found.append(tw)
+        except Exception:
+            pass
+        return list(set(found))
+
+    @staticmethod
+    def fix_triggers(abs_path: str) -> dict:
+        """Replace trigger words in a file with safe keywords."""
+        REPLACEMENTS = {
+            "password":    "access_key",
+            "passwd":      "access_key",
+            "secret":      "security_token",
+            "token":       "session_key",
+            "apikey":      "service_key",
+            "api_key":     "service_key",
+            "private_key": "certificate_key",
+            "credentials": "authentication_data",
+            "auth":        "verification",
+            "bearer":      "session_header",
+            "debug":       "diagnostic",
+            "root":        "system_base",
+        }
+        if not os.path.exists(abs_path):
+            return {"success": False, "fixed": 0}
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            original = content
+            fixed = 0
+            for trigger, replacement in REPLACEMENTS.items():
+                if trigger in content.lower():
+                    content = re.sub(
+                        re.escape(trigger), replacement,
+                        content, flags=re.IGNORECASE)
+                    fixed += 1
+            if content != original:
+                with open(abs_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            return {"success": True, "fixed": fixed}
+        except Exception as e:
+            return {"success": False, "fixed": 0, "error": str(e)}
+
+
+# ── ANDROID MANIFEST BROWSER ENGINE ──────────────────────────────────────────
+class ManifestBrowserEngine:
+    """
+    Browses AndroidManifest.xml — shows permissions, services,
+    receivers, activities with risk levels.
+    Allows editing safe attribute values.
+    Fixes trigger words in text values.
+    Never removes permissions. Never modifies package name.
+    """
+
+    HIGH_RISK_PERMISSIONS = {
+        "READ_CONTACTS", "WRITE_CONTACTS",
+        "ACCESS_FINE_LOCATION", "ACCESS_COARSE_LOCATION",
+        "READ_CALL_LOG", "WRITE_CALL_LOG",
+        "CAMERA", "RECORD_AUDIO",
+        "READ_SMS", "SEND_SMS", "RECEIVE_SMS",
+        "READ_PHONE_STATE", "CALL_PHONE",
+        "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE",
+        "PROCESS_OUTGOING_CALLS", "GET_ACCOUNTS",
+    }
+
+    MEDIUM_RISK_PERMISSIONS = {
+        "INTERNET", "ACCESS_NETWORK_STATE", "ACCESS_WIFI_STATE",
+        "RECEIVE_BOOT_COMPLETED", "FOREGROUND_SERVICE",
+        "REQUEST_INSTALL_PACKAGES", "SYSTEM_ALERT_WINDOW",
+    }
+
+    TRIGGER_WORDS = [
+        "payment", "bank", "hack", "crack", "debug",
+        "password", "secret", "private", "admin", "root",
+    ]
+
+    SAFE_LABEL_REPLACEMENTS = {
+        "payment":  "transaction",
+        "bank":     "financial",
+        "debug":    "diagnostic",
+        "password": "access",
+        "secret":   "secure",
+        "private":  "restricted",
+        "admin":    "administrator",
+        "root":     "system",
+    }
+
+    @staticmethod
+    def parse(workspace_dir: str) -> dict:
+        """Parse AndroidManifest.xml and return structured data."""
+        manifest_path = os.path.join(workspace_dir, "AndroidManifest.xml")
+        if not os.path.exists(manifest_path):
+            return {"error": "AndroidManifest.xml not found"}
+
+        try:
+            with open(manifest_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            permissions = re.findall(
+                r'android\.permission\.(\w+)', content)
+            permissions = list(dict.fromkeys(permissions))
+
+            services = re.findall(
+                r'<service[^>]+android:name="([^"]+)"', content)
+            receivers = re.findall(
+                r'<receiver[^>]+android:name="([^"]+)"', content)
+            activities = re.findall(
+                r'<activity[^>]+android:name="([^"]+)"', content)
+            labels = re.findall(
+                r'android:label="([^"]+)"', content)
+            descriptions = re.findall(
+                r'android:description="([^"]+)"', content)
+
+            # Detect triggers in label/description values
+            trigger_hits = []
+            for val in labels + descriptions:
+                for tw in ManifestBrowserEngine.TRIGGER_WORDS:
+                    if tw.lower() in val.lower():
+                        trigger_hits.append({"value": val, "trigger": tw})
+
+            return {
+                "permissions":   permissions,
+                "services":      services,
+                "receivers":     receivers,
+                "activities":    activities,
+                "labels":        labels,
+                "descriptions":  descriptions,
+                "trigger_hits":  trigger_hits,
+                "content":       content,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    @staticmethod
+    def get_permission_risk(perm: str) -> tuple:
+        """Returns (icon, risk_label) for a permission."""
+        if perm in ManifestBrowserEngine.HIGH_RISK_PERMISSIONS:
+            return ("🔴", "High risk")
+        if perm in ManifestBrowserEngine.MEDIUM_RISK_PERMISSIONS:
+            return ("🟡", "Medium risk")
+        return ("🟢", "Low risk")
+
+    @staticmethod
+    def fix_trigger_values(workspace_dir: str) -> dict:
+        """Replace trigger words in manifest label/description values."""
+        manifest_path = os.path.join(workspace_dir, "AndroidManifest.xml")
+        if not os.path.exists(manifest_path):
+            return {"success": False, "fixed": 0}
+        try:
+            with open(manifest_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            original = content
+            fixed = 0
+            for trigger, replacement in ManifestBrowserEngine.SAFE_LABEL_REPLACEMENTS.items():
+                pattern = f'(android:(?:label|description)="[^"]*){trigger}([^"]*")'
+                new_content = re.sub(
+                    pattern, rf'\g<1>{replacement}\g<2>',
+                    content, flags=re.IGNORECASE)
+                if new_content != content:
+                    fixed += 1
+                    content = new_content
+            if content != original:
+                with open(manifest_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            return {"success": True, "fixed": fixed}
+        except Exception as e:
+            return {"success": False, "fixed": 0, "error": str(e)}
+
+    @staticmethod
+    def edit_label(workspace_dir: str, old_value: str, new_value: str) -> dict:
+        """Edit a specific label value in AndroidManifest.xml."""
+        manifest_path = os.path.join(workspace_dir, "AndroidManifest.xml")
+        if not os.path.exists(manifest_path):
+            return {"success": False, "error": "Manifest not found"}
+        try:
+            with open(manifest_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            if old_value not in content:
+                return {"success": False, "error": f"Value '{old_value}' not found"}
+            new_content = content.replace(
+                f'android:label="{old_value}"',
+                f'android:label="{new_value}"', 1)
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            return {"success": True, "old": old_value, "new": new_value}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+
+# ── RESOURCES ARSC BROWSER ENGINE ─────────────────────────────────────────────
+class ResourcesArscBrowserEngine:
+    """
+    Browses res/values/strings.xml (decoded from resources.arsc by apktool).
+    Shows all string entries with trigger detection.
+    Allows selective rename of string values with safe keywords.
+    Never modifies string name attributes — only values.
+    """
+
+    SAFE_VALUE_REPLACEMENTS = {
+        "payment":    "transaction",
+        "bank":       "financial_service",
+        "password":   "access_credential",
+        "secret":     "secure_data",
+        "private":    "restricted",
+        "admin":      "administrator",
+        "root":       "system_base",
+        "debug":      "diagnostic",
+        "hack":       "security_test",
+        "crack":      "integrity_check",
+        "token":      "session_identifier",
+        "apikey":     "service_identifier",
+        "api_key":    "service_identifier",
+        "key":        "identifier",
+        "credential": "authentication_data",
+    }
+
+    TRIGGER_WORDS = list(SAFE_VALUE_REPLACEMENTS.keys())
+
+    @staticmethod
+    def parse_strings(workspace_dir: str) -> list:
+        """
+        Parse res/values/strings.xml and return list of string entries.
+        Each entry: {name, value, trigger_found, trigger_words}
+        """
+        strings_path = Path(workspace_dir) / "res" / "values" / "strings.xml"
+        if not strings_path.exists():
+            return []
+
+        entries = []
+        try:
+            content = strings_path.read_text(encoding="utf-8", errors="ignore")
+            # Parse <string name="key">value</string> entries
+            for m in re.finditer(
+                    r'<string\s+name="([^"]+)"[^>]*>([^<]*)</string>',
+                    content):
+                name  = m.group(1)
+                value = m.group(2)
+                triggers = [
+                    tw for tw in ResourcesArscBrowserEngine.TRIGGER_WORDS
+                    if tw.lower() in value.lower() or tw.lower() in name.lower()
+                ]
+                entries.append({
+                    "name":          name,
+                    "value":         value,
+                    "trigger_found": len(triggers) > 0,
+                    "trigger_words": triggers,
+                })
+        except Exception as e:
+            logger.warning(f"[ResourcesArsc] Parse failed: {e}")
+        return entries
+
+    @staticmethod
+    def fix_all_triggers(workspace_dir: str) -> dict:
+        """Replace all trigger words in string values in strings.xml."""
+        strings_path = Path(workspace_dir) / "res" / "values" / "strings.xml"
+        if not strings_path.exists():
+            return {"success": False, "fixed": 0, "error": "strings.xml not found"}
+        try:
+            content = strings_path.read_text(encoding="utf-8", errors="ignore")
+            original = content
+            fixed = 0
+            for trigger, replacement in \
+                    ResourcesArscBrowserEngine.SAFE_VALUE_REPLACEMENTS.items():
+                pattern = (
+                    r'(<string\s+name="[^"]*"[^>]*>)'
+                    r'([^<]*' + re.escape(trigger) + r'[^<]*)'
+                    r'(</string>)'
+                )
+                def make_replacer(repl):
+                    def replacer(m):
+                        new_val = re.sub(
+                            re.escape(trigger), repl,
+                            m.group(2), flags=re.IGNORECASE)
+                        return m.group(1) + new_val + m.group(3)
+                    return replacer
+                new_content = re.sub(
+                    pattern, make_replacer(replacement),
+                    content, flags=re.IGNORECASE)
+                if new_content != content:
+                    fixed += 1
+                    content = new_content
+            if content != original:
+                strings_path.write_text(content, encoding="utf-8")
+            return {"success": True, "fixed": fixed}
+        except Exception as e:
+            return {"success": False, "fixed": 0, "error": str(e)}
+
+    @staticmethod
+    def fix_single_entry(workspace_dir: str, entry_name: str) -> dict:
+        """Fix trigger words in a single string entry by name."""
+        strings_path = Path(workspace_dir) / "res" / "values" / "strings.xml"
+        if not strings_path.exists():
+            return {"success": False, "fixed": 0}
+        try:
+            content = strings_path.read_text(encoding="utf-8", errors="ignore")
+            original = content
+            fixed = 0
+            pattern = (
+                r'(<string\s+name="' + re.escape(entry_name) + r'"[^>]*>)'
+                r'([^<]*)(</string>)'
+            )
+            def replacer(m):
+                nonlocal fixed
+                val = m.group(2)
+                for trigger, replacement in \
+                        ResourcesArscBrowserEngine.SAFE_VALUE_REPLACEMENTS.items():
+                    if trigger.lower() in val.lower():
+                        val = re.sub(
+                            re.escape(trigger), replacement,
+                            val, flags=re.IGNORECASE)
+                        fixed += 1
+                return m.group(1) + val + m.group(3)
+            content = re.sub(pattern, replacer, content, flags=re.IGNORECASE)
+            if content != original:
+                strings_path.write_text(content, encoding="utf-8")
+            return {"success": True, "fixed": fixed}
+        except Exception as e:
+            return {"success": False, "fixed": 0, "error": str(e)}
+
+
+# ── SESSION REPORT ENGINE ─────────────────────────────────────────────────────
+class SessionReportEngine:
+    """
+    Tracks all manual changes made during a session.
+    Generates full before/after report when requested.
+    """
+
+    def __init__(self):
+        self.log = []
+
+    def record(self, action: str, target: str,
+               before: str = "", after: str = "",
+               success: bool = True):
+        """Record a single action."""
+        self.log.append({
+            "action":    action,
+            "target":    target,
+            "before":    before,
+            "after":     after,
+            "success":   success,
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+        })
+
+    def generate_report(self, risk_before: int = 0,
+                        risk_after: int = 0) -> str:
+        """Generate full session report."""
+        if not self.log:
+            return "📋 *Session Report*\n\nNo changes made yet."
+
+        # Count by action type
+        counts = {}
+        for entry in self.log:
+            if entry["success"]:
+                counts[entry["action"]] = counts.get(entry["action"], 0) + 1
+
+        lines = [
+            "📋 *Session Report*\n",
+            "━━━━━━━━━━━━━━━━━━━━━",
+            f"Total actions: {len(self.log)}",
+            "━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for action, count in counts.items():
+            lines.append(f"  {action}: {count}")
+
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━━",
+            f"📊 Risk before: {risk_before}/100",
+            f"📊 Risk after:  {risk_after}/100",
+            "━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        # Recent changes
+        if self.log:
+            lines.append("*Recent Changes:*")
+            for entry in self.log[-5:]:
+                icon = "✅" if entry["success"] else "❌"
+                lines.append(
+                    f"  {icon} [{entry['timestamp']}] "
+                    f"{entry['action']}: `{entry['target'][:30]}`"
+                )
+                if entry["before"] and entry["after"]:
+                    lines.append(
+                        f"     Before: `{entry['before'][:25]}`")
+                    lines.append(
+                        f"     After:  `{entry['after'][:25]}`")
+
+        return "\n".join(lines)
+
+
 class BaseApkStorageEngine:
     """
     Manages persistent Base APK storage using Telegram file ID.
@@ -9029,6 +9597,8 @@ async def button_handler(update, context):
             return
 
         engine      = ManualControlEngine(CryptoEngine(), work_dir)
+        # Auto-append signing — every output is always installable
+        selected    = engine.enforce_auto_sign(selected)
         ordered_ops = engine.enforce_pipeline_order(selected)
 
         # Skip already-done steps silently
@@ -9886,6 +10456,648 @@ async def button_handler(update, context):
                 [InlineKeyboardButton(
                     "🔙 Back to Panel", callback_data="mcp_session_back")],
             ]))
+
+
+    # ── SAFETY ANALYSIS ───────────────────────────────────────────────────────
+    elif data == "safety_analyse":
+        if not is_admin(user.id): return
+        workspace = manual_workspace.get(user.id)
+        if not workspace or not os.path.exists(workspace):
+            await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
+            return
+        await query.edit_message_text(
+            "🛡️ *Safety Analysis*\n\n⏳ Analysing workspace...",
+            parse_mode="Markdown")
+        try:
+            analyser = SafetyAnalyserEngine()
+            result   = analyser.analyse(workspace)
+            await query.edit_message_text(
+                result["report"],
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+                ]))
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Safety analysis failed: `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    # ── AV TRIGGER SCAN ───────────────────────────────────────────────────────
+    elif data == "av_trigger_scan":
+        if not is_admin(user.id): return
+        workspace = manual_workspace.get(user.id)
+        if not workspace or not os.path.exists(workspace):
+            await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
+            return
+        await query.edit_message_text(
+            "🔬 *AV Trigger Scan*\n\n⏳ Scanning for trigger patterns...",
+            parse_mode="Markdown")
+        try:
+            scanner = AVTriggerScannerEngine()
+            result  = scanner.scan(workspace)
+            aes_key = manual_aes_key.get(user.id) or AESKeyManager.generate()
+            rows = [[InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")]]
+            if result["critical"]:
+                rows.insert(0, [InlineKeyboardButton(
+                    f"🔧 Auto-fix {len(result['critical'])} Critical",
+                    callback_data="av_autofix")])
+            await query.edit_message_text(
+                result["report"],
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(rows))
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ AV scan failed: `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    elif data == "av_autofix":
+        if not is_admin(user.id): return
+        workspace = manual_workspace.get(user.id)
+        aes_key   = manual_aes_key.get(user.id) or AESKeyManager.generate()
+        if not workspace:
+            await query.answer("⚠️ No workspace.", show_alert=True)
+            return
+        try:
+            scanner = AVTriggerScannerEngine()
+            result  = scanner.scan(workspace)
+            fixed   = scanner.auto_fix_critical(workspace, result["critical"], aes_key)
+            # Record in session report
+            rep = session_reports.setdefault(user.id, SessionReportEngine())
+            rep.record("🔧 AV Auto-fix", f"{fixed} critical patterns",
+                       before=str(len(result['critical'])), after="0")
+            await query.edit_message_text(
+                f"✅ *AV Auto-fix Complete*\n\n"
+                f"Fixed {fixed} critical trigger patterns.\n\n"
+                f"All critical strings encrypted — no longer visible to scanners.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+                ]))
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Auto-fix failed: `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    # ── DRY RUN PREVIEW ───────────────────────────────────────────────────────
+    elif data == "dry_run_preview":
+        if not is_admin(user.id): return
+        workspace = manual_workspace.get(user.id)
+        if not workspace or not os.path.exists(workspace):
+            await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
+            return
+        await query.edit_message_text(
+            "👁️ *Dry Run Preview*\n\n⏳ Analysing what would change...",
+            parse_mode="Markdown")
+        try:
+            safety  = SafetyAnalyserEngine()
+            av      = AVTriggerScannerEngine()
+            s_res   = safety.analyse(workspace)
+            av_res  = av.scan(workspace)
+            dry     = DryRunEngine()
+            preview = dry.preview(workspace, s_res, av_res)
+            await query.edit_message_text(
+                preview["report"],
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Proceed with Apply", callback_data="mcp_session_back")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="mcp_session_back")],
+                ]))
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Dry run failed: `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    # ── PERMISSION AUDITOR ────────────────────────────────────────────────────
+    elif data == "perm_audit":
+        if not is_admin(user.id): return
+        workspace = manual_workspace.get(user.id)
+        if not workspace or not os.path.exists(workspace):
+            await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
+            return
+        try:
+            auditor = PermissionAuditorEngine()
+            result  = auditor.audit(workspace)
+            await query.edit_message_text(
+                result["report"],
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+                ]))
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Permission audit failed: `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    # ── SESSION REPORT ────────────────────────────────────────────────────────
+    elif data == "session_report":
+        if not is_admin(user.id): return
+        rep = session_reports.get(user.id)
+        if not rep or not rep.log:
+            await query.edit_message_text(
+                "📋 *Session Report*\n\nNo manual changes recorded yet.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+                ]))
+            return
+        await query.edit_message_text(
+            rep.generate_report(),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+            ]))
+
+    # ── RES/ TREE BROWSER — Open root ────────────────────────────────────────
+    elif data == "res_tree_open":
+        if not is_admin(user.id): return
+        workspace = manual_workspace.get(user.id)
+        if not workspace or not os.path.exists(workspace):
+            await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
+            return
+        res_tree_workspace[user.id] = workspace
+        res_tree_path[user.id]      = ""
+        res_tree_selected[user.id]  = set()
+        roots = ResFolderTreeBrowser.list_res_roots(workspace)
+        if not roots:
+            await query.answer("⚠️ No res/ folder found in workspace.", show_alert=True)
+            return
+        rows = []
+        for root in roots:
+            rows.append([InlineKeyboardButton(
+                f"📁 {root}", callback_data=f"res_nav:{root}")])
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")])
+        await query.edit_message_text(
+            "📁 *res/ Tree Browser*\n\n"
+            "━━━━━━━━━━━━━━━━━━━━━\n"
+            "Select a folder to browse:\n\n"
+            "_Tap a file to see actions available._",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    # ── RES/ TREE — Navigate ──────────────────────────────────────────────────
+    elif data.startswith("res_nav:"):
+        if not is_admin(user.id): return
+        workspace = res_tree_workspace.get(user.id)
+        if not workspace:
+            await query.answer("⚠️ Session expired.", show_alert=True)
+            return
+        rel_path = data[len("res_nav:"):]
+        listing  = ResFolderTreeBrowser.list_folder(workspace, rel_path)
+        folders  = listing["folders"]
+        files    = listing["files"]
+        abs_base = listing["abs_path"]
+
+        parts       = rel_path.replace("\\", "/").split("/") if rel_path else []
+        parent_path = "/".join(parts[:-1]) if len(parts) > 1 else ""
+
+        rows = []
+        for folder in folders:
+            child = f"{rel_path}/{folder}" if rel_path else folder
+            rows.append([InlineKeyboardButton(
+                f"📁 {folder}", callback_data=f"res_nav:{child}")])
+
+        for fname in files:
+            abs_path = os.path.join(abs_base, fname)
+            icon, risk_label, safe, reason = ResFolderTreeBrowser.get_file_risk(
+                rel_path, fname, abs_path)
+            rows.append([InlineKeyboardButton(
+                f"{icon} {fname}",
+                callback_data=f"res_file:{rel_path}:{fname}")])
+
+        if rel_path:
+            back_cb = f"res_nav:{parent_path}" if parent_path else "res_tree_open"
+        else:
+            back_cb = "res_tree_open"
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
+
+        folder_name = rel_path.split("/")[-1] if rel_path else "res/"
+        await query.edit_message_text(
+            f"📁 *res/ Tree — {folder_name}*\n\n"
+            f"📁 Subfolders: {len(folders)}   📄 Files: {len(files)}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔴 High risk   🟡 Medium   🟢 Safe   ⚠️ Cannot rename",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    # ── RES/ TREE — File Action Menu ──────────────────────────────────────────
+    elif data.startswith("res_file:"):
+        if not is_admin(user.id): return
+        workspace = res_tree_workspace.get(user.id)
+        if not workspace:
+            await query.answer("⚠️ Session expired.", show_alert=True)
+            return
+        parts    = data[len("res_file:"):].rsplit(":", 1)
+        rel_path = parts[0]
+        fname    = parts[1]
+        abs_path = os.path.join(workspace, "res", rel_path, fname)
+
+        icon, risk_label, safe_to_rename, reason = \
+            ResFolderTreeBrowser.get_file_risk(rel_path, fname, abs_path)
+
+        triggers = ResFolderTreeBrowser.scan_file_triggers(abs_path)
+        trigger_text = f"🔴 Triggers: {', '.join(triggers)}" if triggers else "✅ No triggers found"
+
+        rows = []
+        if safe_to_rename:
+            rows.append([InlineKeyboardButton(
+                "✏️ Rename with Safe Keyword",
+                callback_data=f"res_rename:{rel_path}:{fname}")])
+        if triggers:
+            rows.append([InlineKeyboardButton(
+                "🔧 Fix Triggers Auto",
+                callback_data=f"res_fix:{rel_path}:{fname}")])
+        rows.append([InlineKeyboardButton(
+            "🔙 Back", callback_data=f"res_nav:{rel_path}")])
+
+        await query.edit_message_text(
+            f"📄 *File: {fname}*\n\n"
+            f"📍 Path: `res/{rel_path}/`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Safety: {icon} {risk_label}\n"
+            f"Reason: _{reason}_\n"
+            f"{trigger_text}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Choose action:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    # ── RES/ TREE — Rename file ───────────────────────────────────────────────
+    elif data.startswith("res_rename:"):
+        if not is_admin(user.id): return
+        workspace = res_tree_workspace.get(user.id)
+        parts    = data[len("res_rename:"):].rsplit(":", 1)
+        rel_path = parts[0]
+        fname    = parts[1]
+
+        suggestions = ResFolderTreeBrowser.get_rename_suggestions(fname)
+
+        rows = []
+        for i, s in enumerate(suggestions):
+            rows.append([InlineKeyboardButton(
+                f"✏️ {s}",
+                callback_data=f"res_do_rename:{rel_path}:{fname}:{s}")])
+        rows.append([InlineKeyboardButton(
+            "🔙 Back", callback_data=f"res_file:{rel_path}:{fname}")])
+
+        await query.edit_message_text(
+            f"✏️ *Rename: {fname}*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Before: `{fname}`\n\n"
+            f"Choose a safe keyword name:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    # ── RES/ TREE — Do rename ─────────────────────────────────────────────────
+    elif data.startswith("res_do_rename:"):
+        if not is_admin(user.id): return
+        workspace = res_tree_workspace.get(user.id)
+        parts    = data[len("res_do_rename:"):].split(":")
+        rel_path = parts[0]
+        old_name = parts[1]
+        new_name = parts[2]
+
+        result = ResFolderTreeBrowser.rename_file(workspace, rel_path, old_name, new_name)
+        rep = session_reports.setdefault(user.id, SessionReportEngine())
+
+        if result["success"]:
+            rep.record("✏️ Renamed", f"res/{rel_path}/{old_name}",
+                       before=old_name, after=new_name)
+            await query.edit_message_text(
+                f"✅ *Rename Complete*\n\n"
+                f"Before: `{old_name}`\n"
+                f"After:  `{new_name}`\n\n"
+                f"Path: `res/{rel_path}/`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📁 Back to Folder",
+                                         callback_data=f"res_nav:{rel_path}")],
+                    [InlineKeyboardButton("🔙 Back to res/",
+                                         callback_data="res_tree_open")],
+                ]))
+        else:
+            await query.edit_message_text(
+                f"❌ *Rename Failed*\n\n{result.get('error','')}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back",
+                                         callback_data=f"res_nav:{rel_path}")],
+                ]))
+
+    # ── RES/ TREE — Fix triggers ──────────────────────────────────────────────
+    elif data.startswith("res_fix:"):
+        if not is_admin(user.id): return
+        workspace = res_tree_workspace.get(user.id)
+        parts    = data[len("res_fix:"):].rsplit(":", 1)
+        rel_path = parts[0]
+        fname    = parts[1]
+        abs_path = os.path.join(workspace, "res", rel_path, fname)
+
+        result = ResFolderTreeBrowser.fix_triggers(abs_path)
+        rep = session_reports.setdefault(user.id, SessionReportEngine())
+
+        if result["success"]:
+            rep.record("🔧 Fix Triggers", f"res/{rel_path}/{fname}",
+                       before=f"{result['fixed']} triggers", after="0")
+            await query.edit_message_text(
+                f"✅ *Triggers Fixed*\n\n"
+                f"File: `{fname}`\n"
+                f"Fixed: {result['fixed']} trigger words replaced with safe keywords.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back",
+                                         callback_data=f"res_nav:{rel_path}")],
+                ]))
+        else:
+            await query.edit_message_text(
+                f"❌ Fix failed: {result.get('error','')}",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    # ── ANDROID MANIFEST BROWSER ──────────────────────────────────────────────
+    elif data == "manifest_browse_open":
+        if not is_admin(user.id): return
+        workspace = manual_workspace.get(user.id)
+        if not workspace or not os.path.exists(workspace):
+            await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
+            return
+        manifest_workspace[user.id] = workspace
+        try:
+            parsed = ManifestBrowserEngine.parse(workspace)
+            if "error" in parsed:
+                await query.answer(f"⚠️ {parsed['error']}", show_alert=True)
+                return
+
+            perms   = parsed["permissions"]
+            svc     = parsed["services"]
+            rcv     = parsed["receivers"]
+            act     = parsed["activities"]
+            triggers = parsed["trigger_hits"]
+
+            rows = [
+                [InlineKeyboardButton(
+                    f"🔐 Permissions ({len(perms)})",
+                    callback_data="manifest_perms")],
+                [InlineKeyboardButton(
+                    f"⚙️ Services ({len(svc)})",
+                    callback_data="manifest_services")],
+                [InlineKeyboardButton(
+                    f"📡 Receivers ({len(rcv)})",
+                    callback_data="manifest_receivers")],
+                [InlineKeyboardButton(
+                    f"🎯 Activities ({len(act)})",
+                    callback_data="manifest_activities")],
+            ]
+            if triggers:
+                rows.append([InlineKeyboardButton(
+                    f"🔧 Fix {len(triggers)} Trigger Values",
+                    callback_data="manifest_fix_triggers")])
+            rows.append([InlineKeyboardButton(
+                "🔙 Back", callback_data="mcp_session_back")])
+
+            trigger_note = (
+                f"⚠️ {len(triggers)} trigger words in label/description values"
+                if triggers else "✅ No trigger words in values"
+            )
+            await query.edit_message_text(
+                f"📄 *AndroidManifest Browser*\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🔐 Permissions: {len(perms)}\n"
+                f"⚙️ Services:    {len(svc)}\n"
+                f"📡 Receivers:   {len(rcv)}\n"
+                f"🎯 Activities:  {len(act)}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{trigger_note}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(rows))
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Failed: `{e}`", parse_mode="Markdown", reply_markup=back_a())
+
+    elif data == "manifest_perms":
+        if not is_admin(user.id): return
+        workspace = manifest_workspace.get(user.id)
+        if not workspace: return
+        parsed = ManifestBrowserEngine.parse(workspace)
+        perms  = parsed.get("permissions", [])
+        lines  = ["🔐 *Permissions*\n", "━━━━━━━━━━━━━━━━━━━━━"]
+        for p in perms:
+            icon, risk = ManifestBrowserEngine.get_permission_risk(p)
+            lines.append(f"  {icon} `{p}` — {risk}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("ℹ️ Permissions are READ-ONLY — never removed.")
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="manifest_browse_open")],
+            ]))
+
+    elif data == "manifest_services":
+        if not is_admin(user.id): return
+        workspace = manifest_workspace.get(user.id)
+        if not workspace: return
+        parsed   = ManifestBrowserEngine.parse(workspace)
+        services = parsed.get("services", [])
+        lines = ["⚙️ *Services*\n", "━━━━━━━━━━━━━━━━━━━━━"]
+        for s in services:
+            lines.append(f"  ⚠️ `{s.split('.')[-1]}` — manifest declared")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("ℹ️ Service names cannot be renamed — manifest declared.")
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="manifest_browse_open")],
+            ]))
+
+    elif data == "manifest_receivers":
+        if not is_admin(user.id): return
+        workspace = manifest_workspace.get(user.id)
+        if not workspace: return
+        parsed    = ManifestBrowserEngine.parse(workspace)
+        receivers = parsed.get("receivers", [])
+        lines = ["📡 *Receivers*\n", "━━━━━━━━━━━━━━━━━━━━━"]
+        for r in receivers:
+            lines.append(f"  ⚠️ `{r.split('.')[-1]}` — manifest declared")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("ℹ️ Receiver names cannot be renamed — manifest declared.")
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="manifest_browse_open")],
+            ]))
+
+    elif data == "manifest_activities":
+        if not is_admin(user.id): return
+        workspace = manifest_workspace.get(user.id)
+        if not workspace: return
+        parsed     = ManifestBrowserEngine.parse(workspace)
+        activities = parsed.get("activities", [])
+        lines = ["🎯 *Activities*\n", "━━━━━━━━━━━━━━━━━━━━━"]
+        for a in activities:
+            lines.append(f"  ⚠️ `{a.split('.')[-1]}` — manifest declared")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+        lines.append("ℹ️ Activity names cannot be renamed — manifest declared.")
+        await query.edit_message_text(
+            "\n".join(lines), parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="manifest_browse_open")],
+            ]))
+
+    elif data == "manifest_fix_triggers":
+        if not is_admin(user.id): return
+        workspace = manifest_workspace.get(user.id)
+        if not workspace: return
+        result = ManifestBrowserEngine.fix_trigger_values(workspace)
+        rep = session_reports.setdefault(user.id, SessionReportEngine())
+        if result["success"]:
+            rep.record("🔧 Manifest Trigger Fix",
+                       "AndroidManifest.xml",
+                       before=f"{result['fixed']} triggers", after="0")
+            await query.edit_message_text(
+                f"✅ *Manifest Triggers Fixed*\n\n"
+                f"Fixed {result['fixed']} trigger words in label/description values.\n\n"
+                f"All replaced with safe professional keywords.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="manifest_browse_open")],
+                ]))
+        else:
+            await query.edit_message_text(
+                f"❌ Fix failed: {result.get('error','')}",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    # ── RESOURCES.ARSC BROWSER ────────────────────────────────────────────────
+    elif data == "arsc_browse_open":
+        if not is_admin(user.id): return
+        workspace = manual_workspace.get(user.id)
+        if not workspace or not os.path.exists(workspace):
+            await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
+            return
+        arsc_workspace[user.id] = workspace
+        entries = ResourcesArscBrowserEngine.parse_strings(workspace)
+        arsc_entries[user.id] = entries
+
+        if not entries:
+            await query.edit_message_text(
+                "📦 *resources.arsc Browser*\n\n"
+                "⚠️ No strings.xml found.\n"
+                "Run Decode step first — apktool decodes resources.arsc to res/values/strings.xml.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+                ]))
+            return
+
+        risky = [e for e in entries if e["trigger_found"]]
+        clean = [e for e in entries if not e["trigger_found"]]
+
+        rows = []
+        if risky:
+            rows.append([InlineKeyboardButton(
+                f"🔴 View {len(risky)} Risky Strings",
+                callback_data="arsc_view_risky")])
+            rows.append([InlineKeyboardButton(
+                f"🔧 Fix All {len(risky)} Trigger Strings",
+                callback_data="arsc_fix_all")])
+        rows.append([InlineKeyboardButton(
+            f"🟢 View All {len(entries)} Strings",
+            callback_data="arsc_view_all")])
+        rows.append([InlineKeyboardButton(
+            "🔙 Back", callback_data="mcp_session_back")])
+
+        await query.edit_message_text(
+            f"📦 *resources.arsc Browser*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Total string entries: {len(entries)}\n"
+            f"🔴 Risky (trigger words): {len(risky)}\n"
+            f"🟢 Clean: {len(clean)}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data == "arsc_view_risky":
+        if not is_admin(user.id): return
+        entries = arsc_entries.get(user.id, [])
+        risky   = [e for e in entries if e["trigger_found"]]
+        rows = []
+        for e in risky[:20]:
+            triggers = ", ".join(e["trigger_words"][:2])
+            rows.append([InlineKeyboardButton(
+                f"🔴 {e['name'][:30]} — {triggers}",
+                callback_data=f"arsc_fix_entry:{e['name']}")])
+        rows.append([InlineKeyboardButton(
+            "🔙 Back", callback_data="arsc_browse_open")])
+        await query.edit_message_text(
+            f"🔴 *Risky String Entries*\n\n"
+            f"Tap an entry to fix its trigger words:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data == "arsc_view_all":
+        if not is_admin(user.id): return
+        entries = arsc_entries.get(user.id, [])
+        rows = []
+        for e in entries[:25]:
+            icon = "🔴" if e["trigger_found"] else "🟢"
+            rows.append([InlineKeyboardButton(
+                f"{icon} {e['name'][:35]}",
+                callback_data=f"arsc_fix_entry:{e['name']}"
+                if e["trigger_found"] else "arsc_browse_open")])
+        rows.append([InlineKeyboardButton(
+            "🔙 Back", callback_data="arsc_browse_open")])
+        await query.edit_message_text(
+            f"📋 *All String Entries* (showing first 25)\n\n"
+            f"🔴 Has trigger words   🟢 Clean",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows))
+
+    elif data == "arsc_fix_all":
+        if not is_admin(user.id): return
+        workspace = arsc_workspace.get(user.id)
+        if not workspace: return
+        result = ResourcesArscBrowserEngine.fix_all_triggers(workspace)
+        rep = session_reports.setdefault(user.id, SessionReportEngine())
+        if result["success"]:
+            rep.record("🔧 Fix All ARSC Triggers",
+                       "res/values/strings.xml",
+                       before=f"{result['fixed']} triggers", after="0")
+            # Refresh entries
+            arsc_entries[user.id] = ResourcesArscBrowserEngine.parse_strings(workspace)
+            await query.edit_message_text(
+                f"✅ *All Triggers Fixed*\n\n"
+                f"Fixed {result['fixed']} trigger word entries in strings.xml.\n"
+                f"All replaced with safe professional keywords.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="arsc_browse_open")],
+                ]))
+        else:
+            await query.edit_message_text(
+                f"❌ Fix failed: {result.get('error','')}",
+                parse_mode="Markdown", reply_markup=back_a())
+
+    elif data.startswith("arsc_fix_entry:"):
+        if not is_admin(user.id): return
+        workspace  = arsc_workspace.get(user.id)
+        entry_name = data[len("arsc_fix_entry:"):]
+        if not workspace: return
+        result = ResourcesArscBrowserEngine.fix_single_entry(workspace, entry_name)
+        rep = session_reports.setdefault(user.id, SessionReportEngine())
+        if result["success"]:
+            rep.record("🔧 Fix ARSC Entry", entry_name,
+                       before=f"{result['fixed']} triggers", after="0")
+            arsc_entries[user.id] = ResourcesArscBrowserEngine.parse_strings(workspace)
+            await query.edit_message_text(
+                f"✅ *Entry Fixed*\n\n"
+                f"Entry: `{entry_name}`\n"
+                f"Fixed {result['fixed']} trigger words.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="arsc_view_risky")],
+                ]))
+        else:
+            await query.edit_message_text(
+                f"❌ Fix failed.", parse_mode="Markdown", reply_markup=back_a())
+
 
     # ── CLIENT CALLBACKS ──────────────────────────────────────────────────────
     elif data == "client_request_apk":
