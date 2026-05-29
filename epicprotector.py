@@ -9388,10 +9388,7 @@ async def button_handler(update, context):
             await status_msg.edit_text(
                 f"🎛️ *Manual Control Panel*\n\n"
                 f"📦 `{apk_name}` loaded\n\n"
-                f"Select a preset or choose custom:\n\n"
-                f"⚡ *Quick Sign Only* — Strip, Decode, Keystore, Fingerprint, Sign\n"
-                f"🔒 *Full Protection* — All 22 steps\n"
-                f"🎯 *Custom* — You choose manually\n"
+                f"Select a phase to run:\n"
                 f"━━━━━━━━━━━━━━━━━━━━━",
                 parse_mode="Markdown",
                 reply_markup=engine.build_preset_keyboard())
@@ -11483,10 +11480,7 @@ async def document_handler(update, context):
             await status_msg.edit_text(
                 f"✅ *APK Received*\n\n"
                 f"📁 `{doc.file_name}` ({size_mb:.1f}MB)\n\n"
-                f"Select a preset or choose custom:\n\n"
-                f"⚡ *Quick Sign Only* — Strip, Decode, Keystore, Fingerprint, Sign\n"
-                f"🔒 *Full Protection* — All 22 steps\n"
-                f"🎯 *Custom* — You choose manually\n"
+                f"Select a phase to run:\n"
                 f"━━━━━━━━━━━━━━━━━━━━━",
                 parse_mode="Markdown",
                 reply_markup=engine.build_preset_keyboard())
