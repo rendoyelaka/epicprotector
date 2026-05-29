@@ -3137,15 +3137,17 @@ class IntegrityGuardian:
 class SmaliTreeBrowser:
     """
     Builds and navigates the smali folder tree for manual file selection.
-    Supports parent→child navigation across all smali* folders.
-    Never touches system/framework classes.
+    Shows ALL smali files at every level including root.
+    Each file shows a risk badge — safe, crash risk, or protected.
+    Safety analysis runs once per session and caches results.
     Never touches EpicSecurityGuard.smali.
     """
 
-    SKIP_PREFIXES = (
+    # Library folder prefixes — shown with warning badge but NOT hidden
+    LIBRARY_PREFIXES = (
         "com/android/", "android/", "androidx/", "kotlin/",
         "com/google/", "java/", "dalvik/", "kotlinx/",
-        "org/apache/", "org/jetbrains/",
+        "org/apache/", "org/jetbrains/", "io/",
     )
 
     @staticmethod
@@ -3158,13 +3160,20 @@ class SmaliTreeBrowser:
         return roots
 
     @staticmethod
+    def is_library_folder(folder_name: str) -> bool:
+        """Return True if folder is a known library — warn but don't hide."""
+        name = folder_name.lower()
+        return name in (
+            "androidx", "android", "kotlin", "kotlinx",
+            "com", "io", "org", "java", "javax", "dalvik",
+        )
+
+    @staticmethod
     def list_folder(workspace_dir: str, rel_path: str) -> dict:
         """
-        List contents of a folder at rel_path inside workspace_dir.
-        Returns:
-          folders: list of subfolder names
-          files:   list of .smali filenames (excluding protected)
-          abs_path: absolute path to this folder
+        List ALL contents of a folder at rel_path inside workspace_dir.
+        Returns every smali file — no filtering — admin decides what to select.
+        Each file tagged with risk level from safety analysis if available.
         """
         abs_path = os.path.join(workspace_dir, rel_path) if rel_path else workspace_dir
         folders  = []
@@ -3178,22 +3187,40 @@ class SmaliTreeBrowser:
             if os.path.isdir(full):
                 folders.append(item)
             elif item.endswith(".smali"):
-                # Never show EpicSecurityGuard
+                # Never show EpicSecurityGuard — security class
                 if item == "EpicSecurityGuard.smali":
                     continue
-                # Build relative path to check skip prefixes
-                rel_item = os.path.join(rel_path, item).replace("\\", "/") if rel_path else item
-                skip = False
-                for root_name in SmaliTreeBrowser.get_smali_roots(workspace_dir):
-                    if rel_item.startswith(root_name + "/"):
-                        inner = rel_item[len(root_name) + 1:]
-                        if any(inner.startswith(p) for p in SmaliTreeBrowser.SKIP_PREFIXES):
-                            skip = True
-                            break
-                if not skip:
-                    files.append(item)
+                files.append(item)
 
         return {"folders": folders, "files": files, "abs_path": abs_path}
+
+    @staticmethod
+    def get_file_risk_badge(fname: str, crash_risk_files: set,
+                             protected_files: set) -> str:
+        """
+        Return risk badge for a smali file.
+        ✅ = safe to rename
+        ❌ = crash risk — do not rename
+        🔒 = protected system class
+        """
+        base = fname.replace(".smali", "")
+        if base in protected_files:
+            return "🔒"
+        if base in crash_risk_files:
+            return "❌"
+        return "✅"
+
+    @staticmethod
+    def get_folder_badge(folder_name: str) -> str:
+        """Return badge for a folder."""
+        name = folder_name.lower()
+        if name in ("androidx", "kotlin", "kotlinx", "java", "javax", "dalvik"):
+            return "🔒"
+        if name in ("io",):
+            return "⚠️"
+        if name == "com":
+            return "📦"
+        return "📁"
 
     @staticmethod
     def build_breadcrumb(rel_path: str) -> str:
@@ -3202,6 +3229,14 @@ class SmaliTreeBrowser:
             return "📁 Root"
         parts = rel_path.replace("\\", "/").split("/")
         return " › ".join(parts)
+
+    @staticmethod
+    def count_all_smali(workspace_dir: str) -> int:
+        """Count total smali files in workspace."""
+        count = 0
+        for sdir in Path(workspace_dir).glob("smali*"):
+            count += len(list(sdir.rglob("*.smali")))
+        return count
 
 
 # ── SMALI RED FLAG SCANNER ────────────────────────────────────────────────────
@@ -8168,6 +8203,7 @@ manifest_workspace  = {}   # workspace for manifest browser
 arsc_workspace      = {}   # workspace for resources.arsc browser
 arsc_entries        = {}   # cached string entries for arsc browser
 session_reports     = {}   # SessionReportEngine per user
+smali_safety_cache  = {}   # cached safety analysis results per user
 manual_keystore_ctx = {}   # keystore context shared across steps {keystore_path, alias, ks_pass, key_pass, sha256}
 
 # ── ADMIN KEYBOARD ───────────────────────────────────────────────────────────
@@ -9308,7 +9344,7 @@ async def button_handler(update, context):
 
     # ── BACK TO ADMIN ─────────────────────────────────────────────────────────
     if data == "back_admin":
-        for d in [pending_manual, phase2_paused, phase2_after_ops, manual_apk_path,
+        for d in [pending_manual, phase2_paused, phase2_after_ops, smali_safety_cache, manual_apk_path,
                   manual_workspace, manual_work_dir, manual_selected,
                   manual_aes_key, manual_undo_backup, manual_job_start,
                   manual_done_steps, manual_session_log, manual_keystore_ctx,
@@ -10350,31 +10386,63 @@ async def button_handler(update, context):
                 "🌲 *Smali Tree Browser*\n\n"
                 "━━━━━━━━━━━━━━━━━━━━━\n"
                 "⚠️ *No smali folders found.*\n\n"
-                "The workspace exists but contains\n"
-                "no smali/ folders. Run Phase 1 to\n"
-                "decode your APK first.",
+                "Run Phase 1 to decode your APK first.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "📋 Run Phase 1 First",
+                        callback_data="mcp_preset_phase_1_setup")],
                     [InlineKeyboardButton(
                         "⬅️ Back",
                         callback_data="phase2_back_from_inspect")],
                 ]))
             return
 
+        # Run safety analysis — cache results for this session
+        await query.edit_message_text(
+            "🌲 *Smali Tree Browser*\n\n⏳ Running safety analysis...",
+            parse_mode="Markdown")
+
+        try:
+            analyser     = SafetyAnalyserEngine()
+            safety       = analyser.analyse(workspace)
+            crash_files  = set(cr["file"].replace(".smali","")
+                               for cr in safety["crash_risk"])
+            prot_files   = set(p.split("/")[-1] for p in safety["protected"])
+            smali_safety_cache[user.id] = {
+                "crash_risk": crash_files,
+                "protected":  prot_files,
+                "safe_count": len(safety["safe"]),
+                "crash_count": len(safety["crash_risk"]),
+            }
+        except Exception:
+            smali_safety_cache[user.id] = {
+                "crash_risk": set(),
+                "protected":  set(),
+                "safe_count": 0,
+                "crash_count": 0,
+            }
+
+        cache       = smali_safety_cache[user.id]
+        total_smali = SmaliTreeBrowser.count_all_smali(workspace)
+
         rows = []
         for root in roots:
             rows.append([InlineKeyboardButton(
                 f"📁 {root}", callback_data=f"smali_nav:{root}")])
-        rows.append([InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")])
+        rows.append([InlineKeyboardButton(
+            "⬅️ Back", callback_data="phase2_back_from_inspect")])
 
         await query.edit_message_text(
-            "🌲 *Manual Smali Rename*\n\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "Select a smali folder to browse:\n\n"
-            "_Tap smali → navigate into subfolders\n"
-            "until you see .smali files.\n"
-            "Example: smali → com → app → files\n\n"
-            "System and framework classes are excluded automatically._",
+            f"🌲 *Smali Tree Browser*\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Total smali files: {total_smali}\n"
+            f"✅ Safe to rename:    {cache['safe_count']}\n"
+            f"❌ Crash risk:        {cache['crash_count']}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Tap a folder to browse:\n\n"
+            f"_Each file shows:\n"
+            f"✅ Safe  ❌ Crash risk  🔒 Protected_",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(rows))
 
@@ -10400,6 +10468,10 @@ async def button_handler(update, context):
         files      = listing["files"]
         selected   = smali_selected_files.get(user.id, set())
         breadcrumb = SmaliTreeBrowser.build_breadcrumb(rel_path)
+        cache      = smali_safety_cache.get(user.id, {
+            "crash_risk": set(), "protected": set()})
+        crash_files = cache.get("crash_risk", set())
+        prot_files  = cache.get("protected", set())
 
         smali_tree_path[user.id] = rel_path
 
@@ -10409,33 +10481,42 @@ async def button_handler(update, context):
 
         rows = []
 
-        # Subfolders
+        # Subfolders — with folder badge
         for folder in folders:
-            child_rel = f"{rel_path}/{folder}" if rel_path else folder
+            child_rel  = f"{rel_path}/{folder}" if rel_path else folder
+            folder_badge = SmaliTreeBrowser.get_folder_badge(folder)
             rows.append([InlineKeyboardButton(
-                f"📁 {folder}", callback_data=f"smali_nav:{child_rel}")])
+                f"{folder_badge} {folder}",
+                callback_data=f"smali_nav:{child_rel}")])
 
-        # Smali files with checkbox toggle
+        # Smali files — with risk badge + checkbox toggle
+        safe_files_in_folder = []
         for fname in files:
-            abs_path = os.path.join(listing["abs_path"], fname)
-            icon     = "✅" if abs_path in selected else "⬜"
+            abs_path   = os.path.join(listing["abs_path"], fname)
+            risk_badge = SmaliTreeBrowser.get_file_risk_badge(
+                fname, crash_files, prot_files)
+            check_icon = "☑️" if abs_path in selected else "☐"
             rows.append([InlineKeyboardButton(
-                f"{icon} {fname}",
+                f"{check_icon} {risk_badge} {fname}",
                 callback_data=f"smali_toggle:{rel_path}:{fname}")])
+            if risk_badge == "✅":
+                safe_files_in_folder.append(abs_path)
 
         # Controls
         if files:
             rows.append([
                 InlineKeyboardButton(
-                    "✅ Select All", callback_data=f"smali_all:{rel_path}:select"),
+                    f"✅ Select Safe ({len(safe_files_in_folder)})",
+                    callback_data=f"smali_all:{rel_path}:select"),
                 InlineKeyboardButton(
-                    "⬜ Clear All", callback_data=f"smali_all:{rel_path}:clear"),
+                    "☐ Clear All",
+                    callback_data=f"smali_all:{rel_path}:clear"),
             ])
             rows.append([InlineKeyboardButton(
                 f"🔍 Scan & Fix Selected ({len(selected)} selected)",
                 callback_data="smali_scan")])
             rows.append([InlineKeyboardButton(
-                f"📁 Apply to Entire Folder",
+                "📁 Apply to Entire Folder (safe files only)",
                 callback_data=f"smali_folder:{rel_path}")])
 
         # Back button
@@ -10446,14 +10527,25 @@ async def button_handler(update, context):
             rows.append([InlineKeyboardButton("🔙 Back", callback_data="smali_tree_open")])
 
         selected_count = len(selected)
+        # Count risk levels in current folder
+        safe_count  = sum(1 for f in files
+                          if SmaliTreeBrowser.get_file_risk_badge(
+                              f, crash_files, prot_files) == "✅")
+        crash_count = sum(1 for f in files
+                          if SmaliTreeBrowser.get_file_risk_badge(
+                              f, crash_files, prot_files) == "❌")
+        prot_count  = sum(1 for f in files
+                          if SmaliTreeBrowser.get_file_risk_badge(
+                              f, crash_files, prot_files) == "🔒")
+
         if not files and folders:
-            nav_hint = (
-                f"_No .smali files here — tap a subfolder to go deeper._"
-            )
+            nav_hint = "_No .smali files here — tap a subfolder to go deeper._"
         elif files:
             nav_hint = (
-                f"_Tap files to toggle ✅/⬜ selection.\n"
-                f"Tap 🔍 Scan & Fix when ready._"
+                f"_✅ Safe: {safe_count}  "
+                f"❌ Crash risk: {crash_count}  "
+                f"🔒 Protected: {prot_count}_\n"
+                f"_Tap ✅ Select Safe to select safe files only._"
             )
         else:
             nav_hint = "_This folder is empty._"
@@ -10464,7 +10556,7 @@ async def button_handler(update, context):
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📁 Subfolders: {len(folders)}   "
             f"📄 Files: {len(files)}\n"
-            f"✅ Selected: {selected_count} file(s)\n"
+            f"☑️  Selected: {selected_count} file(s)\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"{nav_hint}"
         )
@@ -10561,16 +10653,31 @@ async def button_handler(update, context):
         files    = listing["files"]
         selected = smali_selected_files.get(user.id, set())
 
+        cache       = smali_safety_cache.get(user.id, {"crash_risk": set(), "protected": set()})
+        crash_files = cache.get("crash_risk", set())
+        prot_files  = cache.get("protected", set())
+
         if action == "select":
+            # Only select SAFE files — crash risk and protected never selected
+            added = 0
+            skipped = 0
             for fname in files:
-                abs_path = os.path.join(listing["abs_path"], fname)
-                selected.add(abs_path)
-            await query.answer(f"✅ Selected {len(files)} files")
+                badge = SmaliTreeBrowser.get_file_risk_badge(
+                    fname, crash_files, prot_files)
+                if badge == "✅":
+                    abs_path = os.path.join(listing["abs_path"], fname)
+                    selected.add(abs_path)
+                    added += 1
+                else:
+                    skipped += 1
+            await query.answer(
+                f"✅ {added} safe files selected. "
+                f"{skipped} crash risk files skipped.")
         else:
             for fname in files:
                 abs_path = os.path.join(listing["abs_path"], fname)
                 selected.discard(abs_path)
-            await query.answer("⬜ All files deselected")
+            await query.answer("☐ All files deselected")
 
         smali_selected_files[user.id] = selected
 
