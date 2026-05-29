@@ -9520,13 +9520,31 @@ async def button_handler(update, context):
             # Always clear signing steps from done_steps for each phase run.
             # This ensures every phase produces a fresh signed installable APK.
             # Signing steps must always re-run — never skipped between phases.
+            # These steps ALWAYS re-run on every phase.
+            # decode_workspace and strip_signature must always re-run
+            # so each phase starts with a fresh decoded workspace.
+            # Without this — Phase 2+ would use a stale or deleted workspace
+            # from /tmp/ causing all protection steps to silently fail.
             ALWAYS_RERUN_STEPS = {
-                "rebuild_apk", "keystore_generation",
-                "unique_fingerprint", "zipalign",
-                "sign_apk", "protection_score",
-                "integrity_manifest", "aes_key_management",
+                # Workspace setup — must always be fresh
+                "preflight_validation",
+                "strip_signature",
+                "decode_workspace",
+                "compliance_scan",
+                # Signing — must always produce fresh APK
+                "rebuild_apk",
+                "keystore_generation",
+                "unique_fingerprint",
+                "zipalign",
+                "sign_apk",
+                "protection_score",
+                "integrity_manifest",
+                "aes_key_management",
             }
             done_steps -= ALWAYS_RERUN_STEPS
+            # Also reset workspace so it is rebuilt fresh for this phase
+            manual_workspace[user.id] = None
+            current_workspace = None
 
             tools       = ToolInstaller()
             tools.install_all()
