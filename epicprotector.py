@@ -10315,10 +10315,29 @@ async def button_handler(update, context):
     # ── SMALI TREE — Open root ────────────────────────────────────────────────
     elif data == "smali_tree_open":
         if not is_admin(user.id): return
-        workspace = manual_workspace.get(user.id)
+
+        # Check workspace from smali_tree_workspace first, then manual_workspace
+        workspace = smali_tree_workspace.get(user.id)
         if not workspace or not os.path.exists(workspace):
-            await query.answer(
-                "⚠️ No workspace loaded. Run Decode step first.", show_alert=True)
+            workspace = manual_workspace.get(user.id)
+
+        if not workspace or not os.path.exists(workspace):
+            await query.edit_message_text(
+                "🌲 *Smali Tree Browser*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "⚠️ *No workspace found.*\n\n"
+                "You need to run at least\n"
+                "*Phase 1 — Setup* first to decode\n"
+                "your APK before browsing smali files.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "📋 Run Phase 1 First",
+                        callback_data="mcp_preset_phase_1_setup")],
+                    [InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="phase2_back_from_inspect")],
+                ]))
             return
 
         smali_tree_workspace[user.id] = workspace
@@ -10327,7 +10346,19 @@ async def button_handler(update, context):
 
         roots = SmaliTreeBrowser.get_smali_roots(workspace)
         if not roots:
-            await query.answer("⚠️ No smali folders found in workspace.", show_alert=True)
+            await query.edit_message_text(
+                "🌲 *Smali Tree Browser*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "⚠️ *No smali folders found.*\n\n"
+                "The workspace exists but contains\n"
+                "no smali/ folders. Run Phase 1 to\n"
+                "decode your APK first.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "⬅️ Back",
+                        callback_data="phase2_back_from_inspect")],
+                ]))
             return
 
         rows = []
