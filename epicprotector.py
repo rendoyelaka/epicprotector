@@ -8158,6 +8158,8 @@ manual_selected     = {}   # set of selected operation keys
 manual_aes_key      = {}   # AES key for this job session
 manual_undo_backup  = {}   # backup dir for undo last job
 manual_job_start    = {}   # job start timestamp
+phase2_paused       = {}   # True when Phase 2 is paused for inspection
+phase2_after_ops    = {}   # remaining ops to run after inspection
 # ── New tree browser session state ───────────────────────────────────────────
 res_tree_workspace  = {}   # workspace for res/ tree browser
 res_tree_path       = {}   # current path in res/ tree
@@ -9306,7 +9308,7 @@ async def button_handler(update, context):
 
     # ── BACK TO ADMIN ─────────────────────────────────────────────────────────
     if data == "back_admin":
-        for d in [pending_manual, manual_apk_path,
+        for d in [pending_manual, phase2_paused, phase2_after_ops, manual_apk_path,
                   manual_workspace, manual_work_dir, manual_selected,
                   manual_aes_key, manual_undo_backup, manual_job_start,
                   manual_done_steps, manual_session_log, manual_keystore_ctx,
@@ -9585,6 +9587,16 @@ async def button_handler(update, context):
         }
 
         if preset_key in PHASE_KEYS:
+            # Phase 2 — split into two halves with inspection pause
+            PHASE2_PAUSE_AFTER = {
+                "obfuscation", "safe_rename"
+            }
+            PHASE2_RESUME_FROM = [
+                "encryption", "security_guard", "tamper_detection",
+                "dex_repackaging", "rebuild_apk", "keystore_generation",
+                "unique_fingerprint", "zipalign", "sign_apk", "protection_score",
+            ]
+
             # Run phase immediately
             ops      = engine.PRESETS.get(preset_key, [])
             selected = engine.enforce_auto_sign(set(ops))
@@ -9703,6 +9715,69 @@ async def button_handler(update, context):
                     done_steps.add(op_key)
 
                 job_results.append(result)
+
+                # ── Phase 2 Pause Point — after obfuscation + safe_rename ────
+                # Pause here so admin can inspect and manually rename
+                if (preset_key == "phase_2_code_protection" and
+                        op_key == "safe_rename" and
+                        "❌" not in result.get("status", "")):
+
+                    # Save remaining ops for after inspection
+                    remaining = [
+                        op for op in PHASE2_RESUME_FROM
+                        if op not in done_steps
+                    ]
+                    phase2_paused[user.id]    = True
+                    phase2_after_ops[user.id] = remaining
+                    manual_done_steps[user.id]   = done_steps
+                    manual_keystore_ctx[user.id] = keystore_ctx
+                    manual_workspace[user.id]    = current_workspace
+
+                    # Build partial summary
+                    partial_lines = [
+                        "⏸️ *Phase 2 — Paused for Inspection*\n",
+                        "━━━━━━━━━━━━━━━━━━━━━",
+                    ]
+                    for r in job_results:
+                        icon = "✅" if "❌" not in r.get("status","") else "❌"
+                        partial_lines.append(
+                            f"{icon} {r.get('label', r.get('op',''))}")
+                    partial_lines += [
+                        "━━━━━━━━━━━━━━━━━━━━━",
+                        "✅ Obfuscation complete",
+                        "✅ Safe rename complete",
+                        "",
+                        "🔍 *Inspect your renamed files now.*",
+                        "Use File Editor to view and manually",
+                        "rename any files to your preferred",
+                        "safe keyword names.",
+                        "",
+                        "When ready tap *▶️ Continue Phase 2*",
+                        "to run Encryption + Security Guard.",
+                    ]
+
+                    await status_msg.edit_text(
+                        "\n".join(partial_lines),
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton(
+                                "▶️ Continue Phase 2",
+                                callback_data="phase2_continue")],
+                            [InlineKeyboardButton(
+                                "🌲 Inspect smali/ Files",
+                                callback_data="smali_tree_open")],
+                            [InlineKeyboardButton(
+                                "📁 Inspect res/ Files",
+                                callback_data="res_tree_open")],
+                            [InlineKeyboardButton(
+                                "📄 Inspect AndroidManifest",
+                                callback_data="manifest_browse_open")],
+                            [InlineKeyboardButton(
+                                "📦 Inspect resources.arsc",
+                                callback_data="arsc_browse_open")],
+                        ]))
+                    return
+                # ── End Phase 2 Pause ─────────────────────────────────────────
 
             manual_done_steps[user.id]   = done_steps
             manual_keystore_ctx[user.id] = keystore_ctx
@@ -11356,6 +11431,124 @@ async def button_handler(update, context):
             await query.edit_message_text(
                 f"❌ Fix failed.", parse_mode="Markdown", reply_markup=back_a())
 
+
+    # ── PHASE 2 — Continue after inspection ──────────────────────────────────
+    elif data == "phase2_continue":
+        if not is_admin(user.id): return
+        if not phase2_paused.get(user.id):
+            await query.answer("⚠️ No paused Phase 2 session.", show_alert=True)
+            return
+
+        work_dir  = manual_work_dir.get(user.id)
+        apk_path  = manual_apk_path.get(user.id)
+        workspace = manual_workspace.get(user.id)
+        aes_key   = manual_aes_key.get(user.id) or AESKeyManager.generate()
+        after_ops = phase2_after_ops.get(user.id, [])
+
+        if not after_ops:
+            await query.answer("⚠️ No remaining operations.", show_alert=True)
+            return
+
+        phase2_paused.pop(user.id, None)
+        phase2_after_ops.pop(user.id, None)
+
+        status_msg = await query.edit_message_text(
+            f"🛡️ *Phase 2 — Continuing...*\n\n"
+            f"⏳ Running {len(after_ops)} remaining operations...",
+            parse_mode="Markdown")
+
+        tools   = ToolInstaller()
+        tools.install_all()
+        scanner = ComplianceScannerEngine()
+        engine  = ManualControlEngine(CryptoEngine(), work_dir)
+
+        job_results   = []
+        current_apk   = apk_path
+        keystore_ctx  = manual_keystore_ctx.get(user.id, {})
+        done_steps    = manual_done_steps.get(user.id, set())
+        start_time    = time.time()
+
+        # Use existing workspace from inspection
+        current_workspace = workspace
+
+        for i, op_key in enumerate(after_ops):
+            label = engine.STEP_LABELS.get(op_key, op_key)
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=status_msg.message_id,
+                    text=f"🛡️ *Phase 2 — Continuing*\n\n"
+                         f"Step {i+1}/{len(after_ops)}: {label}\n"
+                         f"⏳ Processing...",
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+
+            result = engine.run_operation(
+                op_key, current_apk, current_workspace,
+                work_dir, aes_key, tools, scanner,
+                rebuilt_apk_override=current_apk if op_key == "sign_apk" else None,
+                keystore_ctx=keystore_ctx,
+                completed_ops=done_steps)
+
+            if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
+                current_apk = result["rebuilt_apk"]
+            if op_key == "rebuild_apk" and result.get("workspace"):
+                current_workspace = result["workspace"]
+                manual_workspace[user.id] = current_workspace
+
+            if "❌" not in result.get("status", ""):
+                done_steps.add(op_key)
+            job_results.append(result)
+
+        manual_done_steps[user.id]   = done_steps
+        manual_keystore_ctx[user.id] = keystore_ctx
+
+        # Summary
+        applied    = [r["op"] for r in job_results if "❌" not in r.get("status","")]
+        scorer     = ProtectionScoreEngine()
+        score_r    = scorer.calculate(applied)
+        elapsed    = int(time.time() - start_time)
+        mins, secs = elapsed // 60, elapsed % 60
+
+        final_apk = None
+        for r in reversed(job_results):
+            if r.get("final_apk") and os.path.exists(r["final_apk"]):
+                final_apk = r["final_apk"]
+                break
+
+        lines = [
+            "✅ *Phase 2 — Complete*\n",
+            "━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for r in job_results:
+            icon = "✅" if "❌" not in r.get("status","") else "❌"
+            lines.append(f"{icon} {r.get('label', r.get('op',''))}")
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━━",
+            f"🕐 Time: `{mins}m {secs}s`",
+            f"📊 Score: *{score_r['score']}/100 — {score_r['grade']}*",
+        ]
+
+        await status_msg.edit_text("\n".join(lines), parse_mode="Markdown")
+
+        if final_apk and os.path.exists(final_apk):
+            with open(final_apk, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=user.id,
+                    document=f,
+                    filename="EPIC_PHASE_2_CODE_PROTECTION.apk",
+                    caption="✅ *Phase 2 — Install & Test*\n\nInstall on your device.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Run Next Phase", callback_data="mcp_show_presets")],
+                        [InlineKeyboardButton("⬅️ Back to Menu",   callback_data="back_admin")],
+                    ]))
+        else:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="⚠️ No signed APK produced.",
+                reply_markup=back_a())
 
     # ── CLIENT CALLBACKS ──────────────────────────────────────────────────────
     elif data == "client_request_apk":
