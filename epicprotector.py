@@ -10349,9 +10349,17 @@ async def button_handler(update, context):
     elif data.startswith("smali_nav:"):
         if not is_admin(user.id): return
         workspace = smali_tree_workspace.get(user.id)
-        if not workspace:
-            await query.answer("⚠️ Session expired. Reopen from menu.", show_alert=True)
-            return
+
+        # Fallback — try manual_workspace if smali_tree_workspace not set
+        if not workspace or not os.path.exists(workspace):
+            workspace = manual_workspace.get(user.id)
+            if workspace and os.path.exists(workspace):
+                smali_tree_workspace[user.id] = workspace
+            else:
+                await query.answer(
+                    "⚠️ Workspace not found. Run Phase 1 or Decode step first.",
+                    show_alert=True)
+                return
 
         rel_path   = data[len("smali_nav:"):]
         listing    = SmaliTreeBrowser.list_folder(workspace, rel_path)
