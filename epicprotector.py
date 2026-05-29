@@ -10371,7 +10371,9 @@ async def button_handler(update, context):
             "🌲 *Manual Smali Rename*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
             "Select a smali folder to browse:\n\n"
-            "_Tap a folder to navigate into it.\n"
+            "_Tap smali → navigate into subfolders\n"
+            "until you see .smali files.\n"
+            "Example: smali → com → app → files\n\n"
             "System and framework classes are excluded automatically._",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(rows))
@@ -10444,6 +10446,18 @@ async def button_handler(update, context):
             rows.append([InlineKeyboardButton("🔙 Back", callback_data="smali_tree_open")])
 
         selected_count = len(selected)
+        if not files and folders:
+            nav_hint = (
+                f"_No .smali files here — tap a subfolder to go deeper._"
+            )
+        elif files:
+            nav_hint = (
+                f"_Tap files to toggle ✅/⬜ selection.\n"
+                f"Tap 🔍 Scan & Fix when ready._"
+            )
+        else:
+            nav_hint = "_This folder is empty._"
+
         msg = (
             f"🌲 *Smali Tree Browser*\n\n"
             f"📍 `{breadcrumb}`\n"
@@ -10452,8 +10466,7 @@ async def button_handler(update, context):
             f"📄 Files: {len(files)}\n"
             f"✅ Selected: {selected_count} file(s)\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"_Tap files to toggle ✅/⬜ selection.\n"
-            f"Tap 🔍 Scan & Fix when ready._"
+            f"{nav_hint}"
         )
         await query.edit_message_text(
             msg, parse_mode="Markdown",
