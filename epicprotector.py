@@ -10334,7 +10334,7 @@ async def button_handler(update, context):
         for root in roots:
             rows.append([InlineKeyboardButton(
                 f"📁 {root}", callback_data=f"smali_nav:{root}")])
-        rows.append([InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")])
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")])
 
         await query.edit_message_text(
             "🌲 *Manual Smali Rename*\n\n"
@@ -10787,7 +10787,7 @@ async def button_handler(update, context):
                 [InlineKeyboardButton(
                     "🌲 Back to Tree", callback_data="smali_tree_open")],
                 [InlineKeyboardButton(
-                    "🔙 Back to Panel", callback_data="mcp_session_back")],
+                    "🔙 Back to Panel", callback_data="phase2_back_from_inspect")],
             ]))
 
 
@@ -10808,7 +10808,7 @@ async def button_handler(update, context):
                 result["report"],
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
                 ]))
         except Exception as e:
             await query.edit_message_text(
@@ -10829,7 +10829,7 @@ async def button_handler(update, context):
             scanner = AVTriggerScannerEngine()
             result  = scanner.scan(workspace)
             aes_key = manual_aes_key.get(user.id) or AESKeyManager.generate()
-            rows = [[InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")]]
+            rows = [[InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")]]
             if result["critical"]:
                 rows.insert(0, [InlineKeyboardButton(
                     f"🔧 Auto-fix {len(result['critical'])} Critical",
@@ -10864,7 +10864,7 @@ async def button_handler(update, context):
                 f"All critical strings encrypted — no longer visible to scanners.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
                 ]))
         except Exception as e:
             await query.edit_message_text(
@@ -10892,8 +10892,8 @@ async def button_handler(update, context):
                 preview["report"],
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Proceed with Apply", callback_data="mcp_session_back")],
-                    [InlineKeyboardButton("❌ Cancel", callback_data="mcp_session_back")],
+                    [InlineKeyboardButton("✅ Proceed with Apply", callback_data="phase2_back_from_inspect")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="phase2_back_from_inspect")],
                 ]))
         except Exception as e:
             await query.edit_message_text(
@@ -10914,7 +10914,7 @@ async def button_handler(update, context):
                 result["report"],
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
                 ]))
         except Exception as e:
             await query.edit_message_text(
@@ -10930,14 +10930,14 @@ async def button_handler(update, context):
                 "📋 *Session Report*\n\nNo manual changes recorded yet.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
                 ]))
             return
         await query.edit_message_text(
             rep.generate_report(),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+                [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
             ]))
 
     # ── RES/ TREE BROWSER — Open root ────────────────────────────────────────
@@ -10958,7 +10958,7 @@ async def button_handler(update, context):
         for root in roots:
             rows.append([InlineKeyboardButton(
                 f"📁 {root}", callback_data=f"res_nav:{root}")])
-        rows.append([InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")])
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")])
         await query.edit_message_text(
             "📁 *res/ Tree Browser*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -11184,7 +11184,7 @@ async def button_handler(update, context):
                     f"🔧 Fix {len(triggers)} Trigger Values",
                     callback_data="manifest_fix_triggers")])
             rows.append([InlineKeyboardButton(
-                "🔙 Back", callback_data="mcp_session_back")])
+                "🔙 Back", callback_data="phase2_back_from_inspect")])
 
             trigger_note = (
                 f"⚠️ {len(triggers)} trigger words in label/description values"
@@ -11316,7 +11316,7 @@ async def button_handler(update, context):
                 "Run Decode step first — apktool decodes resources.arsc to res/values/strings.xml.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="mcp_session_back")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
                 ]))
             return
 
@@ -11335,7 +11335,7 @@ async def button_handler(update, context):
             f"🟢 View All {len(entries)} Strings",
             callback_data="arsc_view_all")])
         rows.append([InlineKeyboardButton(
-            "🔙 Back", callback_data="mcp_session_back")])
+            "🔙 Back", callback_data="phase2_back_from_inspect")])
 
         await query.edit_message_text(
             f"📦 *resources.arsc Browser*\n\n"
@@ -11431,6 +11431,59 @@ async def button_handler(update, context):
             await query.edit_message_text(
                 f"❌ Fix failed.", parse_mode="Markdown", reply_markup=back_a())
 
+
+    # ── PHASE 2 — Back from inspection ───────────────────────────────────────
+    elif data == "phase2_back_from_inspect":
+        if not is_admin(user.id): return
+        # If Phase 2 is paused — go back to pause screen
+        if phase2_paused.get(user.id):
+            after_ops = phase2_after_ops.get(user.id, [])
+            await query.edit_message_text(
+                "⏸️ *Phase 2 — Paused for Inspection*\n\n"
+                "━━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ Obfuscation complete\n"
+                "✅ Safe rename complete\n\n"
+                "🔍 Continue inspecting or tap\n"
+                "*▶️ Continue Phase 2* when ready.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "▶️ Continue Phase 2",
+                        callback_data="phase2_continue")],
+                    [InlineKeyboardButton(
+                        "🌲 Inspect smali/ Files",
+                        callback_data="smali_tree_open")],
+                    [InlineKeyboardButton(
+                        "📁 Inspect res/ Files",
+                        callback_data="res_tree_open")],
+                    [InlineKeyboardButton(
+                        "📄 Inspect AndroidManifest",
+                        callback_data="manifest_browse_open")],
+                    [InlineKeyboardButton(
+                        "📦 Inspect resources.arsc",
+                        callback_data="arsc_browse_open")],
+                ]))
+        else:
+            # No active pause — go to phase selection
+            engine   = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
+            apk_name = os.path.basename(manual_apk_path.get(user.id, "your.apk"))
+            try:
+                await query.edit_message_text(
+                    f"🎛️ *Manual Control Panel*\n\n"
+                    f"📦 `{apk_name}` loaded\n\n"
+                    f"Select a phase to run:\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━",
+                    parse_mode="Markdown",
+                    reply_markup=engine.build_preset_keyboard())
+            except Exception:
+                await context.bot.send_message(
+                    chat_id=user.id,
+                    text=f"🎛️ *Manual Control Panel*\n\n"
+                         f"📦 `{apk_name}` loaded\n\n"
+                         f"Select a phase to run:\n"
+                         f"━━━━━━━━━━━━━━━━━━━━━",
+                    parse_mode="Markdown",
+                    reply_markup=engine.build_preset_keyboard())
 
     # ── PHASE 2 — Continue after inspection ──────────────────────────────────
     elif data == "phase2_continue":
