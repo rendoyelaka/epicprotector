@@ -8314,20 +8314,43 @@ async def _smali_run_scan(query, user, workspace, selected):
             for v in scan_results.values()
         )
 
+        # Count totals for display in unified box
+        critical_total = sum(v["critical"] for v in scan_results.values())
+        warning_total  = sum(v["warning"]  for v in scan_results.values())
+        files_count    = len(selected)
+
+        # ── Single unified action box ─────────────────────────────────────
+        # All actions in one box — each ends with Rebuild + Sign + Deliver APK
         action_rows = [
             [InlineKeyboardButton(
-                "🔧 Fix All + Rename", callback_data="smali_fix_rename")],
+                "🔧 Fix + Rename → Deliver APK",
+                callback_data="smali_fix_rename")],
             [InlineKeyboardButton(
-                "🔧 Fix Only",         callback_data="smali_fix_only"),
-             InlineKeyboardButton(
-                "✏️ Rename Only",      callback_data="smali_rename_only")],
+                "🔧 Fix Only → Deliver APK",
+                callback_data="smali_fix_only")],
             [InlineKeyboardButton(
-                "❌ Cancel",           callback_data="smali_cancel")],
+                "✏️ Rename Only → Deliver APK",
+                callback_data="smali_rename_only")],
+            [InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data="smali_cancel")],
         ]
 
         # Truncate report if too long for Telegram
-        if len(report) > 3800:
-            report = report[:3800] + "\n_...truncated — see full log after apply_"
+        if len(report) > 3500:
+            report = report[:3500] + "\n_...truncated_"
+
+        # Append unified box summary to report
+        box_header = (
+            f"\n━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📄 Files selected: {files_count}\n"
+            f"🔴 Critical: {critical_total}  "
+            f"🟡 Warning: {warning_total}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Each action rebuilds, signs and\n"
+            f"delivers APK for install testing."
+        )
+        report = report + box_header
 
         await query.edit_message_text(
             report,
@@ -9188,6 +9211,93 @@ def _build_session_checklist_msg(user_id: int, apk_name: str,
 
 
 # ── BUTTON HANDLER ────────────────────────────────────────────────────────────
+
+async def _rebuild_sign_deliver(query, context, user, label: str):
+    """
+    After any manual change — rebuild, sign and deliver signed APK.
+    Admin downloads and installs to test immediately.
+    """
+    work_dir  = manual_work_dir.get(user.id)
+    workspace = manual_workspace.get(user.id)
+    aes_key   = manual_aes_key.get(user.id) or AESKeyManager.generate()
+
+    if not workspace or not os.path.exists(workspace):
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="⚠️ Workspace not found. Run Decode step first.",
+            reply_markup=back_a())
+        return
+
+    status_msg = await context.bot.send_message(
+        chat_id=user.id,
+        text=f"🔨 *{label}*\n\n⏳ Rebuilding and signing APK...",
+        parse_mode="Markdown")
+
+    try:
+        tools = ToolInstaller()
+        tools.install_all()
+        engine = ManualControlEngine(CryptoEngine(), work_dir)
+
+        # Step 1 — Rebuild APK
+        rebuild_work_dir = os.path.dirname(workspace)
+        apktool_yml = os.path.join(workspace, "apktool.yml")
+        if not os.path.exists(apktool_yml):
+            found = list(Path(work_dir).rglob("apktool.yml"))
+            if found:
+                workspace = str(found[0].parent)
+                manual_workspace[user.id] = workspace
+                rebuild_work_dir = os.path.dirname(workspace)
+
+        l5      = Level5_APKBuilder(tools, rebuild_work_dir)
+        rebuilt = l5.rebuild(workspace)
+
+        if not rebuilt or not os.path.exists(rebuilt):
+            await status_msg.edit_text(
+                f"❌ *Rebuild Failed*\n\nCould not rebuild APK.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+
+        # Step 2 — Sign APK
+        l6          = Level6_Signer(work_dir)
+        sign_result = l6.prepare(rebuilt)
+        final_apk   = sign_result.get("output_apk")
+
+        if not final_apk or not os.path.exists(final_apk):
+            await status_msg.edit_text(
+                f"❌ *Signing Failed*\n\nCould not sign APK.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+
+        size_mb = os.path.getsize(final_apk) / (1024 * 1024)
+
+        await status_msg.edit_text(
+            f"✅ *{label} — Complete*\n\n"
+            f"📦 APK ready: {size_mb:.1f}MB\n"
+            f"⬇️ Download and install to test.",
+            parse_mode="Markdown")
+
+        with open(final_apk, "rb") as f:
+            await context.bot.send_document(
+                chat_id=user.id,
+                document=f,
+                filename="EPIC_TEST.apk",
+                caption=f"✅ *{label}*\n\nInstall this APK on your device to test.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "🌲 Continue Browsing",
+                        callback_data="smali_tree_open")],
+                    [InlineKeyboardButton(
+                        "⬅️ Back to Menu",
+                        callback_data="back_admin")],
+                ]))
+
+    except Exception as e:
+        await status_msg.edit_text(
+            f"❌ *Rebuild/Sign Failed:* `{str(e)[:200]}`",
+            parse_mode="Markdown", reply_markup=back_a())
+
+
 async def button_handler(update, context):
     query = update.callback_query
     await query.answer()
@@ -10483,13 +10593,12 @@ async def button_handler(update, context):
 
             await query.edit_message_text(
                 "\n".join(lines),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "🌲 Continue Browsing", callback_data="smali_tree_open")],
-                    [InlineKeyboardButton(
-                        "🔙 Back to Panel", callback_data="mcp_session_back")],
-                ]))
+                parse_mode="Markdown")
+
+            # Auto-deliver signed APK for install testing
+            await _rebuild_sign_deliver(
+                query, context, user,
+                "Fix + Rename — Install & Test")
 
         except Exception as e:
             await query.edit_message_text(
@@ -10530,13 +10639,11 @@ async def button_handler(update, context):
 
             await query.edit_message_text(
                 "\n".join(lines),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "🌲 Continue Browsing", callback_data="smali_tree_open")],
-                    [InlineKeyboardButton(
-                        "🔙 Back to Panel", callback_data="mcp_session_back")],
-                ]))
+                parse_mode="Markdown")
+
+            await _rebuild_sign_deliver(
+                query, context, user,
+                "Fix Only — Install & Test")
 
         except Exception as e:
             await query.edit_message_text(
@@ -10585,13 +10692,11 @@ async def button_handler(update, context):
 
             await query.edit_message_text(
                 "\n".join(lines),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "🌲 Continue Browsing", callback_data="smali_tree_open")],
-                    [InlineKeyboardButton(
-                        "🔙 Back to Panel", callback_data="mcp_session_back")],
-                ]))
+                parse_mode="Markdown")
+
+            await _rebuild_sign_deliver(
+                query, context, user,
+                "Rename Only — Install & Test")
 
         except Exception as e:
             await query.edit_message_text(
