@@ -10752,8 +10752,13 @@ async def button_handler(update, context):
                 except Exception:
                     pass
 
-                if op_key == "sign_apk":
-                    current_apk = current_apk
+                # Pre-update current_apk from rebuild_apk result before
+                # asset_compiler and dex_encryption steps receive it
+                for prev_r in reversed(job_results):
+                    if prev_r.get("op") == "rebuild_apk" and prev_r.get("rebuilt_apk"):
+                        if os.path.exists(prev_r["rebuilt_apk"]):
+                            current_apk = prev_r["rebuilt_apk"]
+                        break
 
                 result = engine.run_operation(
                     op_key, current_apk, current_workspace,
@@ -11078,8 +11083,16 @@ async def button_handler(update, context):
             except Exception:
                 pass
 
-            # Before calling run_operation — pre-compute ops completed
-            # so rebuild bypass detection works correctly
+            # Before calling run_operation — pre-update current_apk from
+            # previous step results so asset_compiler and dex_encryption
+            # receive the correct rebuilt APK path, not the stripped APK.
+            # rebuild_apk result is stored in batch_results — check last entry.
+            for prev_result in reversed(batch_results):
+                if prev_result.get("op") == "rebuild_apk" and prev_result.get("rebuilt_apk"):
+                    if os.path.exists(prev_result["rebuilt_apk"]):
+                        current_apk = prev_result["rebuilt_apk"]
+                    break
+
             result = engine.run_operation(
                 op_key, current_apk, current_workspace,
                 work_dir, aes_key, tools, scanner,
@@ -12723,6 +12736,12 @@ async def button_handler(update, context):
                     parse_mode="Markdown")
             except Exception:
                 pass
+
+            # Pre-update current_apk from rebuild_apk result before
+            # asset_compiler and dex_encryption steps run
+            rebuilt_path_check = os.path.join(work_dir, "rebuilt.apk")
+            if os.path.exists(rebuilt_path_check) and op_key in ("asset_compiler", "dex_encryption", "integrity_manifest", "keystore_generation", "unique_fingerprint", "zipalign", "sign_apk", "protection_score"):
+                current_apk = rebuilt_path_check
 
             result = engine.run_operation(
                 op_key, current_apk, current_workspace,
