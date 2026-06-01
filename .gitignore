@@ -1,6 +1,6 @@
 # ══════════════════════════════════════════════════════════════════
 # EPIC PROTECTOR — Git Ignore
-# Elite Master Hybrid Edition — 22-Step Pipeline
+# Elite Master Hybrid Edition — 24-Step Pipeline
 # ══════════════════════════════════════════════════════════════════
 
 # ── Protection Output Files — never commit these ───────────────
@@ -9,6 +9,10 @@ safe_rename_map.json
 proguard-epic-hardened.pro
 clients.json
 bot_log.txt
+
+# ── Asset Compiler Temporary Files ─────────────────────────────
+*.abp.tmp
+*.dexenc.tmp
 
 # ── Job Work Directories ───────────────────────────────────────
 *_PROTECTED/
