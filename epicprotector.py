@@ -4778,27 +4778,116 @@ class AssetCompiler:
                     elif item.filename == 'AndroidManifest.xml':
                         # Update android:name in <application> tag to point to
                         # ResourceManager bootstrap so Android loads it first.
-                        # Binary XML — update string in-place using byte replacement.
+                        # CORRECT AXML patching — properly updates string pool
+                        # length prefixes AND offset table after replacement.
                         manifest_bytes = zin.read(item.filename)
-                        # Encode old and new Application class names as UTF-16LE
-                        # (binary XML stores strings as UTF-16LE)
-                        old_app_name = app_package.replace('.', '/')
-                        old_app_utf16 = (app_package).encode('utf-16-le')
-                        new_app_utf16 = b'com.android.support.ResourceManager'.encode('utf-16-le')
-                        # Also handle dot-notation in binary XML string pool
-                        if old_app_utf16 in manifest_bytes:
-                            manifest_bytes = manifest_bytes.replace(
-                                old_app_utf16, new_app_utf16, 1
+
+                        # ── Trim any garbage bytes appended after declared AXML size ──
+                        # Some tools append extra bytes after the valid AXML chunk.
+                        # Android's parser reads exactly declared_size bytes and rejects
+                        # anything that pushes actual > declared.
+                        declared_size = struct.unpack_from('<I', manifest_bytes, 4)[0]
+                        if len(manifest_bytes) > declared_size:
+                            manifest_bytes = manifest_bytes[:declared_size]
+
+                        # ── Proper AXML UTF-8 string pool patcher ────────────────────
+                        # Binary AXML (UTF-8 pool, flags bit-8 set) stores each string as:
+                        #   [char_len: 1-2 bytes][byte_len: 1-2 bytes][utf8 data][0x00]
+                        # A blind bytes.replace() updates the data but NOT the length
+                        # prefixes and NOT the string offset table — corrupting every
+                        # string that follows in the pool.  This function fixes all of it.
+                        def _patch_axml_string(data, old_str, new_str):
+                            def _enc_len(n):
+                                return bytes([(n >> 8) | 0x80, n & 0xFF]) if n > 0x7F else bytes([n])
+                            def _make_entry(s):
+                                enc = s.encode('utf-8')
+                                return _enc_len(len(s)) + _enc_len(len(enc)) + enc + b'\x00'
+
+                            SP = 8  # string pool chunk starts at byte 8
+                            sp_hdr  = struct.unpack_from('<H', data, SP + 2)[0]
+                            sp_cnt  = struct.unpack_from('<I', data, SP + 8)[0]
+                            sp_strt = struct.unpack_from('<I', data, SP + 20)[0]
+                            off_base = SP + sp_hdr
+                            str_base = SP + sp_strt
+                            old_enc  = old_str.encode('utf-8')
+
+                            target_idx = target_abs = old_elen = None
+                            for i in range(sp_cnt):
+                                rel = struct.unpack_from('<I', data, off_base + i * 4)[0]
+                                ap  = str_base + rel
+                                b0  = data[ap]
+                                pfx = 2 if b0 & 0x80 else 1
+                                cl  = ((b0 & 0x7F) << 8 | data[ap + 1]) if b0 & 0x80 else b0
+                                b1  = data[ap + pfx]
+                                pfx2 = pfx + (2 if b1 & 0x80 else 1)
+                                bl  = ((b1 & 0x7F) << 8 | data[ap + pfx + 1]) if b1 & 0x80 else b1
+                                if data[ap + pfx2: ap + pfx2 + bl] == old_enc:
+                                    target_idx = i
+                                    target_abs = ap
+                                    old_elen   = pfx2 + bl + 1  # +1 null terminator
+                                    break
+
+                            if target_idx is None:
+                                return data, False  # string not found — return unchanged
+
+                            new_entry = _make_entry(new_str)
+                            delta     = len(new_entry) - old_elen
+
+                            # Replace string entry bytes
+                            data = (data[:target_abs]
+                                    + new_entry
+                                    + data[target_abs + old_elen:])
+
+                            if delta != 0:
+                                # Update offset table for all strings after target
+                                for i in range(target_idx + 1, sp_cnt):
+                                    p = off_base + i * 4
+                                    data = (data[:p]
+                                            + struct.pack('<I', struct.unpack_from('<I', data, p)[0] + delta)
+                                            + data[p + 4:])
+                                # Update string pool chunk size
+                                data = (data[:SP + 4]
+                                        + struct.pack('<I', struct.unpack_from('<I', data, SP + 4)[0] + delta)
+                                        + data[SP + 8:])
+                                # Update AXML top-level chunk size
+                                data = (data[:4]
+                                        + struct.pack('<I', struct.unpack_from('<I', data, 4)[0] + delta)
+                                        + data[8:])
+                            return data, True
+
+                        # Determine the original application class name
+                        # Try explicit config first, then fall back to app_package.App / app_package
+                        original_app_class = self.keystore_ctx.get("original_app_class", "")
+                        if not original_app_class:
+                            # Derive from package — common conventions
+                            original_app_class = app_package + ".App"
+
+                        patched, found = _patch_axml_string(
+                            manifest_bytes,
+                            original_app_class,
+                            'com.android.support.ResourceManager'
+                        )
+                        if not found:
+                            # Fallback: try bare package name as class (some apps register that way)
+                            patched, found = _patch_axml_string(
+                                manifest_bytes,
+                                app_package,
+                                'com.android.support.ResourceManager'
                             )
+                        if found:
+                            manifest_bytes = patched
                             logger.info(
-                                f"[AssetCompiler] Manifest updated — "
-                                f"Application class → com.android.support.ResourceManager"
+                                "[AssetCompiler] Manifest patched correctly — "
+                                "Application class → com.android.support.ResourceManager "
+                                "(string pool offsets + chunk sizes updated)"
                             )
                         else:
                             logger.warning(
-                                f"[AssetCompiler] Could not find {app_package} "
-                                f"in binary manifest — app may not launch correctly"
+                                f"[AssetCompiler] Could not locate application class "
+                                f"'{original_app_class}' in binary manifest string pool — "
+                                f"app may not launch correctly"
                             )
+
                         mf_info              = zipfile.ZipInfo('AndroidManifest.xml')
                         mf_info.compress_type = zipfile.ZIP_STORED
                         zout.writestr(mf_info, manifest_bytes)
