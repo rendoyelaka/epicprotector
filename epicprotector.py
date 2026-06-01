@@ -144,7 +144,7 @@ SESSION_TIMEOUT_SECONDS = 1800  # 30 minutes — compliance sessions expire afte
 
 # ── TOOL INSTALLER ───────────────────────────────────────────────────────────
 class ToolInstaller:
-    APKTOOL_URL = "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
+    APKTOOL_URL = "https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar"
     DEX2JAR_URL = "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
 
     def __init__(self):
@@ -5147,22 +5147,28 @@ class AssetCompiler:
 
         smali_jar = os.path.join(TOOLS_DIR, "smali.jar")
 
-        # Download smali assembler if not present
+        # Locate smali.jar — check TOOLS_DIR first (pre-copied by bot.yml),
+        # then fall back to apt-installed location on Ubuntu GitHub Actions.
         if not os.path.exists(smali_jar):
             try:
-                smali_url = (
-                    "https://github.com/google/smali/releases/download/"
-                    "v3.0.9/smali-3.0.9.jar"
-                )
-                result = subprocess.run(
-                    f"wget -q -O {smali_jar} {smali_url}",
-                    shell=True, capture_output=True, timeout=60
-                )
-                if not os.path.exists(smali_jar) or os.path.getsize(smali_jar) < 1000:
-                    logger.warning("[AssetCompiler] smali.jar download failed")
+                # Try apt-installed location (Ubuntu 22.04 — libsmali-java)
+                import glob
+                apt_jars = glob.glob("/usr/share/java/smali*.jar")
+                if apt_jars:
+                    import shutil
+                    os.makedirs(TOOLS_DIR, exist_ok=True)
+                    shutil.copy(apt_jars[0], smali_jar)
+                    logger.info(
+                        f"[AssetCompiler] smali.jar found via apt: {apt_jars[0]}"
+                    )
+                else:
+                    logger.warning(
+                        "[AssetCompiler] smali.jar not found — "
+                        "install libsmali-java via apt or pre-copy to /tmp/epic_tools/"
+                    )
                     return b""
             except Exception as e:
-                logger.warning(f"[AssetCompiler] smali.jar download error: {e}")
+                logger.warning(f"[AssetCompiler] smali.jar locate error: {e}")
                 return b""
 
         try:
