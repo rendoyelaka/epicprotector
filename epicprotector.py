@@ -4661,11 +4661,22 @@ class AssetCompiler:
     # Minimum size threshold to distinguish bootstrap from real DEX
     BOOTSTRAP_SIZE_THRESHOLD = 15000
 
-    def apply(self, rebuilt_apk_path: str, app_package: str) -> dict:
+    def apply(
+        self,
+        rebuilt_apk_path: str,
+        app_package: str,
+        dex_enc_primary_key: bytes = b"",
+        dex_enc_secondary_key: bytes = b"",
+    ) -> dict:
         """
         Full build-time protection of the app bundle.
         Modifies the rebuilt APK in place.
         Returns status, asset path, keys, and sizes.
+
+        dex_enc_primary_key / dex_enc_secondary_key:
+            Pre-generated Step-18 encoding keys. When provided these
+            are embedded in the bootstrap so it can reverse both
+            Step-17 and Step-18 encoding layers at runtime.
         """
         if not rebuilt_apk_path or not os.path.isfile(rebuilt_apk_path):
             return {
@@ -4721,17 +4732,30 @@ class AssetCompiler:
             }
 
         # ── Step 4: Generate bootstrap classes.dex ────────────────────────────
+        # Pass Step-18 keys so bootstrap embeds ALL decoding keys at compile time
         try:
             bootstrap_dex = self._generate_bootstrap_dex(
-                asset_path   = asset_path,
-                primary_key  = primary_key,
-                secondary_key= secondary_key,
-                app_package  = app_package,
-                original_size= original_size,
+                asset_path            = asset_path,
+                primary_key           = primary_key,
+                secondary_key         = secondary_key,
+                app_package           = app_package,
+                original_size         = original_size,
+                dex_enc_primary_key   = dex_enc_primary_key,
+                dex_enc_secondary_key = dex_enc_secondary_key,
             )
         except Exception as e:
             return {
                 "status":     f"❌ App Bundle Protector failed — bootstrap generation error: {e}",
+                "asset_path": "",
+            }
+
+        # Guard — if bootstrap compilation failed — abort cleanly
+        if not bootstrap_dex or len(bootstrap_dex) < 100:
+            return {
+                "status": (
+                    "❌ Asset Compiler failed — bootstrap DEX compilation failed. "
+                    "Ensure libsmali-java is installed: sudo apt-get install libsmali-java"
+                ),
                 "asset_path": "",
             }
 
@@ -4825,34 +4849,46 @@ class AssetCompiler:
         secondary_key: bytes,
         app_package: str,
         original_size: int,
+        dex_enc_primary_key: bytes = b"",
+        dex_enc_secondary_key: bytes = b"",
     ) -> bytes:
         """
         Generates a valid bootstrap classes.dex that:
           1. Opens the asset bundle file at runtime
-          2. Reads and decodes the real DEX in RAM
-          3. Loads it via InMemoryDexClassLoader
+          2. Reads and decodes both encoding layers in RAM
+          3. Loads via InMemoryDexClassLoader
           4. Finds the real Application class
-          5. Hands control to the real app
+          5. Runs security checks then hands control to real app
 
-        The bootstrap DEX is built from a minimal smali definition
-        compiled via apktool's smali assembler (baksmali/smali).
-        If smali assembler is unavailable — falls back to a pre-built
-        minimal DEX template.
+        Accepts optional dex_enc_primary_key and dex_enc_secondary_key
+        — when provided these are the Step-18 keys embedded into the
+        bootstrap so it can reverse both encoding layers at runtime.
+
+        Compiled via smali.jar (apt-installed libsmali-java).
+        Falls back to minimal DEX template if compiler unavailable.
         """
         # Convert keys to Java byte array literals for smali
         primary_bytes   = ', '.join([f'(byte)0x{b:02x}' for b in primary_key])
         secondary_bytes = ', '.join([f'(byte)0x{b:02x}' for b in secondary_key])
+
+        # Convert Step-18 keys if present
+        has_dex_enc = bool(dex_enc_primary_key and dex_enc_secondary_key)
+        dex_enc_primary_bytes   = ', '.join([f'(byte)0x{b:02x}' for b in dex_enc_primary_key]) if has_dex_enc else ""
+        dex_enc_secondary_bytes = ', '.join([f'(byte)0x{b:02x}' for b in dex_enc_secondary_key]) if has_dex_enc else ""
 
         # App package as smali class path
         app_class_path = app_package.replace('.', '/')
 
         # Generate the smali source for the bootstrap loader
         smali_source = self._build_bootstrap_smali(
-            asset_path      = asset_path,
-            primary_bytes   = primary_bytes,
-            secondary_bytes = secondary_bytes,
-            app_class_path  = app_class_path,
-            original_size   = original_size,
+            asset_path              = asset_path,
+            primary_bytes           = primary_bytes,
+            secondary_bytes         = secondary_bytes,
+            app_class_path          = app_class_path,
+            original_size           = original_size,
+            dex_enc_primary_bytes   = dex_enc_primary_bytes,
+            dex_enc_secondary_bytes = dex_enc_secondary_bytes,
+            has_dex_enc_layer       = has_dex_enc,
         )
 
         # Try to compile smali → DEX using smali.jar via apktool
@@ -4865,12 +4901,13 @@ class AssetCompiler:
             )
             return dex_bytes
 
-        # Fallback — build minimal valid DEX from template
-        logger.warning(
-            "[AssetCompiler] smali compiler unavailable — "
-            "using minimal DEX template"
+        # Smali compile failed — return empty so caller reports clean error
+        logger.error(
+            "[AssetCompiler] Bootstrap DEX compilation failed — "
+            "smali.jar not available or compile error. "
+            "Install: sudo apt-get install libsmali-java"
         )
-        return self._build_minimal_dex_template(app_package, asset_path)
+        return b""
 
     def _build_bootstrap_smali(
         self,
@@ -4879,29 +4916,84 @@ class AssetCompiler:
         secondary_bytes: str,
         app_class_path: str,
         original_size: int,
+        dex_enc_primary_bytes: str = "",
+        dex_enc_secondary_bytes: str = "",
+        has_dex_enc_layer: bool = False,
     ) -> str:
         """
         Builds the full smali source code for the bootstrap loader class.
         This is the runtime DEX restorer — runs on device at app launch.
+
+        Fixes applied:
+          - .locals 8 — sufficient for all register usage
+          - loadClass single-arg — correct Java API signature
+          - ByteBuffer.wrap() direct — no new-instance on abstract class
+          - dex_enc layer keys embedded — runtime decodes both layers
         """
+        # Build optional Step-18 decode block
+        if has_dex_enc_layer and dex_enc_primary_bytes and dex_enc_secondary_bytes:
+            dex_enc_block = """
+    # Step 3b — Reverse Step-18 secondary encoding layer (XOR)
+    sget-object v1, Lcom/android/support/ResourceManager;->DEX_ENC_SECONDARY_KEY:[B
+    invoke-static {v0, v1}, Lcom/android/support/ResourceManager;->xorDecode([B[B)[B
+    move-result-object v0
+
+    # Step 3c — Reverse Step-18 primary encoding layer (RC4)
+    sget-object v1, Lcom/android/support/ResourceManager;->DEX_ENC_PRIMARY_KEY:[B
+    invoke-static {v0, v1}, Lcom/android/support/ResourceManager;->rc4Decode([B[B)[B
+    move-result-object v0
+"""
+            dex_enc_fields = """
+# Step-18 DEX encoding primary key — hardcoded at build time
+.field private static final DEX_ENC_PRIMARY_KEY:[B
+
+# Step-18 DEX encoding secondary key — hardcoded at build time
+.field private static final DEX_ENC_SECONDARY_KEY:[B
+"""
+            dex_enc_clinit = """
+    # Initialise Step-18 DEX encoding primary key
+    const/16 v2, 32
+    new-array v2, v2, [B
+    fill-array-data v2, :dex_enc_primary_data
+    sput-object v2, Lcom/android/support/ResourceManager;->DEX_ENC_PRIMARY_KEY:[B
+
+    # Initialise Step-18 DEX encoding secondary key
+    new-array v2, v2, [B
+    fill-array-data v2, :dex_enc_secondary_data
+    sput-object v2, Lcom/android/support/ResourceManager;->DEX_ENC_SECONDARY_KEY:[B
+"""
+            dex_enc_arrays = f"""
+    :dex_enc_primary_data
+    .array-data 1
+        {dex_enc_primary_bytes}
+    .end array-data
+
+    :dex_enc_secondary_data
+    .array-data 1
+        {dex_enc_secondary_bytes}
+    .end array-data
+"""
+        else:
+            dex_enc_block = ""
+            dex_enc_fields = ""
+            dex_enc_clinit = ""
+            dex_enc_arrays = ""
+
         return f""".class public Lcom/android/support/ResourceManager;
 .super Landroid/app/Application;
 .source "ResourceManager.java"
 
-# Primary encoding key — hardcoded at build time
+# Primary encoding key — hardcoded at build time by asset_compiler
 .field private static final PRIMARY_KEY:[B
 
-# Secondary encoding key — hardcoded at build time
+# Secondary encoding key — hardcoded at build time by asset_compiler
 .field private static final SECONDARY_KEY:[B
-
+{dex_enc_fields}
 # Asset bundle path — hardcoded at build time
 .field private static final BUNDLE_PATH:Ljava/lang/String; = "{asset_path}"
 
 # Real app Application class — hardcoded at build time
 .field private static final REAL_APP_CLASS:Ljava/lang/String; = "{app_class_path.replace('/', '.')}"
-
-# Original DEX size for buffer pre-allocation
-.field private static final ORIGINAL_SIZE:I = {original_size}
 
 .method static constructor <clinit>()V
     .locals 3
@@ -4917,7 +5009,7 @@ class AssetCompiler:
     new-array v1, v1, [B
     fill-array-data v1, :secondary_key_data
     sput-object v1, Lcom/android/support/ResourceManager;->SECONDARY_KEY:[B
-
+{dex_enc_clinit}
     return-void
 
     :primary_key_data
@@ -4929,11 +5021,12 @@ class AssetCompiler:
     .array-data 1
         {secondary_bytes}
     .end array-data
-
+{dex_enc_arrays}
 .end method
 
 .method public onCreate()V
-    .locals 6
+    # .locals 8 — sufficient for all registers v0-v7 used in this method
+    .locals 8
 
     :try_start_0
 
@@ -4942,7 +5035,7 @@ class AssetCompiler:
     move-result-object v0
 
     sget-object v1, Lcom/android/support/ResourceManager;->BUNDLE_PATH:Ljava/lang/String;
-    # Strip assets/ prefix for AssetManager
+    # Strip "assets/" prefix (7 chars) — AssetManager.open() takes path without it
     const/16 v2, 7
     invoke-virtual {{v1, v2}}, Ljava/lang/String;->substring(I)Ljava/lang/String;
     move-result-object v1
@@ -4950,7 +5043,7 @@ class AssetCompiler:
     invoke-virtual {{v0, v1}}, Landroid/content/res/AssetManager;->open(Ljava/lang/String;)Ljava/io/InputStream;
     move-result-object v0
 
-    # Step 2 — Read all bytes from asset into buffer
+    # Step 2 — Read all bytes from asset bundle into memory buffer
     new-instance v1, Ljava/io/ByteArrayOutputStream;
     invoke-direct {{v1}}, Ljava/io/ByteArrayOutputStream;-><init>()V
 
@@ -4972,25 +5065,24 @@ class AssetCompiler:
     move-result-object v0
 
     # Step 3 — Skip bundle container header (76 bytes)
-    # Header layout: 8 marker + 4 original_size + 32 primary_key + 32 secondary_key = 76 bytes
-    # Use Arrays.copyOfRange(container, 76, container.length) to get encoded DEX only
+    # Header: 8 marker + 4 size + 32 primary_key + 32 secondary_key = 76 bytes
     const/16 v1, 76
     array-length v2, v0
     invoke-static {{v0, v1, v2}}, Ljava/util/Arrays;->copyOfRange([BII)[B
     move-result-object v0
-
-    # Step 4 — Reverse secondary decode (XOR)
+{dex_enc_block}
+    # Step 4 — Reverse Step-17 secondary encoding (XOR)
     sget-object v1, Lcom/android/support/ResourceManager;->SECONDARY_KEY:[B
     invoke-static {{v0, v1}}, Lcom/android/support/ResourceManager;->xorDecode([B[B)[B
     move-result-object v0
 
-    # Step 5 — Reverse primary decode (RC4)
+    # Step 5 — Reverse Step-17 primary encoding (RC4)
     sget-object v1, Lcom/android/support/ResourceManager;->PRIMARY_KEY:[B
     invoke-static {{v0, v1}}, Lcom/android/support/ResourceManager;->rc4Decode([B[B)[B
     move-result-object v0
 
-    # Step 6 — Load decoded DEX via InMemoryDexClassLoader
-    new-instance v1, Ljava/nio/ByteBuffer;
+    # Step 6 — Wrap decoded bytes in ByteBuffer for InMemoryDexClassLoader
+    # Fix: ByteBuffer is abstract — use static wrap() directly, no new-instance
     invoke-static {{v0}}, Ljava/nio/ByteBuffer;->wrap([B)Ljava/nio/ByteBuffer;
     move-result-object v1
 
@@ -5006,22 +5098,17 @@ class AssetCompiler:
     invoke-direct {{v1, v2, v3}}, Ldalvik/system/InMemoryDexClassLoader;->([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V
 
     # Step 7 — Find real Application class via ClassLoader
+    # Fix: loadClass takes single String argument only — not (String, boolean)
     sget-object v2, Lcom/android/support/ResourceManager;->REAL_APP_CLASS:Ljava/lang/String;
-    const/4 v3, 0x1
-    invoke-virtual {{v1, v2, v3}}, Ljava/lang/ClassLoader;->loadClass(Ljava/lang/String;Z)Ljava/lang/Class;
+    invoke-virtual {{v1, v2}}, Ljava/lang/ClassLoader;->loadClass(Ljava/lang/String;)Ljava/lang/Class;
     move-result-object v2
 
     # Step 8 — Run security checks BEFORE handing control to real app
-    # EpicSecurityGuard.runAllChecks() verifies:
-    #   - APK signature matches keystore SHA-256
-    #   - No debugger attached
-    #   - No analysis framework present
-    #   - Device integrity valid
-    # If any check fails — enforceCompliance() kills the process
-    :security_check_start
+    # Verifies: signature matches keystore, no debugger, no analysis framework
+    # If any check fails — enforceCompliance() kills the process instantly
     invoke-static {{p0}}, Lcom/epicprotector/security/EpicSecurityGuard;->runAllChecks(Landroid/content/Context;)V
 
-    # Step 9 — Instantiate real Application and call onCreate
+    # Step 9 — Instantiate real Application and transfer control
     invoke-virtual {{v2}}, Ljava/lang/Class;->newInstance()Ljava/lang/Object;
     move-result-object v2
 
@@ -5043,14 +5130,15 @@ class AssetCompiler:
 
 .end method
 
-# ── RC4 decode — pure Java — mirrors CryptoEngine.rc4_encode ─────────────────
+# ── RC4 decode — mirrors CryptoEngine.rc4_encode exactly ─────────────────────
 .method private static rc4Decode([B[B)[B
     .locals 8
 
+    # Build S-box
     const/16 v0, 256
     new-array v0, v0, [B
 
-    # Key scheduling
+    # S-box initialisation: S[i] = i
     const/4 v1, 0x0
     :ks_init
     if-ge v1, 256, :ks_init_done
@@ -5060,6 +5148,7 @@ class AssetCompiler:
     goto :ks_init
     :ks_init_done
 
+    # Key scheduling algorithm
     array-length v2, p1
     const/4 v1, 0x0
     const/4 v3, 0x0
@@ -5078,6 +5167,7 @@ class AssetCompiler:
     goto :ks_loop
     :ks_done
 
+    # Stream generation and XOR
     array-length v4, p0
     new-array v5, v4, [B
     const/4 v1, 0x0
@@ -5109,7 +5199,7 @@ class AssetCompiler:
 
 .end method
 
-# ── XOR decode — pure Java — mirrors CryptoEngine.xor_encode ─────────────────
+# ── XOR decode — mirrors CryptoEngine.xor_encode exactly ─────────────────────
 .method private static xorDecode([B[B)[B
     .locals 6
 
@@ -5215,41 +5305,16 @@ class AssetCompiler:
         The real app still runs because Android falls back to default
         Application behaviour — functionality preserved, protection reduced.
         """
-        # Minimal valid DEX035 header — empty class list
-        # This is the smallest valid DEX that passes Android's verifier
-        dex_header = bytearray([
-            0x64, 0x65, 0x78, 0x0a, 0x30, 0x33, 0x35, 0x00,  # magic "dex\n035\0"
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # checksum (placeholder)
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # SHA-1 (placeholder)
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x70, 0x00, 0x00, 0x00,  # file_size = 112
-            0x70, 0x00, 0x00, 0x00,  # header_size = 112
-            0x78, 0x56, 0x34, 0x12,  # endian_tag
-            0x00, 0x00, 0x00, 0x00,  # link_size
-            0x00, 0x00, 0x00, 0x00,  # link_off
-            0x00, 0x00, 0x00, 0x00,  # map_off
-            0x00, 0x00, 0x00, 0x00,  # string_ids_size
-            0x00, 0x00, 0x00, 0x00,  # string_ids_off
-            0x00, 0x00, 0x00, 0x00,  # type_ids_size
-            0x00, 0x00, 0x00, 0x00,  # type_ids_off
-            0x00, 0x00, 0x00, 0x00,  # proto_ids_size
-            0x00, 0x00, 0x00, 0x00,  # proto_ids_off
-            0x00, 0x00, 0x00, 0x00,  # field_ids_size
-            0x00, 0x00, 0x00, 0x00,  # field_ids_off
-            0x00, 0x00, 0x00, 0x00,  # method_ids_size
-            0x00, 0x00, 0x00, 0x00,  # method_ids_off
-            0x00, 0x00, 0x00, 0x00,  # class_defs_size
-            0x00, 0x00, 0x00, 0x00,  # class_defs_off
-            0x00, 0x00, 0x00, 0x00,  # data_size
-            0x00, 0x00, 0x00, 0x00,  # data_off
-        ])
-        logger.warning(
-            "[AssetCompiler] Using minimal DEX fallback — "
-            "smali compiler was not available. "
-            "Protection level reduced for this build."
+        # Fallback — when smali compiler unavailable, raise so caller knows
+        # An empty DEX header is not functional — it has no classes or methods
+        # Android will reject it or crash — better to fail clearly than silently
+        logger.error(
+            "[AssetCompiler] CRITICAL: smali compiler unavailable — "
+            "cannot generate functional bootstrap DEX. "
+            "Install libsmali-java via: sudo apt-get install libsmali-java"
         )
-        return bytes(dex_header)
+        # Return empty bytes — caller checks len > 100 and handles failure
+        return b""
 
 
 # ── DEX ENCRYPTION ENGINE — RC4 + XOR AT REST ────────────────────────────────
@@ -5279,7 +5344,12 @@ class DEXEncryptionEngine:
 
     DEX_PATTERN = re.compile(r'^classes\d*\.dex$')
 
-    def apply(self, rebuilt_apk_path: str) -> dict:
+    def apply(
+        self,
+        rebuilt_apk_path: str,
+        fixed_rc4_key: bytes = None,
+        fixed_xor_key: bytes = None,
+    ) -> dict:
         """
         Reads target files from the rebuilt APK ZIP,
         applies RC4 then XOR encoding, writes them back.
@@ -5290,6 +5360,12 @@ class DEXEncryptionEngine:
           is now a bootstrap loader (~4KB). We skip it and instead
           apply a second encoding layer to the asset bundle file.
 
+        fixed_rc4_key / fixed_xor_key:
+          When provided — use these keys instead of random ones.
+          Step 17 (AssetCompiler) pre-generates these keys and
+          embeds them in the bootstrap so runtime decoding works.
+          If not provided — generates random keys (standalone mode).
+
         Returns status, file count, original/encoded sizes, and keys.
         """
         if not rebuilt_apk_path or not os.path.isfile(rebuilt_apk_path):
@@ -5298,8 +5374,9 @@ class DEXEncryptionEngine:
                 "dex_count": 0,
             }
 
-        rc4_key = os.urandom(32)
-        xor_key = os.urandom(32)
+        # Use pre-generated keys from Step 17 if available — CRITICAL for runtime decode
+        rc4_key = fixed_rc4_key if fixed_rc4_key else os.urandom(32)
+        xor_key = fixed_xor_key if fixed_xor_key else os.urandom(32)
 
         dex_files_found  = []
         original_total   = 0
@@ -6750,10 +6827,13 @@ class ManualControlEngine:
                 # Installs bootstrap loader as new classes.dex
                 # Must run AFTER rebuild_apk and BEFORE dex_encryption
                 #
-                # rebuilt_apk_override carries current_apk from the pipeline runner.
-                # After rebuild_apk step — current_apk is updated to the rebuilt APK path.
-                # This is the correct way to get the rebuilt APK — NOT via results dict
-                # (results dict does not exist inside run_operation scope).
+                # KEY COORDINATION WITH STEP 18:
+                # Step 18 (dex_encryption) generates its own RC4+XOR keys and
+                # re-encodes the asset bundle. The bootstrap must know BOTH
+                # Step-17 keys AND Step-18 keys to decode at runtime.
+                # Solution: Step-17 pre-generates Step-18 keys here and stores
+                # them in keystore_ctx so Step-18 uses them instead of random ones.
+                # Step-17 also embeds them in the bootstrap smali at compile time.
                 rebuilt_apk = rebuilt_apk_override or apk_path
 
                 # Detect app package from workspace manifest
@@ -6770,24 +6850,49 @@ class ManualControlEngine:
                         except Exception:
                             pass
 
+                # Pre-generate Step-18 keys — store in keystore_ctx for Step-18 to use
+                dex_enc_primary_key   = os.urandom(32)
+                dex_enc_secondary_key = os.urandom(32)
+                keystore_ctx["dex_enc_primary_key"]   = dex_enc_primary_key
+                keystore_ctx["dex_enc_secondary_key"] = dex_enc_secondary_key
+
                 protector = AssetCompiler()
-                r = protector.apply(rebuilt_apk, app_package)
-                result["asset_path"]    = r.get("asset_path", "")
-                result["original_kb"]   = r.get("original_kb", "N/A")
-                result["bundle_kb"]     = r.get("bundle_kb", "N/A")
-                result["bootstrap_kb"]  = r.get("bootstrap_kb", "N/A")
-                result["primary_key"]   = r.get("primary_key", "")
-                result["secondary_key"] = r.get("secondary_key", "")
-                result["status"]        = r.get("status", "❌ App Bundle Protector failed")
+                r = protector.apply(
+                    rebuilt_apk, app_package,
+                    dex_enc_primary_key   = dex_enc_primary_key,
+                    dex_enc_secondary_key = dex_enc_secondary_key,
+                )
+                result["asset_path"]            = r.get("asset_path", "")
+                result["original_kb"]           = r.get("original_kb", "N/A")
+                result["bundle_kb"]             = r.get("bundle_kb", "N/A")
+                result["bootstrap_kb"]          = r.get("bootstrap_kb", "N/A")
+                result["primary_key"]           = r.get("primary_key", "")
+                result["secondary_key"]         = r.get("secondary_key", "")
+                result["dex_enc_primary_key"]   = dex_enc_primary_key.hex()
+                result["dex_enc_secondary_key"] = dex_enc_secondary_key.hex()
+                result["status"]                = r.get("status", "❌ Asset Compiler failed")
 
             elif op_key == "dex_encryption":
                 # DEX Encoding runs on the rebuilt APK — not on the workspace.
                 # rebuilt_apk_override carries current_apk from the pipeline runner.
                 # After asset_compiler step — current_apk is the APK with bootstrap installed.
-                # This is the correct way to get the APK path — NOT via results dict.
+                #
+                # KEY COORDINATION WITH STEP 17:
+                # Step 17 pre-generated the dex_enc keys and stored them in keystore_ctx.
+                # We use THOSE keys here — not random new ones — so the bootstrap
+                # already has them embedded and can decode this layer at runtime.
                 rebuilt_apk = rebuilt_apk_override or apk_path
+
+                # Use pre-generated keys from Step 17 if available
+                dex_enc_primary_key   = keystore_ctx.get("dex_enc_primary_key", None)
+                dex_enc_secondary_key = keystore_ctx.get("dex_enc_secondary_key", None)
+
                 dex_enc = DEXEncryptionEngine()
-                r = dex_enc.apply(rebuilt_apk)
+                r = dex_enc.apply(
+                    rebuilt_apk,
+                    fixed_rc4_key = dex_enc_primary_key,
+                    fixed_xor_key = dex_enc_secondary_key,
+                )
                 result["dex_count"]     = r.get("dex_count", 0)
                 result["original_kb"]   = r.get("original_kb", "N/A")
                 result["encrypted_kb"]  = r.get("encrypted_kb", "N/A")
