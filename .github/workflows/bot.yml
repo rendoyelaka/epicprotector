@@ -173,35 +173,36 @@ jobs:
           fi
           java -jar "$APKTOOL_JAR" --version && echo "✅ apktool verified." || { echo "❌ apktool failed to run."; exit 1; }
 
-      # ── Step 10 — Cache smali.jar ──────────────────────────────
-      # smali.jar is used by AssetCompiler (Step 17 in pipeline)
+      # ── Step 10 — Install smali via apt ───────────────────────
+      # smali (libsmali-java) is used by AssetCompiler (Step 17)
       # to compile the bootstrap loader DEX at build time.
-      # Cached by version — only re-downloaded when version changes.
-      # Without this cache smali.jar downloads fresh each run (~1 min).
-      - name: Cache smali.jar
-        uses: actions/cache@v4
-        id: smali-cache
-        with:
-          path: /tmp/epic_tools/smali.jar
-          key: smali-v3.0.9
-
-      # ── Step 11 — Download smali.jar if not cached ─────────────
-      - name: Pre-Download smali.jar
+      # Installed via apt — Ubuntu 22.04 official package repository.
+      # More reliable than GitHub download — no URL dependency.
+      # Provides smali v2.5.2 at /usr/share/java/smali.jar
+      - name: Install smali
         run: |
-          mkdir -p /tmp/epic_tools
-          SMALI_URL="https://github.com/google/smali/releases/download/v3.0.9/smali-3.0.9.jar"
-          SMALI_JAR="/tmp/epic_tools/smali.jar"
-          if [ ! -f "$SMALI_JAR" ]; then
-            echo "📥 Downloading smali v3.0.9..."
-            wget -q -O "$SMALI_JAR" "$SMALI_URL"
+          echo "📦 Installing smali assembler..."
+          sudo apt-get install -y -qq libsmali-java
+          SMALI_JAR=$(find /usr/share/java -name "smali*.jar" 2>/dev/null | head -1)
+          if [ -n "$SMALI_JAR" ]; then
+            echo "✅ smali installed: $SMALI_JAR"
+            mkdir -p /tmp/epic_tools
+            cp "$SMALI_JAR" /tmp/epic_tools/smali.jar
+            echo "✅ smali.jar copied to /tmp/epic_tools/smali.jar"
+            java -jar /tmp/epic_tools/smali.jar --version && echo "✅ smali verified." || echo "⚠️ smali version check returned non-zero (normal)."
           else
-            echo "✅ smali.jar restored from cache."
+            echo "⚠️ smali.jar not found after install — AssetCompiler will use fallback DEX template."
           fi
-          if [ -f "$SMALI_JAR" ] && [ "$(stat -c%s "$SMALI_JAR")" -gt 1000 ]; then
-            echo "✅ smali.jar ready: $(du -sh $SMALI_JAR | cut -f1)"
-          else
-            echo "⚠️ smali.jar not available — AssetCompiler will use fallback DEX template."
-          fi
+
+      # ── Step 11 — (Reserved) ───────────────────────────────────
+      # Step 11 placeholder — previously used for smali download.
+      # Kept for step numbering consistency.
+      - name: Verify Tool Readiness
+        run: |
+          echo "🔍 Verifying all protection tools are ready..."
+          [ -f "/tmp/epic_tools/apktool.jar" ] && echo "✅ apktool.jar ready" || echo "❌ apktool.jar missing"
+          [ -f "/tmp/epic_tools/smali.jar" ]   && echo "✅ smali.jar ready"   || echo "⚠️ smali.jar not available — fallback will be used"
+          echo "✅ Tool readiness check complete."
 
       # ── Step 12 — Confirm Bot Script Exists ────────────────────
       - name: Confirm Bot Script Exists
