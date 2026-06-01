@@ -1,6 +1,6 @@
 # ══════════════════════════════════════════════════════════════════
 # EPIC PROTECTOR — Python Dependencies
-# Elite Master Hybrid Edition — 22-Step Pipeline
+# Elite Master Hybrid Edition — 24-Step Pipeline
 # ══════════════════════════════════════════════════════════════════
 #
 # Add this file to the ROOT of your GitHub repository.
@@ -12,3 +12,6 @@ python-telegram-bot==21.9
 
 # Web Keep-Alive Server
 flask==3.1.3
+
+# Android APK Analysis — used by compliance scan and APK inspection
+androguard==4.1.3
