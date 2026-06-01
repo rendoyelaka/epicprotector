@@ -158,7 +158,7 @@ class ToolInstaller:
 
     def install_system_deps(self):
         self._run("apt-get update -qq")
-        self._run("apt-get install -y -qq default-jdk zipalign apksigner wget unzip")
+        self._run("apt-get install -y -qq default-jdk zipalign apksigner wget unzip libsmali-java")
 
     def install_apktool(self):
         if not os.path.exists(self.apktool_jar):
@@ -5319,40 +5319,73 @@ class AssetCompiler:
     def _compile_smali_to_dex(self, smali_source: str) -> bytes:
         """
         Compiles smali source to DEX bytes using smali.jar.
-        Downloads smali.jar if not present.
+        Searches all known locations exhaustively before failing.
         Returns DEX bytes or empty bytes if compilation fails.
         """
-        import tempfile, subprocess
+        import tempfile, subprocess, glob as _glob
 
         smali_jar = os.path.join(TOOLS_DIR, "smali.jar")
 
-        # Locate smali.jar — check TOOLS_DIR first (pre-copied by bot.yml),
-        # then fall back to apt-installed location on Ubuntu GitHub Actions.
+        # ── Locate smali.jar — search every known location ────────────────
         if not os.path.exists(smali_jar):
-            try:
-                # Try apt-installed location (Ubuntu 22.04 — libsmali-java)
-                import glob
-                apt_jars = glob.glob("/usr/share/java/smali*.jar")
-                if apt_jars:
+            # All known locations across Ubuntu 20/22/24, Debian, GitHub Actions
+            search_patterns = [
+                "/usr/share/java/smali*.jar",          # apt libsmali-java
+                "/usr/share/apktool/smali*.jar",        # apktool bundle
+                "/usr/share/apktool/smali.jar",
+                "/usr/local/lib/smali*.jar",
+                "/opt/smali*.jar",
+                "/usr/bin/../share/java/smali*.jar",
+            ]
+            found_jar = None
+            for pattern in search_patterns:
+                matches = _glob.glob(pattern)
+                # Prefer the plain smali.jar over versioned ones for stability
+                plain = [m for m in matches if os.path.basename(m) == "smali.jar"]
+                if plain:
+                    found_jar = plain[0]
+                    break
+                elif matches:
+                    found_jar = matches[0]
+                    break
+
+            if found_jar:
+                try:
                     import shutil
                     os.makedirs(TOOLS_DIR, exist_ok=True)
-                    shutil.copy(apt_jars[0], smali_jar)
-                    logger.info(
-                        f"[AssetCompiler] smali.jar found via apt: {apt_jars[0]}"
-                    )
+                    shutil.copy(found_jar, smali_jar)
+                    logger.info(f"[AssetCompiler] smali.jar located: {found_jar}")
+                except Exception as e:
+                    # Copy failed — use found_jar directly
+                    smali_jar = found_jar
+                    logger.info(f"[AssetCompiler] Using smali.jar in place: {found_jar}")
+            else:
+                # Last resort — try installing libsmali-java right now
+                logger.info("[AssetCompiler] smali.jar not found — attempting install...")
+                r = subprocess.run(
+                    "apt-get install -y -qq libsmali-java",
+                    shell=True, capture_output=True, text=True, timeout=120)
+                matches = _glob.glob("/usr/share/java/smali*.jar")
+                plain   = [m for m in matches if os.path.basename(m) == "smali.jar"]
+                found_jar = plain[0] if plain else (matches[0] if matches else None)
+                if found_jar:
+                    try:
+                        import shutil
+                        os.makedirs(TOOLS_DIR, exist_ok=True)
+                        shutil.copy(found_jar, smali_jar)
+                        logger.info(f"[AssetCompiler] smali.jar installed and located: {found_jar}")
+                    except Exception:
+                        smali_jar = found_jar
                 else:
-                    logger.warning(
-                        "[AssetCompiler] smali.jar not found — "
-                        "install libsmali-java via apt or pre-copy to /tmp/epic_tools/"
+                    logger.error(
+                        "[AssetCompiler] smali.jar not found anywhere. "
+                        "Install manually: apt-get install libsmali-java"
                     )
                     return b""
-            except Exception as e:
-                logger.warning(f"[AssetCompiler] smali.jar locate error: {e}")
-                return b""
 
+        # ── Compile smali → DEX ───────────────────────────────────────────
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                # Write smali source to file
                 smali_dir  = os.path.join(tmpdir, "smali")
                 pkg_dir    = os.path.join(smali_dir, "com", "android", "support")
                 os.makedirs(pkg_dir, exist_ok=True)
@@ -5361,7 +5394,6 @@ class AssetCompiler:
                 with open(smali_file, 'w', encoding='utf-8') as f:
                     f.write(smali_source)
 
-                # Compile smali → DEX
                 dex_file = os.path.join(tmpdir, "classes.dex")
                 result = subprocess.run(
                     f"java -jar {smali_jar} assemble {smali_dir} -o {dex_file}",
@@ -5370,11 +5402,15 @@ class AssetCompiler:
 
                 if os.path.exists(dex_file) and os.path.getsize(dex_file) > 100:
                     with open(dex_file, 'rb') as f:
-                        return f.read()
+                        dex = f.read()
+                    logger.info(
+                        f"[AssetCompiler] Bootstrap DEX compiled — {len(dex):,} bytes"
+                    )
+                    return dex
                 else:
                     logger.warning(
-                        f"[AssetCompiler] smali compile failed: "
-                        f"{result.stderr[:200]}"
+                        f"[AssetCompiler] smali compile failed.\n"
+                        f"STDERR: {result.stderr[:400]}"
                     )
                     return b""
         except Exception as e:
