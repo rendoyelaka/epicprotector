@@ -2,7 +2,7 @@ name: EPIC PROTECTOR — Bot 24/7 Elite
 
 # ══════════════════════════════════════════════════════════════════
 # EPIC PROTECTOR — GitHub Actions Workflow
-# Elite Master Hybrid Edition — 22-Step Pipeline
+# Elite Master Hybrid Edition — 24-Step Pipeline
 # ══════════════════════════════════════════════════════════════════
 #
 # Triggers:
@@ -11,23 +11,26 @@ name: EPIC PROTECTOR — Bot 24/7 Elite
 #   - Auto-restart every 5 hours (keeps bot alive 24/7)
 #
 # Improvements over base version:
-#   1. pip cache — python packages cached between runs
-#   2. Environment validation — checks secrets before running
-#   3. Always saves logs — full audit trail
-#   4. Cleaner step naming — professional output
-#   5. Longer retention for logs — 30 days
-#   6. Bot startup confirmation step
-#   7. Consistent tool versions pinned
-#   8. keytool verified after JDK install — keystore generation guaranteed
-#   9. default-jdk (full) used — keytool included, not headless
-#  10. apktool.jar cached by version hash — never re-downloaded
-#  11. Python syntax check before bot launch — catches errors early
-#  12. KS_PASS / KS_KEY removed — script generates fresh keystores dynamically
-#  13. Redundant crash upload merged — single clean log artifact
-#  14. 22-Step pipeline reflected in all step labels
-#  15. apt package cache — JDK and tools cached between runs
-#  16. Full cache restore — startup time reduced from 9min to ~1min
-#  17. Concurrency lock — old bot stops instantly when new push detected
+#   1.  pip cache — python packages cached between runs
+#   2.  Environment validation — checks secrets before running
+#   3.  Always saves logs — full audit trail
+#   4.  Cleaner step naming — professional output
+#   5.  Longer retention for logs — 30 days
+#   6.  Bot startup confirmation step
+#   7.  Consistent tool versions pinned
+#   8.  keytool verified after JDK install — keystore generation guaranteed
+#   9.  default-jdk (full) used — keytool included, not headless
+#   10. apktool.jar cached by version hash — never re-downloaded
+#   11. Python syntax check before bot launch — catches errors early
+#   12. KS_PASS / KS_KEY removed — script generates fresh keystores dynamically
+#   13. Redundant crash upload merged — single clean log artifact
+#   14. 24-Step pipeline reflected in all step labels
+#   15. apt package cache — JDK and tools cached between runs
+#   16. Full cache restore — startup time reduced from 9min to ~1min
+#   17. Concurrency lock — old bot stops instantly when new push detected
+#   18. smali.jar cached — Asset Compiler bootstrap compilation ready
+#   19. apktool aligned to v2.10.0 across workflow and script
+#   20. androguard added to requirements — APK analysis fully supported
 # ══════════════════════════════════════════════════════════════════
 
 on:
@@ -44,7 +47,7 @@ concurrency:
 
 jobs:
   run-bot:
-    name: EPIC PROTECTOR — Elite Bot Runner (22-Step)
+    name: EPIC PROTECTOR — Elite Bot Runner (24-Step)
     runs-on: ubuntu-22.04
     timeout-minutes: 350
 
@@ -136,11 +139,13 @@ jobs:
           echo "✅ Python dependencies installed."
           python3 -c "import telegram; print('✅ python-telegram-bot:', telegram.__version__)"
           python3 -c "import flask; print('✅ flask:', flask.__version__)"
+          python3 -c "import androguard; print('✅ androguard:', androguard.__version__)"
 
       # ── Step 8 — Cache apktool.jar ─────────────────────────────
       # Caches apktool.jar by version string.
       # Only re-downloaded when version changes.
       # Saves 1 min per run on cold starts.
+      # Version aligned with epicprotector.py ToolInstaller.
       - name: Cache apktool.jar
         uses: actions/cache@v4
         id: apktool-cache
@@ -155,7 +160,7 @@ jobs:
           APKTOOL_URL="https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar"
           APKTOOL_JAR="/tmp/epic_tools/apktool.jar"
           if [ ! -f "$APKTOOL_JAR" ]; then
-            echo "📥 Downloading apktool.jar..."
+            echo "📥 Downloading apktool v2.10.0..."
             wget -q -O "$APKTOOL_JAR" "$APKTOOL_URL"
           else
             echo "✅ apktool.jar restored from cache."
@@ -168,7 +173,37 @@ jobs:
           fi
           java -jar "$APKTOOL_JAR" --version && echo "✅ apktool verified." || { echo "❌ apktool failed to run."; exit 1; }
 
-      # ── Step 10 — Confirm Bot Script Exists ────────────────────
+      # ── Step 10 — Cache smali.jar ──────────────────────────────
+      # smali.jar is used by AssetCompiler (Step 17 in pipeline)
+      # to compile the bootstrap loader DEX at build time.
+      # Cached by version — only re-downloaded when version changes.
+      # Without this cache smali.jar downloads fresh each run (~1 min).
+      - name: Cache smali.jar
+        uses: actions/cache@v4
+        id: smali-cache
+        with:
+          path: /tmp/epic_tools/smali.jar
+          key: smali-v3.0.9
+
+      # ── Step 11 — Download smali.jar if not cached ─────────────
+      - name: Pre-Download smali.jar
+        run: |
+          mkdir -p /tmp/epic_tools
+          SMALI_URL="https://github.com/google/smali/releases/download/v3.0.9/smali-3.0.9.jar"
+          SMALI_JAR="/tmp/epic_tools/smali.jar"
+          if [ ! -f "$SMALI_JAR" ]; then
+            echo "📥 Downloading smali v3.0.9..."
+            wget -q -O "$SMALI_JAR" "$SMALI_URL"
+          else
+            echo "✅ smali.jar restored from cache."
+          fi
+          if [ -f "$SMALI_JAR" ] && [ "$(stat -c%s "$SMALI_JAR")" -gt 1000 ]; then
+            echo "✅ smali.jar ready: $(du -sh $SMALI_JAR | cut -f1)"
+          else
+            echo "⚠️ smali.jar not available — AssetCompiler will use fallback DEX template."
+          fi
+
+      # ── Step 12 — Confirm Bot Script Exists ────────────────────
       - name: Confirm Bot Script Exists
         run: |
           if [ ! -f "epicprotector.py" ]; then
@@ -178,7 +213,7 @@ jobs:
           echo "✅ epicprotector.py found."
           echo "📄 Script size: $(wc -l < epicprotector.py) lines"
 
-      # ── Step 11 — Python Syntax Validation ─────────────────────
+      # ── Step 13 — Python Syntax Validation ─────────────────────
       # Validates Python syntax before launching the bot.
       # Catches any script errors immediately — prevents silent failures.
       - name: Python Syntax Validation
@@ -197,7 +232,7 @@ jobs:
               sys.exit(1)
           "
 
-      # ── Step 12 — Run EPIC PROTECTOR Bot ───────────────────────
+      # ── Step 14 — Run EPIC PROTECTOR Bot ───────────────────────
       # KS_PASS and KS_KEY not required — script generates fresh
       # keystores dynamically per job and destroys them after signing.
       - name: Run EPIC PROTECTOR Bot
@@ -205,12 +240,12 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
         run: |
-          echo "🚀 Starting EPIC PROTECTOR Elite Bot (22-Step Pipeline)..."
+          echo "🚀 Starting EPIC PROTECTOR Elite Bot (24-Step Pipeline)..."
           echo "⏰ Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           python3 epicprotector.py 2>&1 | tee bot_log.txt
           echo "⏰ End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-      # ── Step 13 — Upload Full Log Always ───────────────────────
+      # ── Step 15 — Upload Full Log Always ───────────────────────
       # Single unified log artifact — always uploaded whether
       # the run succeeded or failed.
       # Retention: 30 days for full audit trail coverage.
