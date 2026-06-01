@@ -82,9 +82,8 @@ jobs:
           echo "✅ All required secrets are present."
 
       # ── Step 4 — Cache apt Packages ────────────────────────────
-      # Caches default-jdk, zipalign, apksigner and all apt deps.
-      # First run downloads and stores cache — all future runs
-      # restore from cache in under 45 seconds instead of 8 minutes.
+      # Caches default-jdk, zipalign, apksigner, libsmali-java and all apt deps.
+      # Includes /usr/share/java so smali.jar is available after cache restore.
       - name: Cache apt Packages
         uses: actions/cache@v4
         id: apt-cache
@@ -96,7 +95,9 @@ jobs:
             /usr/bin/keytool
             /usr/bin/zipalign
             /usr/bin/apksigner
-          key: apt-epic-tools-${{ runner.os }}-v1
+            /usr/share/java
+            /usr/bin/smali
+          key: apt-epic-tools-${{ runner.os }}-v2
           restore-keys: |
             apt-epic-tools-${{ runner.os }}-
 
@@ -115,7 +116,8 @@ jobs:
             apksigner \
             wget \
             unzip \
-            curl
+            curl \
+            libsmali-java
           echo "✅ System tools installed."
 
       # ── Step 6 — Verify System Tools ───────────────────────────
@@ -173,25 +175,49 @@ jobs:
           fi
           java -jar "$APKTOOL_JAR" --version && echo "✅ apktool verified." || { echo "❌ apktool failed to run."; exit 1; }
 
-      # ── Step 10 — Install smali via apt ───────────────────────
+      # ── Step 10 — Install smali and copy to epic_tools ────────
       # smali (libsmali-java) is used by AssetCompiler (Step 17)
       # to compile the bootstrap loader DEX at build time.
-      # Installed via apt — Ubuntu 22.04 official package repository.
-      # More reliable than GitHub download — no URL dependency.
-      # Provides smali v2.5.2 at /usr/share/java/smali.jar
+      # Always runs — ensures smali.jar is in /tmp/epic_tools/
+      # regardless of apt cache state.
       - name: Install smali
         run: |
-          echo "📦 Installing smali assembler..."
+          echo "📦 Ensuring smali assembler is available..."
+          mkdir -p /tmp/epic_tools
+
+          # If smali.jar already in epic_tools (from cache) — verify and use it
+          if [ -f "/tmp/epic_tools/smali.jar" ]; then
+            echo "✅ smali.jar already in /tmp/epic_tools — verifying..."
+            java -jar /tmp/epic_tools/smali.jar --version 2>&1 | head -1 && \
+              echo "✅ smali.jar verified from cache." && exit 0 || \
+              echo "⚠️ Cached smali.jar failed — reinstalling..."
+          fi
+
+          # Install libsmali-java via apt
           sudo apt-get install -y -qq libsmali-java
-          SMALI_JAR=$(find /usr/share/java -name "smali*.jar" 2>/dev/null | head -1)
+
+          # Find the installed jar
+          SMALI_JAR=$(find /usr/share/java -name "smali.jar" 2>/dev/null | head -1)
+          if [ -z "$SMALI_JAR" ]; then
+            SMALI_JAR=$(find /usr/share/java -name "smali*.jar" 2>/dev/null | head -1)
+          fi
+
           if [ -n "$SMALI_JAR" ]; then
-            echo "✅ smali installed: $SMALI_JAR"
-            mkdir -p /tmp/epic_tools
             cp "$SMALI_JAR" /tmp/epic_tools/smali.jar
-            echo "✅ smali.jar copied to /tmp/epic_tools/smali.jar"
-            java -jar /tmp/epic_tools/smali.jar --version && echo "✅ smali verified." || echo "⚠️ smali version check returned non-zero (normal)."
+            echo "✅ smali.jar copied to /tmp/epic_tools/smali.jar from $SMALI_JAR"
+            java -jar /tmp/epic_tools/smali.jar --version 2>&1 | head -1
+            echo "✅ smali verified."
           else
-            echo "⚠️ smali.jar not found after install — AssetCompiler will use fallback DEX template."
+            # Also try the smali binary directly
+            SMALI_BIN=$(which smali 2>/dev/null)
+            if [ -n "$SMALI_BIN" ]; then
+              echo "✅ smali available as binary: $SMALI_BIN"
+              echo "Script will use smali binary directly."
+            else
+              echo "❌ ERROR: smali not available — Asset Compiler will fail."
+              echo "   This will cause bootstrap DEX compilation to fail."
+              exit 1
+            fi
           fi
 
       # ── Step 11 — (Reserved) ───────────────────────────────────
