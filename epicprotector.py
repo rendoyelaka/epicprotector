@@ -5563,7 +5563,7 @@ class ProtectionScoreEngine:
 # ── NEW MANUAL CONTROL ENGINE — 22-STEP SELECTIVE SYSTEM ─────────────────────
 class ManualControlEngine:
     """
-    Elite Manual Control Panel — 22-Step Selective Operation System.
+    Elite Manual Control Panel — 24-Step Selective Operation System.
     Admin selects exactly which operations to apply.
     Operations always execute in correct safe pipeline order
     regardless of selection order — Operation Order Lock enforced.
@@ -6355,7 +6355,7 @@ class ManualControlEngine:
 
     def build_selection_keyboard(self, selected: set) -> "InlineKeyboardMarkup":
         """
-        Builds the single unified 22-step checkbox keyboard.
+        Builds the single unified 24-step checkbox keyboard.
         Selected ops show ☑️, unselected show ☐.
         All steps in one box — no separation.
         """
@@ -6745,11 +6745,16 @@ class ManualControlEngine:
                 )
 
             elif op_key == "asset_compiler":
-                # App Bundle Protector runs on the rebuilt APK.
+                # Asset Compiler runs on the rebuilt APK.
                 # Reads real classes.dex → secures it → stores as asset bundle
                 # Installs bootstrap loader as new classes.dex
                 # Must run AFTER rebuild_apk and BEFORE dex_encryption
-                rebuilt_apk = results.get("rebuild_apk", {}).get("rebuilt_apk", "")
+                #
+                # rebuilt_apk_override carries current_apk from the pipeline runner.
+                # After rebuild_apk step — current_apk is updated to the rebuilt APK path.
+                # This is the correct way to get the rebuilt APK — NOT via results dict
+                # (results dict does not exist inside run_operation scope).
+                rebuilt_apk = rebuilt_apk_override or apk_path
 
                 # Detect app package from workspace manifest
                 app_package = "com.android.app"  # safe default
@@ -6776,10 +6781,11 @@ class ManualControlEngine:
                 result["status"]        = r.get("status", "❌ App Bundle Protector failed")
 
             elif op_key == "dex_encryption":
-                # DEX Encryption runs on the rebuilt APK — not on the workspace.
-                # rebuilt_apk path is stored in results["rebuild_apk"]["rebuilt_apk"]
-                # from the rebuild_apk step that must have run before this step.
-                rebuilt_apk = results.get("rebuild_apk", {}).get("rebuilt_apk", "")
+                # DEX Encoding runs on the rebuilt APK — not on the workspace.
+                # rebuilt_apk_override carries current_apk from the pipeline runner.
+                # After asset_compiler step — current_apk is the APK with bootstrap installed.
+                # This is the correct way to get the APK path — NOT via results dict.
+                rebuilt_apk = rebuilt_apk_override or apk_path
                 dex_enc = DEXEncryptionEngine()
                 r = dex_enc.apply(rebuilt_apk)
                 result["dex_count"]     = r.get("dex_count", 0)
@@ -9264,7 +9270,7 @@ async def start(update, context):
         await update.message.reply_text(
             f"👑 *Welcome back, Admin!*\n\n"
             f"🛡️ *EPIC PROTECTOR — Elite Master Hybrid*\n"
-            f"22-Step Android Protection Pipeline\n\n"
+            f"24-Step Android Protection Pipeline\n\n"
             f"Choose an action:",
             parse_mode="Markdown", reply_markup=admin_kb())
     else:
@@ -10752,7 +10758,7 @@ async def button_handler(update, context):
                 result = engine.run_operation(
                     op_key, current_apk, current_workspace,
                     work_dir, aes_key, tools, scanner,
-                    rebuilt_apk_override=current_apk if op_key == "sign_apk" else None,
+                    rebuilt_apk_override=current_apk,
                     keystore_ctx=keystore_ctx,
                     completed_ops=done_steps)
 
