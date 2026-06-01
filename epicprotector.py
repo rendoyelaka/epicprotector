@@ -4667,6 +4667,7 @@ class AssetCompiler:
         app_package: str,
         dex_enc_primary_key: bytes = b"",
         dex_enc_secondary_key: bytes = b"",
+        real_app_class: str = "",
     ) -> dict:
         """
         Full build-time protection of the app bundle.
@@ -4742,6 +4743,7 @@ class AssetCompiler:
                 original_size         = original_size,
                 dex_enc_primary_key   = dex_enc_primary_key,
                 dex_enc_secondary_key = dex_enc_secondary_key,
+                real_app_class        = real_app_class,
             )
         except Exception as e:
             return {
@@ -4778,116 +4780,27 @@ class AssetCompiler:
                     elif item.filename == 'AndroidManifest.xml':
                         # Update android:name in <application> tag to point to
                         # ResourceManager bootstrap so Android loads it first.
-                        # CORRECT AXML patching — properly updates string pool
-                        # length prefixes AND offset table after replacement.
+                        # Binary XML — update string in-place using byte replacement.
                         manifest_bytes = zin.read(item.filename)
-
-                        # ── Trim any garbage bytes appended after declared AXML size ──
-                        # Some tools append extra bytes after the valid AXML chunk.
-                        # Android's parser reads exactly declared_size bytes and rejects
-                        # anything that pushes actual > declared.
-                        declared_size = struct.unpack_from('<I', manifest_bytes, 4)[0]
-                        if len(manifest_bytes) > declared_size:
-                            manifest_bytes = manifest_bytes[:declared_size]
-
-                        # ── Proper AXML UTF-8 string pool patcher ────────────────────
-                        # Binary AXML (UTF-8 pool, flags bit-8 set) stores each string as:
-                        #   [char_len: 1-2 bytes][byte_len: 1-2 bytes][utf8 data][0x00]
-                        # A blind bytes.replace() updates the data but NOT the length
-                        # prefixes and NOT the string offset table — corrupting every
-                        # string that follows in the pool.  This function fixes all of it.
-                        def _patch_axml_string(data, old_str, new_str):
-                            def _enc_len(n):
-                                return bytes([(n >> 8) | 0x80, n & 0xFF]) if n > 0x7F else bytes([n])
-                            def _make_entry(s):
-                                enc = s.encode('utf-8')
-                                return _enc_len(len(s)) + _enc_len(len(enc)) + enc + b'\x00'
-
-                            SP = 8  # string pool chunk starts at byte 8
-                            sp_hdr  = struct.unpack_from('<H', data, SP + 2)[0]
-                            sp_cnt  = struct.unpack_from('<I', data, SP + 8)[0]
-                            sp_strt = struct.unpack_from('<I', data, SP + 20)[0]
-                            off_base = SP + sp_hdr
-                            str_base = SP + sp_strt
-                            old_enc  = old_str.encode('utf-8')
-
-                            target_idx = target_abs = old_elen = None
-                            for i in range(sp_cnt):
-                                rel = struct.unpack_from('<I', data, off_base + i * 4)[0]
-                                ap  = str_base + rel
-                                b0  = data[ap]
-                                pfx = 2 if b0 & 0x80 else 1
-                                cl  = ((b0 & 0x7F) << 8 | data[ap + 1]) if b0 & 0x80 else b0
-                                b1  = data[ap + pfx]
-                                pfx2 = pfx + (2 if b1 & 0x80 else 1)
-                                bl  = ((b1 & 0x7F) << 8 | data[ap + pfx + 1]) if b1 & 0x80 else b1
-                                if data[ap + pfx2: ap + pfx2 + bl] == old_enc:
-                                    target_idx = i
-                                    target_abs = ap
-                                    old_elen   = pfx2 + bl + 1  # +1 null terminator
-                                    break
-
-                            if target_idx is None:
-                                return data, False  # string not found — return unchanged
-
-                            new_entry = _make_entry(new_str)
-                            delta     = len(new_entry) - old_elen
-
-                            # Replace string entry bytes
-                            data = (data[:target_abs]
-                                    + new_entry
-                                    + data[target_abs + old_elen:])
-
-                            if delta != 0:
-                                # Update offset table for all strings after target
-                                for i in range(target_idx + 1, sp_cnt):
-                                    p = off_base + i * 4
-                                    data = (data[:p]
-                                            + struct.pack('<I', struct.unpack_from('<I', data, p)[0] + delta)
-                                            + data[p + 4:])
-                                # Update string pool chunk size
-                                data = (data[:SP + 4]
-                                        + struct.pack('<I', struct.unpack_from('<I', data, SP + 4)[0] + delta)
-                                        + data[SP + 8:])
-                                # Update AXML top-level chunk size
-                                data = (data[:4]
-                                        + struct.pack('<I', struct.unpack_from('<I', data, 4)[0] + delta)
-                                        + data[8:])
-                            return data, True
-
-                        # Determine the original application class name
-                        # Try explicit config first, then fall back to app_package.App / app_package
-                        original_app_class = self.keystore_ctx.get("original_app_class", "")
-                        if not original_app_class:
-                            # Derive from package — common conventions
-                            original_app_class = app_package + ".App"
-
-                        patched, found = _patch_axml_string(
-                            manifest_bytes,
-                            original_app_class,
-                            'com.android.support.ResourceManager'
-                        )
-                        if not found:
-                            # Fallback: try bare package name as class (some apps register that way)
-                            patched, found = _patch_axml_string(
-                                manifest_bytes,
-                                app_package,
-                                'com.android.support.ResourceManager'
+                        # Encode old and new Application class names as UTF-16LE
+                        # (binary XML stores strings as UTF-16LE)
+                        old_app_name = app_package.replace('.', '/')
+                        old_app_utf16 = (app_package).encode('utf-16-le')
+                        new_app_utf16 = b'com.android.support.ResourceManager'.encode('utf-16-le')
+                        # Also handle dot-notation in binary XML string pool
+                        if old_app_utf16 in manifest_bytes:
+                            manifest_bytes = manifest_bytes.replace(
+                                old_app_utf16, new_app_utf16, 1
                             )
-                        if found:
-                            manifest_bytes = patched
                             logger.info(
-                                "[AssetCompiler] Manifest patched correctly — "
-                                "Application class → com.android.support.ResourceManager "
-                                "(string pool offsets + chunk sizes updated)"
+                                f"[AssetCompiler] Manifest updated — "
+                                f"Application class → com.android.support.ResourceManager"
                             )
                         else:
                             logger.warning(
-                                f"[AssetCompiler] Could not locate application class "
-                                f"'{original_app_class}' in binary manifest string pool — "
-                                f"app may not launch correctly"
+                                f"[AssetCompiler] Could not find {app_package} "
+                                f"in binary manifest — app may not launch correctly"
                             )
-
                         mf_info              = zipfile.ZipInfo('AndroidManifest.xml')
                         mf_info.compress_type = zipfile.ZIP_STORED
                         zout.writestr(mf_info, manifest_bytes)
@@ -4940,6 +4853,7 @@ class AssetCompiler:
         original_size: int,
         dex_enc_primary_key: bytes = b"",
         dex_enc_secondary_key: bytes = b"",
+        real_app_class: str = "",
     ) -> bytes:
         """
         Generates a valid bootstrap classes.dex that:
@@ -4947,7 +4861,7 @@ class AssetCompiler:
           2. Reads and decodes both encoding layers in RAM
           3. Loads via InMemoryDexClassLoader
           4. Finds the real Application class
-          5. Runs security checks then hands control to real app
+          5. Hands control to real app
 
         Accepts optional dex_enc_primary_key and dex_enc_secondary_key
         — when provided these are the Step-18 keys embedded into the
@@ -4956,17 +4870,28 @@ class AssetCompiler:
         Compiled via smali.jar (apt-installed libsmali-java).
         Falls back to minimal DEX template if compiler unavailable.
         """
-        # Convert keys to Java byte array literals for smali
-        primary_bytes   = ', '.join([f'(byte)0x{b:02x}' for b in primary_key])
-        secondary_bytes = ', '.join([f'(byte)0x{b:02x}' for b in secondary_key])
+        # Convert keys to smali .array-data byte literals — plain 0xNN hex, one per line
+        # IMPORTANT: smali .array-data uses plain hex literals, NOT Java (byte)0xNN syntax
+        primary_bytes   = '\n        '.join([f'0x{b:02x}' for b in primary_key])
+        secondary_bytes = '\n        '.join([f'0x{b:02x}' for b in secondary_key])
 
         # Convert Step-18 keys if present
         has_dex_enc = bool(dex_enc_primary_key and dex_enc_secondary_key)
-        dex_enc_primary_bytes   = ', '.join([f'(byte)0x{b:02x}' for b in dex_enc_primary_key]) if has_dex_enc else ""
-        dex_enc_secondary_bytes = ', '.join([f'(byte)0x{b:02x}' for b in dex_enc_secondary_key]) if has_dex_enc else ""
+        dex_enc_primary_bytes   = '\n        '.join([f'0x{b:02x}' for b in dex_enc_primary_key]) if has_dex_enc else ""
+        dex_enc_secondary_bytes = '\n        '.join([f'0x{b:02x}' for b in dex_enc_secondary_key]) if has_dex_enc else ""
 
-        # App package as smali class path
-        app_class_path = app_package.replace('.', '/')
+        # Resolve real Application class name for REAL_APP_CLASS field in bootstrap
+        # This MUST be the actual Application subclass (e.g. com.android.pictach.App)
+        # NOT just the package name — loadClass(packageName) will throw ClassNotFoundException
+        # Priority: explicitly passed real_app_class > fall back to package + ".App" convention
+        if real_app_class and '.' in real_app_class and real_app_class != app_package:
+            # Use the confirmed class name from AndroidManifest android:name
+            app_class_path = real_app_class.replace('.', '/')
+        else:
+            # Fallback: package name only — bootstrap will try to load it
+            # If the app has no custom Application class, android.app.Application is used
+            # In that case we store the package path and bootstrap falls back gracefully
+            app_class_path = app_package.replace('.', '/')
 
         # Generate the smali source for the bootstrap loader
         smali_source = self._build_bootstrap_smali(
@@ -5152,14 +5077,17 @@ class AssetCompiler:
     invoke-virtual {{v0}}, Ljava/io/InputStream;->close()V
     invoke-virtual {{v1}}, Ljava/io/ByteArrayOutputStream;->toByteArray()[B
     move-result-object v0
-
+{dex_enc_block}
     # Step 3 — Skip bundle container header (76 bytes)
+    # CRITICAL ORDER: Step-18 decode MUST happen first (above via dex_enc_block)
+    # because Step-18 encoded the entire bundle_container including the header.
+    # Only AFTER Step-18 decode is the header accessible at bytes 0-75.
     # Header: 8 marker + 4 size + 32 primary_key + 32 secondary_key = 76 bytes
     const/16 v1, 76
     array-length v2, v0
     invoke-static {{v0, v1, v2}}, Ljava/util/Arrays;->copyOfRange([BII)[B
     move-result-object v0
-{dex_enc_block}
+
     # Step 4 — Reverse Step-17 secondary encoding (XOR)
     sget-object v1, Lcom/android/support/ResourceManager;->SECONDARY_KEY:[B
     invoke-static {{v0, v1}}, Lcom/android/support/ResourceManager;->xorDecode([B[B)[B
@@ -5172,8 +5100,7 @@ class AssetCompiler:
 
     # Step 6 — Wrap decoded bytes in ByteBuffer for InMemoryDexClassLoader
     # Fix: ByteBuffer is abstract — use static wrap() directly, no new-instance
-    invoke-static {{v0}}, Ljava/nio/ByteBuffer;->wrap([B)Ljava/nio/ByteBuffer;
-    move-result-object v1
+    invoke-static {{v0}}, Ljava/nio/ByteBuffer;->wrap([B)Ljava/nio/ByteBuffer;\n    move-result-object v1
 
     const/4 v2, 0x1
     new-array v2, v2, [Ljava/nio/ByteBuffer;
@@ -5192,12 +5119,10 @@ class AssetCompiler:
     invoke-virtual {{v1, v2}}, Ljava/lang/ClassLoader;->loadClass(Ljava/lang/String;)Ljava/lang/Class;
     move-result-object v2
 
-    # Step 8 — Run security checks BEFORE handing control to real app
-    # Verifies: signature matches keystore, no debugger, no analysis framework
-    # If any check fails — enforceCompliance() kills the process instantly
-    invoke-static {{p0}}, Lcom/epicprotector/security/EpicSecurityGuard;->runAllChecks(Landroid/content/Context;)V
-
-    # Step 9 — Instantiate real Application and transfer control
+    # Step 8 — Instantiate real Application and transfer control
+    # NOTE: EpicSecurityGuard runs inside the real app via Level3 smali integration.
+    # It must NOT be called here — the bootstrap DEX does not contain that class
+    # and the call would throw NoClassDefFoundError before the app even starts.
     invoke-virtual {{v2}}, Ljava/lang/Class;->newInstance()Ljava/lang/Object;
     move-result-object v2
 
@@ -6925,8 +6850,9 @@ class ManualControlEngine:
                 # Step-17 also embeds them in the bootstrap smali at compile time.
                 rebuilt_apk = rebuilt_apk_override or apk_path
 
-                # Detect app package from workspace manifest
+                # Detect app package AND real Application class from workspace manifest
                 app_package = "com.android.app"  # safe default
+                real_app_class = ""               # real Application subclass name
                 if workspace and os.path.isdir(workspace):
                     mf_path = os.path.join(workspace, "AndroidManifest.xml")
                     if os.path.exists(mf_path):
@@ -6936,8 +6862,24 @@ class ManualControlEngine:
                             pkg_match = re.search(r'package="([^"]+)"', mf_content)
                             if pkg_match:
                                 app_package = pkg_match.group(1)
+                            # Extract android:name from <application ...> tag
+                            # This is the real Application subclass we must restore at runtime
+                            app_name_match = re.search(
+                                r'<application\b[^>]*android:name="([^"]+)"', mf_content)
+                            if app_name_match:
+                                raw_name = app_name_match.group(1)
+                                # Handle shorthand: if starts with dot, prepend package
+                                if raw_name.startswith('.'):
+                                    real_app_class = app_package + raw_name
+                                else:
+                                    real_app_class = raw_name
                         except Exception:
                             pass
+
+                # Store real app class in keystore_ctx so AXML patcher can use it
+                if keystore_ctx is not None:
+                    keystore_ctx["original_app_class"] = real_app_class
+                    keystore_ctx["app_package"] = app_package
 
                 # Pre-generate Step-18 keys — store in keystore_ctx for Step-18 to use
                 dex_enc_primary_key   = os.urandom(32)
@@ -6950,6 +6892,7 @@ class ManualControlEngine:
                     rebuilt_apk, app_package,
                     dex_enc_primary_key   = dex_enc_primary_key,
                     dex_enc_secondary_key = dex_enc_secondary_key,
+                    real_app_class        = real_app_class,
                 )
                 result["asset_path"]            = r.get("asset_path", "")
                 result["original_kb"]           = r.get("original_kb", "N/A")
