@@ -6925,31 +6925,135 @@ class ManualControlEngine:
                 # Step-17 also embeds them in the bootstrap smali at compile time.
                 rebuilt_apk = rebuilt_apk_override or apk_path
 
-                # Detect app package AND real Application class from workspace manifest
-                app_package = "com.android.app"  # safe default
-                real_app_class = ""               # real Application subclass name
-                if workspace and os.path.isdir(workspace):
-                    mf_path = os.path.join(workspace, "AndroidManifest.xml")
-                    if os.path.exists(mf_path):
-                        try:
-                            with open(mf_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                mf_content = f.read()
-                            pkg_match = re.search(r'package="([^"]+)"', mf_content)
-                            if pkg_match:
-                                app_package = pkg_match.group(1)
-                            # Extract android:name from <application ...> tag
-                            # This is the real Application subclass we must restore at runtime
-                            app_name_match = re.search(
-                                r'<application\b[^>]*android:name="([^"]+)"', mf_content)
-                            if app_name_match:
-                                raw_name = app_name_match.group(1)
-                                # Handle shorthand: if starts with dot, prepend package
-                                if raw_name.startswith('.'):
-                                    real_app_class = app_package + raw_name
+                # Detect app package AND real Application class
+                # PRIMARY: read from decoded workspace AndroidManifest.xml (text XML)
+                # FALLBACK: read from binary APK manifest when workspace not available
+                # (e.g. when Quick Test Panel runs only Rebuild + Asset Compiler + Sign)
+                app_package    = "com.android.app"  # safe default
+                real_app_class = ""                  # real Application subclass name
+
+                def _read_manifest_info_from_workspace(ws):
+                    """Read package and app class from decoded workspace text XML."""
+                    pkg = "com.android.app"
+                    app_cls = ""
+                    try:
+                        mf_path = os.path.join(ws, "AndroidManifest.xml")
+                        if not os.path.exists(mf_path):
+                            return pkg, app_cls
+                        with open(mf_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                        pkg_m = re.search(r'package="([^"]+)"', content)
+                        if pkg_m:
+                            pkg = pkg_m.group(1)
+                        app_m = re.search(
+                            r'<application\b[^>]*android:name="([^"]+)"', content)
+                        if app_m:
+                            raw = app_m.group(1)
+                            app_cls = (pkg + raw) if raw.startswith('.') else raw
+                    except Exception:
+                        pass
+                    return pkg, app_cls
+
+                def _read_manifest_info_from_apk(apk_path):
+                    """
+                    Read package name and Application class from binary AXML
+                    inside the APK when workspace is not available.
+                    Parses the UTF-8 string pool and scans for package pattern
+                    and Application subclass name.
+                    """
+                    pkg = "com.android.app"
+                    app_cls = ""
+                    try:
+                        with zipfile.ZipFile(apk_path, 'r') as zf:
+                            if 'AndroidManifest.xml' not in zf.namelist():
+                                return pkg, app_cls
+                            mf = zf.read('AndroidManifest.xml')
+
+                        # Parse string pool
+                        SP = 8
+                        sp_hdr   = struct.unpack_from('<H', mf, SP + 2)[0]
+                        sp_cnt   = struct.unpack_from('<I', mf, SP + 8)[0]
+                        sp_flags = struct.unpack_from('<I', mf, SP + 16)[0]
+                        sp_strt  = struct.unpack_from('<I', mf, SP + 20)[0]
+                        is_utf8  = bool(sp_flags & (1 << 8))
+                        off_base = SP + sp_hdr
+                        str_base = SP + sp_strt
+
+                        strings = []
+                        for i in range(sp_cnt):
+                            rel = struct.unpack_from('<I', mf, off_base + i * 4)[0]
+                            ap  = str_base + rel
+                            try:
+                                if is_utf8:
+                                    b0  = mf[ap]
+                                    pfx = 2 if b0 & 0x80 else 1
+                                    b1  = mf[ap + pfx]
+                                    p2  = pfx + (2 if b1 & 0x80 else 1)
+                                    bl  = ((b1 & 0x7F) << 8 | mf[ap + pfx + 1]) \
+                                          if b1 & 0x80 else b1
+                                    s   = mf[ap + p2: ap + p2 + bl].decode('utf-8')
                                 else:
-                                    real_app_class = raw_name
-                        except Exception:
-                            pass
+                                    cl  = struct.unpack_from('<H', mf, ap)[0]
+                                    s   = mf[ap + 2: ap + 2 + cl * 2].decode('utf-16-le')
+                                strings.append(s)
+                            except Exception:
+                                strings.append('')
+
+                        # Package name — 2 dots, not starting with android, reasonable length
+                        for s in strings:
+                            if (s and s.count('.') >= 2
+                                    and not s.startswith('android')
+                                    and not s.startswith('com.google')
+                                    and len(s) < 60
+                                    and ' ' not in s
+                                    and '/' not in s):
+                                pkg = s
+                                break
+
+                        # Application class — contains package prefix + class name
+                        # Look for strings that start with the package and end in a class
+                        for s in strings:
+                            if (s and s.startswith(pkg + '.')
+                                    and '/' not in s
+                                    and ' ' not in s
+                                    and len(s) > len(pkg) + 1):
+                                # Prefer class names that look like Application subclasses
+                                last = s.split('.')[-1]
+                                if any(kw in last for kw in [
+                                    'App', 'Application', 'Base', 'Main', 'Root'
+                                ]):
+                                    app_cls = s
+                                    break
+                        # If no Application-named class found, first class in package
+                        if not app_cls:
+                            for s in strings:
+                                if (s and s.startswith(pkg + '.')
+                                        and '/' not in s
+                                        and ' ' not in s
+                                        and len(s) > len(pkg) + 1):
+                                    app_cls = s
+                                    break
+                    except Exception:
+                        pass
+                    return pkg, app_cls
+
+                # Try workspace first — it has text XML which is more reliable
+                if workspace and os.path.isdir(workspace):
+                    app_package, real_app_class = _read_manifest_info_from_workspace(workspace)
+
+                # Fallback — read from binary APK manifest when workspace unavailable
+                # This handles Quick Test Panel with no Decode step selected
+                if app_package == "com.android.app" or not real_app_class:
+                    apk_pkg, apk_cls = _read_manifest_info_from_apk(rebuilt_apk)
+                    if app_package == "com.android.app" and apk_pkg != "com.android.app":
+                        app_package = apk_pkg
+                    if not real_app_class and apk_cls:
+                        real_app_class = apk_cls
+
+                logger.info(
+                    f"[AssetCompiler] package={app_package} "
+                    f"app_class={real_app_class or '(none — using android.app.Application)'}"
+                )
 
                 # Store real app class in keystore_ctx so AXML patcher can use it
                 if keystore_ctx is not None:
@@ -6979,6 +7083,11 @@ class ManualControlEngine:
                 result["dex_enc_primary_key"]   = dex_enc_primary_key.hex()
                 result["dex_enc_secondary_key"] = dex_enc_secondary_key.hex()
                 result["status"]                = r.get("status", "❌ Asset Compiler failed")
+                # Flag whether asset_compiler succeeded — dex_encryption checks this
+                asset_ok = "✅" in result["status"]
+                result["asset_compiler_ok"] = asset_ok
+                if keystore_ctx is not None:
+                    keystore_ctx["asset_compiler_ok"] = asset_ok
 
             elif op_key == "dex_encryption":
                 # DEX Encoding runs on the rebuilt APK — not on the workspace.
@@ -6991,22 +7100,50 @@ class ManualControlEngine:
                 # already has them embedded and can decode this layer at runtime.
                 rebuilt_apk = rebuilt_apk_override or apk_path
 
-                # Use pre-generated keys from Step 17 if available
-                dex_enc_primary_key   = keystore_ctx.get("dex_enc_primary_key", None)
-                dex_enc_secondary_key = keystore_ctx.get("dex_enc_secondary_key", None)
+                # CRITICAL GUARD — if asset_compiler failed, skip dex_encryption.
+                # Without a successful asset_compiler run there is no asset bundle
+                # to encode. Running dex_encryption without it would either:
+                #   a) find nothing to encode and return a warning, OR
+                #   b) encode the real full DEX inside the APK with random keys
+                #      that the bootstrap does NOT know — runtime crash guaranteed.
+                # Either way the result is a broken APK. Stop cleanly instead.
+                asset_compiler_ok = keystore_ctx.get("asset_compiler_ok", True) \
+                    if keystore_ctx else True
+                # Also check completed_ops — if asset_compiler was in the pipeline
+                # and is NOT in completed_ops, it failed or was skipped
+                if "asset_compiler" in completed_ops:
+                    # asset_compiler ran in a previous batch — check keystore_ctx flag
+                    asset_compiler_ok = keystore_ctx.get("asset_compiler_ok", True) \
+                        if keystore_ctx else True
+                # Check current batch results via keystore_ctx flag set just above
+                if keystore_ctx is not None and "asset_compiler_ok" in keystore_ctx:
+                    asset_compiler_ok = keystore_ctx["asset_compiler_ok"]
 
-                dex_enc = DEXEncryptionEngine()
-                r = dex_enc.apply(
-                    rebuilt_apk,
-                    fixed_rc4_key = dex_enc_primary_key,
-                    fixed_xor_key = dex_enc_secondary_key,
-                )
-                result["dex_count"]     = r.get("dex_count", 0)
-                result["original_kb"]   = r.get("original_kb", "N/A")
-                result["encrypted_kb"]  = r.get("encrypted_kb", "N/A")
-                result["rc4_key_hex"]   = r.get("rc4_key_hex", "")
-                result["xor_key_hex"]   = r.get("xor_key_hex", "")
-                result["status"]        = r.get("status", "❌ DEX Encryption failed")
+                if not asset_compiler_ok:
+                    result["status"]    = (
+                        "⏭️ DEX Encoding skipped — Asset Compiler did not complete "
+                        "successfully. Fix Asset Compiler first."
+                    )
+                    result["dex_count"] = 0
+                else:
+                    # Use pre-generated keys from Step 17 if available
+                    dex_enc_primary_key   = keystore_ctx.get("dex_enc_primary_key", None) \
+                        if keystore_ctx else None
+                    dex_enc_secondary_key = keystore_ctx.get("dex_enc_secondary_key", None) \
+                        if keystore_ctx else None
+
+                    dex_enc = DEXEncryptionEngine()
+                    r = dex_enc.apply(
+                        rebuilt_apk,
+                        fixed_rc4_key = dex_enc_primary_key,
+                        fixed_xor_key = dex_enc_secondary_key,
+                    )
+                    result["dex_count"]     = r.get("dex_count", 0)
+                    result["original_kb"]   = r.get("original_kb", "N/A")
+                    result["encrypted_kb"]  = r.get("encrypted_kb", "N/A")
+                    result["rc4_key_hex"]   = r.get("rc4_key_hex", "")
+                    result["xor_key_hex"]   = r.get("xor_key_hex", "")
+                    result["status"]        = r.get("status", "❌ DEX Encryption failed")
 
             elif op_key == "integrity_manifest":
                 guardian = IntegrityGuardian(work_dir)
@@ -9447,9 +9584,13 @@ session_reports     = {}   # SessionReportEngine per user
 smali_safety_cache  = {}   # cached safety analysis results per user
 manual_keystore_ctx = {}   # keystore context shared across steps {keystore_path, alias, ks_pass, key_pass, sha256}
 
+# ── QUICK TEST PANEL SESSION STATE ────────────────────────────────────────────
+quick_test_selected = {}   # {user_id: set()} — which steps are ON
+
 # ── ADMIN KEYBOARD ───────────────────────────────────────────────────────────
 def admin_kb():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧪 Quick Test Panel",        callback_data="quick_test_open")],
         [InlineKeyboardButton("🎛️ Manual Control Panel",   callback_data="admin_manual")],
         [InlineKeyboardButton("📦 Base APK",                callback_data="admin_base_apk")],
     ])
@@ -9472,6 +9613,36 @@ def client_kb():
     ])
 
 def back_a(): return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_admin")]])
+
+
+def _build_quick_test_keyboard(selected: set, engine: "ManualControlEngine") -> "InlineKeyboardMarkup":
+    """
+    Builds the Quick Test Panel keyboard.
+    Every step is a toggle button — ON (☑️) or OFF (☐).
+    One Proceed button at the bottom delivers the APK.
+    """
+    rows = []
+    for op in engine.PIPELINE_ORDER:
+        label   = engine.STEP_LABELS.get(op, op)
+        tick    = "☑️" if op in selected else "☐"
+        display = f"{tick} {label}"
+        rows.append([InlineKeyboardButton(
+            display, callback_data=f"qt_toggle_{op}"
+        )])
+
+    # Control row
+    rows.append([
+        InlineKeyboardButton("☑️ Select All", callback_data="qt_select_all"),
+        InlineKeyboardButton("☐ Clear All",   callback_data="qt_clear_all"),
+    ])
+
+    # Proceed button — only active label changes based on selection count
+    count   = len(selected)
+    proceed = f"▶️ Proceed & Get APK  ({count} steps)" if count else "▶️ Proceed & Get APK"
+    rows.append([InlineKeyboardButton(proceed, callback_data="qt_proceed")])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
+
+    return InlineKeyboardMarkup(rows)
 def back_c(): return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_client")]])
 
 
@@ -10596,6 +10767,314 @@ async def button_handler(update, context):
             "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
             parse_mode="Markdown", reply_markup=admin_kb())
         return
+
+    # ── BACK TO SESSION CHECKLIST (from smali tree) ───────────────────────────
+    # ── QUICK TEST PANEL — OPEN ───────────────────────────────────────────────
+    elif data == "quick_test_open":
+        if not is_admin(user.id): return
+
+        # Load base APK config
+        config  = _get_base_apk_config()
+        file_id = config.get("base_apk_file_id")
+        if not file_id:
+            await query.edit_message_text(
+                "🧪 *Quick Test Panel*\n\n"
+                "❌ No Base APK stored yet.\n\n"
+                "Go to 📦 Base APK → Upload Base APK first.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+
+        apk_name = config.get("base_apk_filename", "base.apk")
+
+        # Initialise fresh selection — default useful testing steps ON
+        engine   = ManualControlEngine(CryptoEngine(), WORK_DIR)
+        default  = {
+            "strip_signature",
+            "decode_workspace",
+            "rebuild_apk",
+            "asset_compiler",
+            "dex_encryption",
+            "keystore_generation",
+            "unique_fingerprint",
+            "zipalign",
+            "sign_apk",
+        }
+        quick_test_selected[user.id] = default
+
+        count = len(default)
+        await query.edit_message_text(
+            f"🧪 *Quick Test Panel*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 `{apk_name}`\n\n"
+            f"Tap any step to toggle ON ☑️ / OFF ☐\n"
+            f"Then tap *▶️ Proceed & Get APK*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ *{count} steps selected*",
+            parse_mode="Markdown",
+            reply_markup=_build_quick_test_keyboard(default, engine))
+
+    # ── QUICK TEST PANEL — TOGGLE STEP ────────────────────────────────────────
+    elif data.startswith("qt_toggle_"):
+        if not is_admin(user.id): return
+
+        op_key   = data[len("qt_toggle_"):]
+        selected = quick_test_selected.get(user.id, set()).copy()
+
+        if op_key in selected:
+            selected.discard(op_key)
+        else:
+            selected.add(op_key)
+
+        quick_test_selected[user.id] = selected
+        config   = _get_base_apk_config()
+        apk_name = config.get("base_apk_filename", "base.apk")
+        engine   = ManualControlEngine(CryptoEngine(), WORK_DIR)
+        count    = len(selected)
+
+        await query.edit_message_text(
+            f"🧪 *Quick Test Panel*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 `{apk_name}`\n\n"
+            f"Tap any step to toggle ON ☑️ / OFF ☐\n"
+            f"Then tap *▶️ Proceed & Get APK*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ *{count} steps selected*",
+            parse_mode="Markdown",
+            reply_markup=_build_quick_test_keyboard(selected, engine))
+
+    # ── QUICK TEST PANEL — SELECT ALL ────────────────────────────────────────
+    elif data == "qt_select_all":
+        if not is_admin(user.id): return
+
+        engine   = ManualControlEngine(CryptoEngine(), WORK_DIR)
+        selected = set(engine.PIPELINE_ORDER)
+        quick_test_selected[user.id] = selected
+        config   = _get_base_apk_config()
+        apk_name = config.get("base_apk_filename", "base.apk")
+        count    = len(selected)
+
+        await query.edit_message_text(
+            f"🧪 *Quick Test Panel*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 `{apk_name}`\n\n"
+            f"Tap any step to toggle ON ☑️ / OFF ☐\n"
+            f"Then tap *▶️ Proceed & Get APK*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ *{count} steps selected (ALL)*",
+            parse_mode="Markdown",
+            reply_markup=_build_quick_test_keyboard(selected, engine))
+
+    # ── QUICK TEST PANEL — CLEAR ALL ─────────────────────────────────────────
+    elif data == "qt_clear_all":
+        if not is_admin(user.id): return
+
+        engine   = ManualControlEngine(CryptoEngine(), WORK_DIR)
+        selected = set()
+        quick_test_selected[user.id] = selected
+        config   = _get_base_apk_config()
+        apk_name = config.get("base_apk_filename", "base.apk")
+
+        await query.edit_message_text(
+            f"🧪 *Quick Test Panel*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📦 `{apk_name}`\n\n"
+            f"Tap any step to toggle ON ☑️ / OFF ☐\n"
+            f"Then tap *▶️ Proceed & Get APK*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"☐ *0 steps selected*",
+            parse_mode="Markdown",
+            reply_markup=_build_quick_test_keyboard(selected, engine))
+
+    # ── QUICK TEST PANEL — PROCEED & GET APK ─────────────────────────────────
+    elif data == "qt_proceed":
+        if not is_admin(user.id): return
+
+        selected = quick_test_selected.get(user.id, set())
+
+        if not selected:
+            await query.answer(
+                "⚠️ No steps selected. Tap steps to turn them ON first.",
+                show_alert=True)
+            return
+
+        # Load base APK
+        config   = _get_base_apk_config()
+        apk_name = config.get("base_apk_filename", "base.apk")
+
+        status_msg = await query.edit_message_text(
+            f"🧪 *Quick Test Panel*\n\n"
+            f"📦 `{apk_name}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 Loading APK...",
+            parse_mode="Markdown")
+
+        try:
+            apk_path = BaseApkStorageEngine.get_local_path(config)
+            if not apk_path:
+                await status_msg.edit_text(
+                    f"🧪 *Quick Test Panel*\n\n"
+                    f"📥 Downloading Base APK...\n⏳ Please wait...",
+                    parse_mode="Markdown")
+                apk_path = await BaseApkStorageEngine.download_base_apk(
+                    context.bot, config)
+            if not apk_path:
+                await status_msg.edit_text(
+                    "❌ Failed to load Base APK.\nGo to 📦 Base APK and re-upload.",
+                    parse_mode="Markdown", reply_markup=back_a())
+                return
+        except Exception as e:
+            await status_msg.edit_text(
+                f"❌ APK load error: `{e}`",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+
+        # Fresh work directory for this test run
+        job_id   = f"qt_{int(time.time())}"
+        work_dir = os.path.join(WORK_DIR, job_id)
+        os.makedirs(work_dir, exist_ok=True)
+
+        engine      = ManualControlEngine(CryptoEngine(), work_dir)
+        aes_key     = AESKeyManager.generate()
+        tools       = ToolInstaller()
+        scanner     = ComplianceScannerEngine()
+        keystore_ctx = {}
+
+        # Always add signing so APK is always installable
+        selected_with_sign = engine.enforce_auto_sign(selected)
+        ordered_ops        = engine.enforce_pipeline_order(selected_with_sign)
+
+        total      = len(ordered_ops)
+        start_time = time.time()
+
+        current_apk       = apk_path
+        current_workspace = None
+        step_results      = []
+
+        # ── Run each selected step ─────────────────────────────────────────
+        for i, op_key in enumerate(ordered_ops):
+            label = engine.STEP_LABELS.get(op_key, op_key)
+
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=user.id,
+                    message_id=status_msg.message_id,
+                    text=f"🧪 *Quick Test Panel*\n\n"
+                         f"📦 `{apk_name}`\n"
+                         f"━━━━━━━━━━━━━━━━━━━━━\n"
+                         f"Step {i+1}/{total}\n"
+                         f"▶️ *{label}*\n"
+                         f"⏳ Running...",
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+
+            # Pre-update current_apk from previous rebuild result
+            for prev in reversed(step_results):
+                if prev.get("op") == "rebuild_apk" and prev.get("rebuilt_apk"):
+                    if os.path.exists(prev["rebuilt_apk"]):
+                        current_apk = prev["rebuilt_apk"]
+                    break
+
+            result = engine.run_operation(
+                op_key, current_apk, current_workspace,
+                work_dir, aes_key, tools, scanner,
+                rebuilt_apk_override = current_apk,
+                keystore_ctx         = keystore_ctx,
+                completed_ops        = set(r["op"] for r in step_results))
+
+            result["op"] = op_key
+
+            # Update state
+            if op_key == "decode_workspace" and result.get("workspace"):
+                current_workspace = result["workspace"]
+            if op_key == "strip_signature":
+                stripped = os.path.join(work_dir, "input_stripped.apk")
+                if os.path.exists(stripped):
+                    current_apk = stripped
+            if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
+                current_apk = result["rebuilt_apk"]
+            if op_key == "sign_apk" and result.get("final_apk"):
+                current_apk = result["final_apk"]
+
+            step_results.append(result)
+
+        # ── Build result summary ───────────────────────────────────────────
+        elapsed = int(time.time() - start_time)
+        mins    = elapsed // 60
+        secs    = elapsed % 60
+
+        lines = [
+            "🧪 *Quick Test — Results*",
+            f"📦 `{apk_name}`",
+            f"⏱️ Time: {mins}m {secs}s",
+            "━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        final_apk = None
+        for r in step_results:
+            lbl    = engine.STEP_LABELS.get(r["op"], r["op"])
+            status = r.get("status", "")
+            if "❌" in status:
+                icon = "❌"
+            elif "⚠️" in status:
+                icon = "⚠️"
+            else:
+                icon = "✅"
+            lines.append(f"{icon} {lbl}")
+            # Show error detail for failed steps
+            if "❌" in status:
+                lines.append(f"   _{status[:100]}_")
+            if r.get("final_apk") and os.path.exists(r["final_apk"]):
+                final_apk = r["final_apk"]
+
+        lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+        result_text = "\n".join(lines)
+
+        await status_msg.edit_text(
+            result_text,
+            parse_mode="Markdown")
+
+        # ── Deliver APK ───────────────────────────────────────────────────
+        if final_apk and os.path.exists(final_apk):
+            size_mb = os.path.getsize(final_apk) / (1024 * 1024)
+            with open(final_apk, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=user.id,
+                    document=f,
+                    filename=f"EPIC_TEST_{job_id}.apk",
+                    caption=(
+                        f"✅ *Quick Test APK Ready*\n\n"
+                        f"📦 Size: {size_mb:.1f} MB\n"
+                        f"⏱️ Built in {mins}m {secs}s\n\n"
+                        f"Install on device and test."
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "🔄 Run Again", callback_data="quick_test_open"),
+                        InlineKeyboardButton(
+                            "🔙 Back", callback_data="back_admin"),
+                    ]]))
+        else:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=(
+                    "⚠️ *No signed APK produced.*\n\n"
+                    "Make sure *Sign APK* step is included.\n"
+                    "It is added automatically — check if Rebuild APK "
+                    "and Decode steps ran successfully."
+                ),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "🔄 Try Again", callback_data="quick_test_open"),
+                    InlineKeyboardButton(
+                        "🔙 Back", callback_data="back_admin"),
+                ]]))
+
+        # Clean up selection
+        quick_test_selected.pop(user.id, None)
 
     # ── BACK TO SESSION CHECKLIST (from smali tree) ───────────────────────────
     elif data == "mcp_session_back":
