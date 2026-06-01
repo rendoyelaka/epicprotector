@@ -12727,7 +12727,7 @@ async def button_handler(update, context):
             result = engine.run_operation(
                 op_key, current_apk, current_workspace,
                 work_dir, aes_key, tools, scanner,
-                rebuilt_apk_override=current_apk if op_key == "sign_apk" else None,
+                rebuilt_apk_override=current_apk,
                 keystore_ctx=keystore_ctx,
                 completed_ops=done_steps)
 
