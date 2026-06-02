@@ -5,14 +5,23 @@ name: EPIC PROTECTOR — Bot 24/7 Elite
 # Elite Master Hybrid Edition — 24-Step Pipeline
 # ══════════════════════════════════════════════════════════════════
 #
-# Key fixes in this version:
-#   1. libsmali-java ALWAYS installed — not skipped on cache hit
-#   2. smali.jar verified and hard-fails if missing (exit 1)
-#   3. /usr/share/java cached so smali survives between runs
-#   4. Cache key v3 — forces clean rebuild to fix broken v1/v2 caches
-#   5. GH_PAT passed to bot — Base APK GitHub storage works
-#   6. smali binary fallback — works even without jar
-#   7. All tool checks exit 1 on failure — no silent failures
+# What this workflow does:
+#   - Runs bot 24/7 via 5-hour schedule restart
+#   - Installs all tools needed for the 24-step pipeline
+#   - Caches apktool.jar and smali.jar so restarts are fast
+#   - Hard-fails if any critical tool is missing (no silent failures)
+#   - Passes GH_PAT so Base APK storage works
+#   - Uploads full log after every run
+#
+# Tool install strategy:
+#   - Step 5: apt-get install runs EVERY time (no cache-hit skip)
+#             Reason: apt cache stores .deb files but does NOT
+#             restore installed binaries to /usr/share/java or /usr/bin
+#             Running install when packages are cached takes ~5 seconds
+#   - Step 8: apktool.jar cached by version key — never re-downloaded
+#   - Step 9: smali.jar cached by version key — never re-installed
+#             This is the critical fix: smali.jar now persists between
+#             the 5-hour restart cycles, same as apktool.jar
 # ══════════════════════════════════════════════════════════════════
 
 on:
@@ -39,7 +48,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ── Step 2 — Python Setup ──────────────────────────────────
+      # ── Step 2 — Python ────────────────────────────────────────
       - name: Set Up Python 3.11
         uses: actions/setup-python@v5
         with:
@@ -54,33 +63,14 @@ jobs:
         run: |
           [ -z "$BOT_TOKEN" ] && echo "❌ BOT_TOKEN missing" && exit 1
           [ -z "$ADMIN_ID"  ] && echo "❌ ADMIN_ID missing"  && exit 1
-          echo "✅ All secrets present."
+          echo "✅ Secrets OK"
 
-      # ── Step 4 — Cache apt + Java + smali ─────────────────────
-      # v3 key — forces fresh install, fixes broken v1/v2 caches.
-      # Caches /usr/share/java so smali.jar persists between runs.
-      - name: Cache apt Packages
-        uses: actions/cache@v4
-        id: apt-cache
-        with:
-          path: |
-            /var/cache/apt/archives
-            /usr/lib/jvm
-            /usr/bin/java
-            /usr/bin/keytool
-            /usr/bin/zipalign
-            /usr/bin/apksigner
-            /usr/share/java
-            /usr/bin/smali
-          key: apt-epic-tools-${{ runner.os }}-v3
-          restore-keys: |
-            apt-epic-tools-${{ runner.os }}-
-
-      # ── Step 5 — Install System Tools ─────────────────────────
-      # ALWAYS runs regardless of cache hit.
-      # Reason: apt cache restores /var/cache/apt/archives but does
-      # NOT restore actual installed binaries in /usr/bin or /usr/share.
-      # Running apt-get install is instant when packages are cached.
+      # ── Step 4 — System Tools (ALWAYS — no cache-hit skip) ─────
+      # apt-get install runs every time.
+      # apt cache stores .deb archives but does NOT restore installed
+      # binaries to /usr/bin or /usr/share. So even on cache hit,
+      # the actual tools are missing unless we install them.
+      # When packages are cached, this step takes ~5 seconds.
       - name: Install System Tools
         run: |
           echo "📦 Installing system tools..."
@@ -94,22 +84,12 @@ jobs:
             curl \
             libsmali-java
           echo "✅ System tools installed."
-
-      # ── Step 6 — Verify System Tools ──────────────────────────
-      - name: Verify System Tools
-        run: |
           java -version
           keytool -help > /dev/null 2>&1 \
             && echo "✅ keytool OK" \
             || { echo "❌ keytool missing"; exit 1; }
-          zipalign -h > /dev/null 2>&1 \
-            && echo "✅ zipalign OK" \
-            || echo "⚠️ zipalign non-zero (normal)"
-          apksigner version \
-            && echo "✅ apksigner OK" \
-            || echo "⚠️ apksigner non-zero (normal)"
 
-      # ── Step 7 — Python Dependencies ──────────────────────────
+      # ── Step 5 — Python Dependencies ───────────────────────────
       - name: Install Python Dependencies
         run: |
           pip install --upgrade pip --quiet
@@ -118,7 +98,8 @@ jobs:
           python3 -c "import flask;      print('✅ flask:',         flask.__version__)"
           python3 -c "import androguard; print('✅ androguard:',    androguard.__version__)"
 
-      # ── Step 8 — Cache apktool.jar ─────────────────────────────
+      # ── Step 6 — Cache apktool.jar ─────────────────────────────
+      # Cached by version string — only re-downloaded when version changes.
       - name: Cache apktool.jar
         uses: actions/cache@v4
         id: apktool-cache
@@ -126,7 +107,7 @@ jobs:
           path: /tmp/epic_tools/apktool.jar
           key: apktool-v2.10.0
 
-      # ── Step 9 — apktool ──────────────────────────────────────
+      # ── Step 7 — Install apktool ───────────────────────────────
       - name: Install apktool
         run: |
           mkdir -p /tmp/epic_tools
@@ -143,72 +124,87 @@ jobs:
             && echo "✅ apktool verified." \
             || { echo "❌ apktool failed"; exit 1; }
 
-      # ── Step 10 — smali ───────────────────────────────────────
-      # Critical for Asset Compiler (Step 17).
-      # Always runs. Copies smali.jar to /tmp/epic_tools/smali.jar.
-      # Hard-fails if smali is not available — so the error is
-      # clear BEFORE the bot starts, not inside Asset Compiler.
+      # ── Step 8 — Cache smali.jar ───────────────────────────────
+      # CRITICAL: Same pattern as apktool.jar.
+      # smali.jar is used by Asset Compiler to compile the bootstrap DEX.
+      # Without this cache, smali.jar is lost between 5-hour restarts
+      # and must be re-installed every time from apt.
+      # Cached by version — persists indefinitely until version changes.
+      - name: Cache smali.jar
+        uses: actions/cache@v4
+        id: smali-cache
+        with:
+          path: /tmp/epic_tools/smali.jar
+          key: smali-v2.5.2
+
+      # ── Step 9 — Install smali ─────────────────────────────────
+      # libsmali-java was installed in Step 4.
+      # This step copies smali.jar from /usr/share/java to /tmp/epic_tools.
+      # Hard-fails if smali is not available — clear error before bot starts.
       - name: Install smali
         run: |
-          echo "📦 Installing smali assembler..."
           mkdir -p /tmp/epic_tools
           SMALI_DEST="/tmp/epic_tools/smali.jar"
 
-          # Already present and working?
+          # Already cached and working?
           if [ -f "$SMALI_DEST" ]; then
             java -jar "$SMALI_DEST" --version 2>&1 | head -1 \
-              && echo "✅ smali.jar already ready." && exit 0 \
-              || echo "⚠️ Existing smali.jar invalid — reinstalling..."
+              && echo "✅ smali.jar from cache — ready." && exit 0 \
+              || echo "⚠️ Cached smali.jar invalid — reinstalling..."
           fi
 
-          # libsmali-java was installed in Step 5 — find the jar
-          SMALI_JAR=$(find /usr/share/java -name "smali.jar"   2>/dev/null | head -1)
+          # Find the jar installed by libsmali-java in Step 4
+          SMALI_JAR=$(find /usr/share/java -name "smali.jar" 2>/dev/null | head -1)
           [ -z "$SMALI_JAR" ] && \
-          SMALI_JAR=$(find /usr/share/java -name "smali*.jar"  2>/dev/null | head -1)
+          SMALI_JAR=$(find /usr/share/java -name "smali*.jar" 2>/dev/null | head -1)
 
           if [ -n "$SMALI_JAR" ]; then
             cp "$SMALI_JAR" "$SMALI_DEST"
             java -jar "$SMALI_DEST" --version 2>&1 | head -1
-            echo "✅ smali.jar ready: $SMALI_DEST"
+            echo "✅ smali.jar copied and ready: $SMALI_DEST"
           else
-            # Fallback — smali binary in PATH (also installed by libsmali-java)
+            # Binary fallback — also installed by libsmali-java
             if which smali > /dev/null 2>&1; then
               echo "✅ smali binary available: $(which smali)"
               echo "   Asset Compiler will use smali binary directly."
             else
-              echo "❌ FATAL: smali not available — Asset Compiler will fail."
-              echo "   libsmali-java did not install correctly."
+              echo "❌ FATAL: smali not available after install."
+              echo "   libsmali-java may have failed. Check Step 4 output."
               exit 1
             fi
           fi
 
-      # ── Step 11 — Final Tool Check ─────────────────────────────
+      # ── Step 10 — Final Tool Check ─────────────────────────────
+      # Confirms every tool is present before bot starts.
+      # Hard-fails immediately — no silent failures inside the bot.
       - name: Verify All Tools Ready
         run: |
           echo "🔍 Final tool check..."
+
           [ -f "/tmp/epic_tools/apktool.jar" ] \
-            && echo "✅ apktool.jar ready" \
+            && echo "✅ apktool.jar" \
             || { echo "❌ apktool.jar missing"; exit 1; }
 
           if [ -f "/tmp/epic_tools/smali.jar" ]; then
-            echo "✅ smali.jar ready"
+            echo "✅ smali.jar"
           elif which smali > /dev/null 2>&1; then
-            echo "✅ smali binary ready: $(which smali)"
+            echo "✅ smali binary: $(which smali)"
           else
-            echo "❌ smali not available — exit"
+            echo "❌ smali missing — Asset Compiler will fail"
             exit 1
           fi
 
+          java -version 2>&1 | head -1
           echo "✅ All tools ready."
 
-      # ── Step 12 — Confirm Script ───────────────────────────────
+      # ── Step 11 — Confirm Script ────────────────────────────────
       - name: Confirm Bot Script Exists
         run: |
           [ -f "epicprotector.py" ] \
-            && echo "✅ epicprotector.py found ($(wc -l < epicprotector.py) lines)" \
+            && echo "✅ epicprotector.py — $(wc -l < epicprotector.py) lines" \
             || { echo "❌ epicprotector.py not found"; exit 1; }
 
-      # ── Step 13 — Syntax Check ─────────────────────────────────
+      # ── Step 12 — Syntax Check ──────────────────────────────────
       - name: Python Syntax Check
         run: |
           python3 -c "
@@ -219,12 +215,13 @@ jobs:
               ast.parse(src)
               print('✅ Syntax OK')
           except SyntaxError as e:
-              print(f'❌ Syntax error line {e.lineno}: {e.msg}')
+              print(f'❌ Syntax error at line {e.lineno}: {e.msg}')
               sys.exit(1)
           "
 
-      # ── Step 14 — Run Bot ──────────────────────────────────────
-      # GH_PAT passed so Base APK GitHub storage works correctly.
+      # ── Step 13 — Run Bot ───────────────────────────────────────
+      # GH_PAT: required for Base APK storage on GitHub
+      # BOT_TOKEN + ADMIN_ID: required for Telegram bot
       - name: Run EPIC PROTECTOR Bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
@@ -236,7 +233,7 @@ jobs:
           python3 epicprotector.py 2>&1 | tee bot_log.txt
           echo "⏰ $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-      # ── Step 15 — Upload Log ───────────────────────────────────
+      # ── Step 14 — Upload Log ────────────────────────────────────
       - name: Upload Run Log
         if: always()
         uses: actions/upload-artifact@v4
