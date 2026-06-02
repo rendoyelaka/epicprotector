@@ -87,8 +87,12 @@ KS_PASS    = os.environ.get("KS_PASS",  "Epic@Store#2024")   # move to env in pr
 KS_KEY     = os.environ.get("KS_KEY",   "Epic@Key#2024")
 SCRIPT_VERSION = "2.1"
 
-WORK_DIR   = "/tmp/epic_protector"
-TOOLS_DIR  = "/tmp/epic_tools"
+# Use GITHUB_WORKSPACE when running on GitHub Actions so tools
+# and work files persist in the repo workspace directory.
+# Falls back to /tmp for local runs.
+_BASE = os.environ.get("GITHUB_WORKSPACE", "/tmp")
+WORK_DIR   = os.path.join(_BASE, "epic_protector")
+TOOLS_DIR  = os.path.join(_BASE, "epic_tools")
 DB_FILE    = os.path.join(WORK_DIR, "clients.json")          # persistent storage
 MAX_APK_MB = 45                                               # Telegram bot limit
 
