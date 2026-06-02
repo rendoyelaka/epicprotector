@@ -11073,14 +11073,19 @@ async def button_handler(update, context):
                 label = engine.STEP_LABELS.get(op_key, op_key)
 
                 try:
+                    # Escape underscores/special chars — APK file names with
+                    # underscores (e.g. base_app.apk) break Markdown entity
+                    # parsing and cause: BadRequest: can't find end of entity
+                    _sn = apk_name.replace("_", r"\_").replace("*", r"\*").replace("`", r"\`")
+                    _sl = label.replace("_", r"\_").replace("*", r"\*").replace("`", r"\`")
                     await context.bot.edit_message_text(
                         chat_id=user.id,
                         message_id=status_msg.message_id,
                         text=f"🧪 *Quick Test Panel*\n\n"
-                             f"📦 `{apk_name}`\n"
+                             f"📦 `{_sn}`\n"
                              f"━━━━━━━━━━━━━━━━━━━━━\n"
                              f"Step {i+1}/{total}\n"
-                             f"▶️ *{label}*\n"
+                             f"▶️ *{_sl}*\n"
                              f"⏳ Running...",
                         parse_mode="Markdown")
                 except Exception:
@@ -11169,7 +11174,8 @@ async def button_handler(update, context):
             lines.append(f"{icon} {lbl}")
             # Show error detail for failed steps
             if "❌" in status:
-                lines.append(f"   _{status[:100]}_")
+                _safe_status = status[:100].replace("_", r"\_").replace("*", r"\*").replace("`", r"\`")
+                lines.append(f"   _{_safe_status}_")
             if r.get("final_apk") and os.path.exists(r["final_apk"]):
                 final_apk = r["final_apk"]
 
