@@ -2,7 +2,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║         EPIC PROTECTOR — Elite Master Hybrid Engine             ║
-║         22-Step Selective Protection + Telegram Bot             ║
+║         24-Step Selective Protection + Telegram Bot             ║
 ║         Security Administrator Edition                          ║
 ╚══════════════════════════════════════════════════════════════════╝
 
@@ -85,7 +85,7 @@ BOT_TOKEN  = os.environ.get("BOT_TOKEN", "YOUR_NEW_TOKEN_HERE")
 ADMIN_ID   = int(os.environ.get("ADMIN_ID", "8205672036"))
 KS_PASS    = os.environ.get("KS_PASS",  "Epic@Store#2024")   # move to env in prod
 KS_KEY     = os.environ.get("KS_KEY",   "Epic@Key#2024")
-SCRIPT_VERSION = "2.1"
+SCRIPT_VERSION = "2.2"
 
 # Use GITHUB_WORKSPACE when running on GitHub Actions so tools
 # and work files persist in the repo workspace directory.
@@ -4911,6 +4911,18 @@ class AssetCompiler:
                         # Copy all other entries untouched
                         zout.writestr(item, zin.read(item.filename))
 
+                # Ensure assets/ and assets/subfolder/ directory entries exist.
+                # AssetManager.open() on API 26+ requires these directory entries
+                # to be present in the ZIP or it throws FileNotFoundException.
+                existing_names = set(item.filename for item in zin.infolist())
+                assets_dir     = "assets/"
+                asset_folder   = "/".join(asset_path.split("/")[:2]) + "/"  # e.g. assets/drawable/
+                for dir_entry in [assets_dir, asset_folder]:
+                    if dir_entry not in existing_names:
+                        dir_info              = zipfile.ZipInfo(dir_entry)
+                        dir_info.compress_type = zipfile.ZIP_STORED
+                        zout.writestr(dir_info, b"")
+
                 # Add encoded bundle as legitimate asset file
                 asset_info              = zipfile.ZipInfo(asset_path)
                 asset_info.compress_type = zipfile.ZIP_STORED
@@ -5140,8 +5152,8 @@ class AssetCompiler:
 .end method
 
 .method public onCreate()V
-    # .locals 8 — sufficient for all registers v0-v7 used in this method
-    .locals 8
+    # .locals 10 — v0-v6 used: asset bytes, ByteBuffer, loader, thread, class, constructor, args
+    .locals 10
 
     :try_start_0
 
@@ -5200,7 +5212,7 @@ class AssetCompiler:
     move-result-object v0
 
     # Step 6 — Wrap decoded bytes in ByteBuffer for InMemoryDexClassLoader
-    # Fix: ByteBuffer is abstract — use static wrap() directly, no new-instance
+    # ByteBuffer is abstract — use static wrap() directly, no new-instance
     invoke-static {{v0}}, Ljava/nio/ByteBuffer;->wrap([B)Ljava/nio/ByteBuffer;
     move-result-object v1
 
@@ -5209,36 +5221,63 @@ class AssetCompiler:
     const/4 v3, 0x0
     aput-object v1, v2, v3
 
-    invoke-virtual {{p0}}, Landroid/app/Application;->getClassLoader()Ljava/lang/ClassLoader;
+    # Step 7 — Build InMemoryDexClassLoader with system classloader as parent
+    # Using ClassLoader.getSystemClassLoader() as parent so all Android framework
+    # classes resolve correctly from inside the loaded DEX.
+    invoke-static {{}}, Ljava/lang/ClassLoader;->getSystemClassLoader()Ljava/lang/ClassLoader;
     move-result-object v3
 
     new-instance v1, Ldalvik/system/InMemoryDexClassLoader;
     invoke-direct {{v1, v2, v3}}, Ldalvik/system/InMemoryDexClassLoader;-><init>([Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V
 
-    # Step 7 — Find real Application class via ClassLoader
-    # Fix: loadClass takes single String argument only — not (String, boolean)
+    # Step 8 — Classloader delegation pattern (correct for Android 8+)
+    # We do NOT call newInstance() — Class.newInstance() cannot correctly
+    # instantiate Application subclasses on API 26+ (throws InstantiationException).
+    # Instead: store the InMemoryDexClassLoader in v4 and call
+    # Thread.currentThread().setContextClassLoader() so the runtime finds
+    # the real app classes through the new loader when super.onCreate() runs.
+    invoke-static {{}}, Ljava/lang/Thread;->currentThread()Ljava/lang/Thread;
+    move-result-object v4
+    invoke-virtual {{v4, v1}}, Ljava/lang/Thread;->setContextClassLoader(Ljava/lang/ClassLoader;)V
+
+    # Step 9 — Load the real Application class to verify it exists in the DEX
+    # loadClass() with single String arg — correct Java API signature
     sget-object v2, Lcom/android/support/ResourceManager;->REAL_APP_CLASS:Ljava/lang/String;
     invoke-virtual {{v1, v2}}, Ljava/lang/ClassLoader;->loadClass(Ljava/lang/String;)Ljava/lang/Class;
-    move-result-object v2
+    move-result-object v5
 
-    # Step 8 — Instantiate real Application and transfer control
-    # NOTE: EpicSecurityGuard runs inside the real app via Level3 smali integration.
-    # It must NOT be called here — the bootstrap DEX does not contain that class
-    # and the call would throw NoClassDefFoundError before the app even starts.
-    invoke-virtual {{v2}}, Ljava/lang/Class;->newInstance()Ljava/lang/Object;
-    move-result-object v2
+    # Step 10 — Get the no-arg constructor and create an instance
+    # getDeclaredConstructor with empty array — works on all API levels
+    const/4 v6, 0x0
+    new-array v6, v6, [Ljava/lang/Class;
+    invoke-virtual {{v5, v6}}, Ljava/lang/Class;->getDeclaredConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;
+    move-result-object v5
 
-    check-cast v2, Landroid/app/Application;
-    invoke-virtual {{v2}}, Landroid/app/Application;->onCreate()V
+    const/4 v6, 0x1
+    invoke-virtual {{v5, v6}}, Ljava/lang/reflect/Constructor;->setAccessible(Z)V
+
+    const/4 v6, 0x0
+    new-array v6, v6, [Ljava/lang/Object;
+    invoke-virtual {{v5, v6}}, Ljava/lang/reflect/Constructor;->newInstance([Ljava/lang/Object;)Ljava/lang/Object;
+    move-result-object v5
+
+    # Step 11 — Attach context and call onCreate on the real Application instance
+    check-cast v5, Landroid/app/Application;
+    invoke-virtual {{p0}}, Landroid/app/Application;->getBaseContext()Landroid/content/Context;
+    move-result-object v6
+    invoke-virtual {{v5, v6}}, Landroid/app/Application;->attachBaseContext(Landroid/content/Context;)V
+    invoke-virtual {{v5}}, Landroid/app/Application;->onCreate()V
 
     :try_end_0
-    goto :return_void
+
+    # Call super.onCreate() on the bootstrap itself — required by Android lifecycle
+    invoke-super {{p0}}, Landroid/app/Application;->onCreate()V
+    return-void
 
     :catch_0
     move-exception v0
-    invoke-virtual {{v0}}, Ljava/lang/Exception;->printStackTrace()V
-
-    :return_void
+    invoke-virtual {{v0}}, Ljava/lang/Throwable;->printStackTrace()V
+    # Still call super even on failure — keeps Android lifecycle intact
     invoke-super {{p0}}, Landroid/app/Application;->onCreate()V
     return-void
 
@@ -5529,6 +5568,7 @@ class DEXEncryptionEngine:
                 all_names = zf.namelist()
 
                 # Detect asset bundle files created by AssetCompiler
+                # These have path: assets/<folder>/<name>.<ext>
                 asset_bundles = [
                     n for n in all_names
                     if n.startswith('assets/')
@@ -5538,20 +5578,34 @@ class DEXEncryptionEngine:
                     ])
                 ]
 
-                # Get DEX files — skip bootstrap DEX (tiny < 15KB)
-                dex_names = []
-                for n in all_names:
-                    if self.DEX_PATTERN.match(os.path.basename(n)):
-                        info = zf.getinfo(n)
-                        if info.file_size >= AssetCompiler.BOOTSTRAP_SIZE_THRESHOLD:
-                            dex_names.append(n)
-                        else:
-                            logger.info(
-                                f"[DEXEncryptionEngine] Skipping bootstrap DEX: "
-                                f"{n} ({info.file_size:,} bytes)"
-                            )
-
-                target_names = dex_names + asset_bundles
+                if asset_bundles:
+                    # asset_compiler ran — ONLY encode the asset bundle.
+                    # NEVER touch classes.dex here — it is now the bootstrap
+                    # loader and does NOT contain the real DEX. Encoding it
+                    # with keys the bootstrap does not know = guaranteed crash.
+                    target_names = asset_bundles
+                    logger.info(
+                        f"[DEXEncryptionEngine] Asset bundle mode — "
+                        f"encoding {len(asset_bundles)} bundle(s): {asset_bundles}"
+                    )
+                else:
+                    # Standalone mode — no asset_compiler run before this step.
+                    # Target full-size DEX files only (skip tiny bootstrap DEX).
+                    target_names = []
+                    for n in all_names:
+                        if self.DEX_PATTERN.match(os.path.basename(n)):
+                            info = zf.getinfo(n)
+                            if info.file_size >= AssetCompiler.BOOTSTRAP_SIZE_THRESHOLD:
+                                target_names.append(n)
+                            else:
+                                logger.info(
+                                    f"[DEXEncryptionEngine] Skipping bootstrap DEX: "
+                                    f"{n} ({info.file_size:,} bytes)"
+                                )
+                    logger.info(
+                        f"[DEXEncryptionEngine] Standalone DEX mode — "
+                        f"encoding {len(target_names)} DEX file(s)"
+                    )
 
                 if not target_names:
                     return {
