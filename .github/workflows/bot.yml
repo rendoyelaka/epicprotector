@@ -119,20 +119,22 @@ jobs:
           apksigner version \
             && echo "✅ apksigner confirmed." \
             || echo "⚠️ apksigner version check returned non-zero (normal)."
-          # Verify smali jar directly with java -jar (reliable on all GitHub runners)
-          # The smali binary wrapper needs java-wrappers package which may be missing
-          # java -jar works with just default-jdk which is always installed
-          SMALI_JAR=$(find /usr/share/java -name "smali.jar" 2>/dev/null | head -1)
-          [ -z "$SMALI_JAR" ] && SMALI_JAR=$(find /usr/share/java -name "smali*.jar" 2>/dev/null | head -1)
-          if [ -n "$SMALI_JAR" ]; then
+          # Download smali-2.5.2 standalone executable jar directly from official release.
+          # libsmali-java on ubuntu-22.04 installs LIBRARY jars only (no Main-Class
+          # in MANIFEST.MF) — they fail with "no main manifest attribute".
+          # The standalone jar from the official release has the correct manifest.
+          mkdir -p "$GITHUB_WORKSPACE/epic_tools"
+          SMALI_JAR="$GITHUB_WORKSPACE/epic_tools/smali.jar"
+          if [ ! -f "$SMALI_JAR" ]; then
+            echo "📥 Downloading smali-2.5.2 standalone jar..."
+            wget -q -O "$SMALI_JAR" \
+              "https://github.com/google/smali/releases/download/v2.5.2/smali-2.5.2.jar"
+          fi
+          if [ -f "$SMALI_JAR" ]; then
             java -jar "$SMALI_JAR" --version 2>&1 | head -1
-            echo "✅ smali jar confirmed: $SMALI_JAR"
-            # Copy to GITHUB_WORKSPACE/epic_tools for script to find
-            mkdir -p "$GITHUB_WORKSPACE/epic_tools"
-            cp "$SMALI_JAR" "$GITHUB_WORKSPACE/epic_tools/smali.jar"
-            echo "✅ smali.jar copied to $GITHUB_WORKSPACE/epic_tools/smali.jar"
+            echo "✅ smali.jar ready: $SMALI_JAR"
           else
-            echo "❌ ERROR: smali.jar not found after libsmali-java install"
+            echo "❌ ERROR: smali.jar download failed"
             exit 1
           fi
 
@@ -157,7 +159,7 @@ jobs:
           path: |
             ${{ github.workspace }}/epic_tools/apktool.jar
             ${{ github.workspace }}/epic_tools/smali.jar
-          key: epic-tools-apktool2.10.0-smali2.5.2
+          key: epic-tools-apktool2.10.0-smali2.5.2-standalone
 
       # ── Step 8 — Download apktool if not cached ────────────────
       - name: Pre-Download apktool
