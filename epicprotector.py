@@ -2523,8 +2523,19 @@ class Level6_Signer:
         else:
             strip_result = {"stripped_files": [], "files_kept": 0}
 
-        # ── Step 1 — Generate fresh Elite identity ────────────────────────────
-        identity = self.generate_keystore()
+        # ── Step 1 — Use pre-loaded identity or generate fresh one ───────────
+        # If sign_apk step pre-loaded _identity from keystore_ctx (keystore_generation
+        # ran earlier this session), skip generating a second keystore — use that one.
+        # This keeps the signing identity coherent: same keystore whose SHA-256 was
+        # injected into the security guard smali is used for final signing.
+        if not self._identity or not self._identity.get("keystore_path") or                 not os.path.exists(self._identity.get("keystore_path", "")):
+            identity = self.generate_keystore()
+        else:
+            identity = self._identity
+            logger.info(
+                f"[Level6] Using pre-loaded keystore from keystore_generation step — "
+                f"CN={identity.get('cn','')}, coherent identity preserved."
+            )
 
         try:
             # ── Step 2A — apksigner: zipalign first, then sign ────────────────
