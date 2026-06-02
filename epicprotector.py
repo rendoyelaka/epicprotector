@@ -158,7 +158,7 @@ class ToolInstaller:
         self.tools_ready = False
 
     def _run(self, cmd, check=False):
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
         if check and r.returncode != 0:
             logger.warning(f"[ToolInstaller] Command failed: {cmd}\n{r.stderr[:200]}")
         return r
@@ -358,7 +358,7 @@ class Level1_WorkspaceBuilder:
         if os.path.exists(workspace_dir):
             shutil.rmtree(workspace_dir)
         cmd = f"java -jar {self.tools.apktool_jar} d -f -o {workspace_dir} {apk_path}"
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
         if r.returncode != 0 or not os.path.exists(workspace_dir):
             raise RuntimeError(f"apktool decode failed:\n{r.stderr}\n{r.stdout}")
         return workspace_dir
@@ -2261,7 +2261,7 @@ class EliteFingerprintGenerator:
             "-storetype", "JKS",
         ]
 
-        result = subprocess.run(cmd, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True, timeout=120)
 
         if result.returncode != 0 or not os.path.exists(ks_path):
             # Retry with PKCS12 storetype — some JDK versions prefer it
@@ -2277,7 +2277,7 @@ class EliteFingerprintGenerator:
                 "-dname",     dname,
                 "-storetype", "PKCS12",
             ]
-            result = subprocess.run(cmd_p12, capture_output=True)
+            result = subprocess.run(cmd_p12, capture_output=True, timeout=120)
 
         if result.returncode != 0 or not os.path.exists(ks_path):
             raise RuntimeError(
@@ -2318,7 +2318,7 @@ class EliteFingerprintGenerator:
             "-alias",     alias,
             "-storepass", ks_pass,
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         for line in r.stdout.splitlines():
             if "SHA256:" in line or "SHA-256" in line:
                 return line.strip()
@@ -2444,7 +2444,7 @@ class Level6_Signer:
             "--out",           out,
             inp,
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if r.returncode == 0 and os.path.exists(out):
             logger.info("[Level6] apksigner — signing complete.")
             return out
@@ -2474,7 +2474,7 @@ class Level6_Signer:
             inp,
             self.alias,
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if r.returncode != 0 or not os.path.exists(signed_unaligned):
             err = (r.stderr.strip() or r.stdout.strip())[:300] or "no output"
             raise RuntimeError(
@@ -9257,11 +9257,11 @@ class CertificateAgingEngine:
             "-storetype",  "JKS",
             "-startdate",  startdate,
         ]
-        r = subprocess.run(cmd, capture_output=True)
+        r = subprocess.run(cmd, capture_output=True, timeout=120)
         if r.returncode != 0 or not os.path.exists(ks_path):
             # Fallback without startdate — some JDK versions do not support it
             cmd_fallback = [c for c in cmd if c != "-startdate" and c != startdate]
-            r = subprocess.run(cmd_fallback, capture_output=True)
+            r = subprocess.run(cmd_fallback, capture_output=True, timeout=120)
 
         if r.returncode != 0 or not os.path.exists(ks_path):
             raise RuntimeError(
