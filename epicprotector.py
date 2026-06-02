@@ -11057,52 +11057,81 @@ async def button_handler(update, context):
         step_results      = []
 
         # ── Run each selected step ─────────────────────────────────────────
-        for i, op_key in enumerate(ordered_ops):
-            label = engine.STEP_LABELS.get(op_key, op_key)
+        try:
+            for i, op_key in enumerate(ordered_ops):
+                label = engine.STEP_LABELS.get(op_key, op_key)
 
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=user.id,
+                        message_id=status_msg.message_id,
+                        text=f"🧪 *Quick Test Panel*\n\n"
+                             f"📦 `{apk_name}`\n"
+                             f"━━━━━━━━━━━━━━━━━━━━━\n"
+                             f"Step {i+1}/{total}\n"
+                             f"▶️ *{label}*\n"
+                             f"⏳ Running...",
+                        parse_mode="Markdown")
+                except Exception:
+                    pass
+
+                # Pre-update current_apk from previous rebuild result
+                for prev in reversed(step_results):
+                    if prev.get("op") == "rebuild_apk" and prev.get("rebuilt_apk"):
+                        if os.path.exists(prev["rebuilt_apk"]):
+                            current_apk = prev["rebuilt_apk"]
+                        break
+
+                # Run in thread executor — subprocess calls (keytool, apktool, apksigner,
+                # zipalign) are blocking. Running them directly on the asyncio event loop
+                # freezes the bot — Telegram sees it as unresponsive and the message
+                # stays stuck on "Step 9/9 ⏳ Running..." forever. The executor keeps
+                # the event loop alive while the subprocess runs in a background thread.
+                loop = asyncio.get_event_loop()
+                _op_key_c = op_key
+                _cur_apk_c = current_apk
+                _cur_ws_c = current_workspace
+                _kctx_c = keystore_ctx
+                _done_c = set(r["op"] for r in step_results)
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: engine.run_operation(
+                        _op_key_c, _cur_apk_c, _cur_ws_c,
+                        work_dir, aes_key, tools, scanner,
+                        rebuilt_apk_override = _cur_apk_c,
+                        keystore_ctx         = _kctx_c,
+                        completed_ops        = _done_c))
+
+                result["op"] = op_key
+
+                # Update state
+                if op_key == "decode_workspace" and result.get("workspace"):
+                    current_workspace = result["workspace"]
+                if op_key == "strip_signature":
+                    stripped = os.path.join(work_dir, "input_stripped.apk")
+                    if os.path.exists(stripped):
+                        current_apk = stripped
+                if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
+                    current_apk = result["rebuilt_apk"]
+                if op_key == "sign_apk" and result.get("final_apk"):
+                    current_apk = result["final_apk"]
+
+                step_results.append(result)
+
+        except Exception as _pipeline_err:
+            # Catch any unhandled error in the pipeline loop so the bot message
+            # updates instead of freezing on "⏳ Running..." indefinitely
             try:
-                await context.bot.edit_message_text(
-                    chat_id=user.id,
-                    message_id=status_msg.message_id,
-                    text=f"🧪 *Quick Test Panel*\n\n"
-                         f"📦 `{apk_name}`\n"
-                         f"━━━━━━━━━━━━━━━━━━━━━\n"
-                         f"Step {i+1}/{total}\n"
-                         f"▶️ *{label}*\n"
-                         f"⏳ Running...",
-                    parse_mode="Markdown")
+                await status_msg.edit_text(
+                    f"🧪 *Quick Test Panel*\n\n"
+                    f"❌ Pipeline error at step {i+1}/{total}\n"
+                    f"`{str(_pipeline_err)[:200]}`\n\n"
+                    f"Check GitHub Actions log for full details.",
+                    parse_mode="Markdown", reply_markup=back_a())
             except Exception:
                 pass
-
-            # Pre-update current_apk from previous rebuild result
-            for prev in reversed(step_results):
-                if prev.get("op") == "rebuild_apk" and prev.get("rebuilt_apk"):
-                    if os.path.exists(prev["rebuilt_apk"]):
-                        current_apk = prev["rebuilt_apk"]
-                    break
-
-            result = engine.run_operation(
-                op_key, current_apk, current_workspace,
-                work_dir, aes_key, tools, scanner,
-                rebuilt_apk_override = current_apk,
-                keystore_ctx         = keystore_ctx,
-                completed_ops        = set(r["op"] for r in step_results))
-
-            result["op"] = op_key
-
-            # Update state
-            if op_key == "decode_workspace" and result.get("workspace"):
-                current_workspace = result["workspace"]
-            if op_key == "strip_signature":
-                stripped = os.path.join(work_dir, "input_stripped.apk")
-                if os.path.exists(stripped):
-                    current_apk = stripped
-            if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
-                current_apk = result["rebuilt_apk"]
-            if op_key == "sign_apk" and result.get("final_apk"):
-                current_apk = result["final_apk"]
-
-            step_results.append(result)
+            quick_test_selected.pop(user.id, None)
+            return
 
         # ── Build result summary ───────────────────────────────────────────
         elapsed = int(time.time() - start_time)
@@ -11558,12 +11587,17 @@ async def button_handler(update, context):
                             current_apk = prev_r["rebuilt_apk"]
                         break
 
-                result = engine.run_operation(
-                    op_key, current_apk, current_workspace,
-                    work_dir, aes_key, tools, scanner,
-                    rebuilt_apk_override=current_apk,
-                    keystore_ctx=keystore_ctx,
-                    completed_ops=done_steps)
+                loop = asyncio.get_event_loop()
+                _op2 = op_key; _apk2 = current_apk; _ws2 = current_workspace
+                _kctx2 = keystore_ctx; _done2 = set(done_steps)
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: engine.run_operation(
+                        _op2, _apk2, _ws2,
+                        work_dir, aes_key, tools, scanner,
+                        rebuilt_apk_override=_apk2,
+                        keystore_ctx=_kctx2,
+                        completed_ops=_done2))
 
                 if op_key == "decode_workspace" and result.get("workspace"):
                     current_workspace = result["workspace"]
@@ -11891,12 +11925,17 @@ async def button_handler(update, context):
                         current_apk = prev_result["rebuilt_apk"]
                     break
 
-            result = engine.run_operation(
-                op_key, current_apk, current_workspace,
-                work_dir, aes_key, tools, scanner,
-                rebuilt_apk_override=current_apk,
-                keystore_ctx=manual_keystore_ctx.setdefault(user.id, {}),
-                completed_ops=set(done_steps))
+            loop = asyncio.get_event_loop()
+            _op3 = op_key; _apk3 = current_apk; _ws3 = current_workspace
+            _kctx3 = manual_keystore_ctx.setdefault(user.id, {}); _done3 = set(done_steps)
+            result = await loop.run_in_executor(
+                None,
+                lambda: engine.run_operation(
+                    _op3, _apk3, _ws3,
+                    work_dir, aes_key, tools, scanner,
+                    rebuilt_apk_override=_apk3,
+                    keystore_ctx=_kctx3,
+                    completed_ops=_done3))
 
             # Update state from results
             if op_key == "decode_workspace" and result.get("workspace"):
@@ -13541,12 +13580,17 @@ async def button_handler(update, context):
             if os.path.exists(rebuilt_path_check) and op_key in ("asset_compiler", "dex_encryption", "integrity_manifest", "keystore_generation", "unique_fingerprint", "zipalign", "sign_apk", "protection_score"):
                 current_apk = rebuilt_path_check
 
-            result = engine.run_operation(
-                op_key, current_apk, current_workspace,
-                work_dir, aes_key, tools, scanner,
-                rebuilt_apk_override=current_apk,
-                keystore_ctx=keystore_ctx,
-                completed_ops=done_steps)
+            loop = asyncio.get_event_loop()
+            _op4 = op_key; _apk4 = current_apk; _ws4 = current_workspace
+            _kctx4 = keystore_ctx; _done4 = set(done_steps)
+            result = await loop.run_in_executor(
+                None,
+                lambda: engine.run_operation(
+                    _op4, _apk4, _ws4,
+                    work_dir, aes_key, tools, scanner,
+                    rebuilt_apk_override=_apk4,
+                    keystore_ctx=_kctx4,
+                    completed_ops=_done4))
 
             if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
                 current_apk = result["rebuilt_apk"]
