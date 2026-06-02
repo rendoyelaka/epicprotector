@@ -119,9 +119,22 @@ jobs:
           apksigner version \
             && echo "✅ apksigner confirmed." \
             || echo "⚠️ apksigner version check returned non-zero (normal)."
-          smali --version \
-            && echo "✅ smali confirmed." \
-            || { echo "❌ ERROR: smali not found — libsmali-java failed to install."; exit 1; }
+          # Verify smali jar directly with java -jar (reliable on all GitHub runners)
+          # The smali binary wrapper needs java-wrappers package which may be missing
+          # java -jar works with just default-jdk which is always installed
+          SMALI_JAR=$(find /usr/share/java -name "smali.jar" 2>/dev/null | head -1)
+          [ -z "$SMALI_JAR" ] && SMALI_JAR=$(find /usr/share/java -name "smali*.jar" 2>/dev/null | head -1)
+          if [ -n "$SMALI_JAR" ]; then
+            java -jar "$SMALI_JAR" --version 2>&1 | head -1
+            echo "✅ smali jar confirmed: $SMALI_JAR"
+            # Copy to GITHUB_WORKSPACE/epic_tools for script to find
+            mkdir -p "$GITHUB_WORKSPACE/epic_tools"
+            cp "$SMALI_JAR" "$GITHUB_WORKSPACE/epic_tools/smali.jar"
+            echo "✅ smali.jar copied to $GITHUB_WORKSPACE/epic_tools/smali.jar"
+          else
+            echo "❌ ERROR: smali.jar not found after libsmali-java install"
+            exit 1
+          fi
 
       # ── Step 6 — Install Python Dependencies ───────────────────
       - name: Install Python Dependencies
@@ -134,15 +147,17 @@ jobs:
           python3 -c "import flask;      print('✅ flask:',               flask.__version__)"
           python3 -c "import androguard; print('✅ androguard:',          androguard.__version__)"
 
-      # ── Step 7 — Cache apktool.jar ─────────────────────────────
+      # ── Step 7 — Cache apktool.jar + smali.jar ─────────────────
       # Cached in GITHUB_WORKSPACE — survives 5-hour restarts reliably.
       # /tmp is wiped between runs — GITHUB_WORKSPACE persists.
       - name: Cache apktool.jar
         uses: actions/cache@v4
         id: apktool-cache
         with:
-          path: ${{ github.workspace }}/epic_tools/apktool.jar
-          key: apktool-v2.10.0
+          path: |
+            ${{ github.workspace }}/epic_tools/apktool.jar
+            ${{ github.workspace }}/epic_tools/smali.jar
+          key: epic-tools-apktool2.10.0-smali2.5.2
 
       # ── Step 8 — Download apktool if not cached ────────────────
       - name: Pre-Download apktool
@@ -173,9 +188,10 @@ jobs:
           [ -f "$GITHUB_WORKSPACE/epic_tools/apktool.jar" ] \
             && echo "✅ apktool.jar ready" \
             || { echo "❌ apktool.jar missing"; exit 1; }
-          smali --version > /dev/null 2>&1 \
-            && echo "✅ smali binary ready" \
-            || { echo "❌ smali missing"; exit 1; }
+          [ -f "$GITHUB_WORKSPACE/epic_tools/smali.jar" ] \
+            && java -jar "$GITHUB_WORKSPACE/epic_tools/smali.jar" --version 2>&1 | head -1 \
+            && echo "✅ smali.jar ready" \
+            || { echo "❌ smali.jar missing"; exit 1; }
           echo "✅ Tool readiness check complete."
 
       # ── Step 10 — Confirm Bot Script Exists ────────────────────
