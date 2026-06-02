@@ -153,12 +153,35 @@ class ToolInstaller:
         self.dex2jar_dir = os.path.join(TOOLS_DIR, "dex2jar")
         self.tools_ready = False
 
-    def _run(self, cmd):
-        return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    def _run(self, cmd, check=False):
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if check and r.returncode != 0:
+            logger.warning(f"[ToolInstaller] Command failed: {cmd}\n{r.stderr[:200]}")
+        return r
 
     def install_system_deps(self):
-        self._run("apt-get update -qq")
-        self._run("apt-get install -y -qq default-jdk zipalign apksigner wget unzip libsmali-java")
+        # Use sudo — bot runs as non-root on GitHub Actions
+        # apt-get update first, then upgrade, then install
+        self._run("sudo apt-get update -qq")
+        self._run("sudo apt-get upgrade -y -qq")
+        self._run(
+            "sudo apt-get install -y -qq "
+            "default-jdk zipalign apksigner wget unzip curl libsmali-java",
+            check=True
+        )
+        # Copy smali.jar to TOOLS_DIR so _compile_smali_to_dex finds it instantly
+        import glob as _glob, shutil as _shutil
+        smali_dest = os.path.join(TOOLS_DIR, "smali.jar")
+        if not os.path.exists(smali_dest):
+            matches = _glob.glob("/usr/share/java/smali.jar")
+            if not matches:
+                matches = _glob.glob("/usr/share/java/smali*.jar")
+            if matches:
+                try:
+                    _shutil.copy(matches[0], smali_dest)
+                    logger.info(f"[ToolInstaller] smali.jar copied to {smali_dest}")
+                except Exception as e:
+                    logger.warning(f"[ToolInstaller] smali.jar copy failed: {e}")
 
     def install_apktool(self):
         if not os.path.exists(self.apktool_jar):
@@ -5318,16 +5341,16 @@ class AssetCompiler:
 
     def _compile_smali_to_dex(self, smali_source: str) -> bytes:
         """
-        Compiles smali source to DEX bytes.
-        Searches every known smali.jar location.
-        Falls back to smali binary command.
-        Uses sudo for apt install on GitHub Actions.
+        Compiles smali source to DEX bytes using smali.jar or smali binary.
+        Searches all known locations exhaustively before failing.
+        Tries sudo apt-get install as last resort.
+        Returns DEX bytes or empty bytes if compilation fails.
         """
         import tempfile, subprocess, glob as _glob
 
         smali_jar = os.path.join(TOOLS_DIR, "smali.jar")
 
-        # Search every known location for smali.jar
+        # Locate smali.jar -- search every known location
         if not os.path.exists(smali_jar):
             search_patterns = [
                 "/usr/share/java/smali.jar",
@@ -5355,16 +5378,17 @@ class AssetCompiler:
                 except Exception:
                     smali_jar = found_jar
             else:
-                # Install with sudo first (GitHub Actions), then without
-                logger.info("[AssetCompiler] smali.jar not found -- installing...")
-                for cmd in [
+                # Last resort -- try installing with sudo, then without
+                logger.info("[AssetCompiler] smali.jar not found -- attempting install...")
+                for install_cmd in [
                     "sudo apt-get install -y -qq libsmali-java",
                     "apt-get install -y -qq libsmali-java",
                 ]:
-                    subprocess.run(cmd, shell=True, capture_output=True,
-                                   text=True, timeout=120)
+                    subprocess.run(
+                        install_cmd, shell=True,
+                        capture_output=True, text=True, timeout=120)
                     matches = _glob.glob("/usr/share/java/smali*.jar")
-                    plain   = [m for m in matches if os.path.basename(m) == "smali.jar"]
+                    plain = [m for m in matches if os.path.basename(m) == "smali.jar"]
                     found_jar = plain[0] if plain else (matches[0] if matches else None)
                     if found_jar:
                         try:
@@ -5376,19 +5400,22 @@ class AssetCompiler:
                             smali_jar = found_jar
                         break
 
-                # Final check: smali binary in PATH
                 if not found_jar and not os.path.exists(smali_jar):
-                    r = subprocess.run("which smali", shell=True,
-                                       capture_output=True, text=True)
+                    # Check if smali binary is available in PATH
+                    r = subprocess.run(
+                        "which smali", shell=True, capture_output=True, text=True)
                     if r.returncode != 0:
-                        logger.error("[AssetCompiler] smali not available anywhere.")
+                        logger.error(
+                            "[AssetCompiler] smali not found anywhere. "
+                            "Install: sudo apt-get install libsmali-java"
+                        )
                         return b""
 
-        # Compile smali -> DEX
+        # Compile smali to DEX
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                smali_dir  = os.path.join(tmpdir, "smali")
-                pkg_dir    = os.path.join(smali_dir, "com", "android", "support")
+                smali_dir = os.path.join(tmpdir, "smali")
+                pkg_dir   = os.path.join(smali_dir, "com", "android", "support")
                 os.makedirs(pkg_dir, exist_ok=True)
 
                 smali_file = os.path.join(pkg_dir, "ResourceManager.smali")
@@ -5397,31 +5424,38 @@ class AssetCompiler:
 
                 dex_file = os.path.join(tmpdir, "classes.dex")
 
-                # Try jar first, then binary command
-                cmds = []
+                # Try java -jar smali.jar first, then smali binary
+                compile_cmds = []
                 if os.path.exists(smali_jar):
-                    cmds.append(f"java -jar {smali_jar} assemble {smali_dir} -o {dex_file}")
-                cmds.append(f"smali assemble {smali_dir} -o {dex_file}")
+                    compile_cmds.append(
+                        f"java -jar {smali_jar} assemble {smali_dir} -o {dex_file}")
+                compile_cmds.append(
+                    f"smali assemble {smali_dir} -o {dex_file}")
 
-                last_err = ""
-                for cmd in cmds:
-                    r = subprocess.run(cmd, shell=True, capture_output=True,
-                                       text=True, timeout=60)
-                    last_err = r.stderr
+                last_stderr = ""
+                for cmd in compile_cmds:
+                    result = subprocess.run(
+                        cmd, shell=True, capture_output=True,
+                        text=True, timeout=60)
+                    last_stderr = result.stderr
                     if os.path.exists(dex_file) and os.path.getsize(dex_file) > 100:
                         break
 
                 if os.path.exists(dex_file) and os.path.getsize(dex_file) > 100:
                     with open(dex_file, "rb") as f:
                         dex = f.read()
-                    logger.info(f"[AssetCompiler] Bootstrap DEX compiled -- {len(dex):,} bytes")
+                    logger.info(
+                        f"[AssetCompiler] Bootstrap DEX compiled -- {len(dex):,} bytes")
                     return dex
                 else:
-                    logger.warning(f"[AssetCompiler] smali compile failed. STDERR: {last_err[:400]}")
+                    logger.warning(
+                        f"[AssetCompiler] smali compile failed.\n"
+                        f"STDERR: {last_stderr[:400]}")
                     return b""
         except Exception as e:
-            logger.warning(f"[AssetCompiler] compile error: {e}")
+            logger.warning(f"[AssetCompiler] smali compile error: {e}")
             return b""
+
 
     def _build_minimal_dex_template(
         self,
