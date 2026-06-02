@@ -11183,9 +11183,16 @@ async def button_handler(update, context):
 
         result_text = "\n".join(lines)
 
-        await status_msg.edit_text(
-            result_text,
-            parse_mode="Markdown")
+        # Send result summary as plain text — no parse_mode.
+        # Result lines contain file paths and error messages with underscores
+        # that break Markdown entity parsing (BadRequest: can't find end of entity).
+        # Emoji icons in the lines are visible in plain text — no formatting needed.
+        try:
+            await status_msg.edit_text(result_text)
+        except Exception:
+            # Fallback: strip non-ASCII and retry
+            await status_msg.edit_text(
+                result_text.encode("ascii", "ignore").decode("ascii"))
 
         # ── Deliver APK ───────────────────────────────────────────────────
         if final_apk and os.path.exists(final_apk):
