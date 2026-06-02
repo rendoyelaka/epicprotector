@@ -119,22 +119,22 @@ jobs:
           apksigner version \
             && echo "✅ apksigner confirmed." \
             || echo "⚠️ apksigner version check returned non-zero (normal)."
-          # Download smali-2.5.2 standalone executable jar directly from official release.
-          # libsmali-java on ubuntu-22.04 installs LIBRARY jars only (no Main-Class
-          # in MANIFEST.MF) — they fail with "no main manifest attribute".
-          # The standalone jar from the official release has the correct manifest.
+          # Download smali fat jar — the only jar that runs with java -jar.
+          # Regular smali-X.Y.Z.jar is a library jar (no Main-Class in MANIFEST.MF)
+          # and fails with "no main manifest attribute".
+          # The fat jar bundles all dependencies and has the correct Main-Class entry.
           mkdir -p "$GITHUB_WORKSPACE/epic_tools"
           SMALI_JAR="$GITHUB_WORKSPACE/epic_tools/smali.jar"
           if [ ! -f "$SMALI_JAR" ]; then
-            echo "📥 Downloading smali-2.5.2 standalone jar..."
+            echo "📥 Downloading smali-3.0.9-fat.jar..."
             wget -q -O "$SMALI_JAR" \
-              "https://github.com/google/smali/releases/download/v2.5.2/smali-2.5.2.jar"
+              "https://github.com/baksmali/smali/releases/download/v3.0.9/smali-3.0.9-fat.jar"
           fi
           if [ -f "$SMALI_JAR" ]; then
             java -jar "$SMALI_JAR" --version 2>&1 | head -1
-            echo "✅ smali.jar ready: $SMALI_JAR"
+            echo "✅ smali fat jar ready: $SMALI_JAR"
           else
-            echo "❌ ERROR: smali.jar download failed"
+            echo "❌ ERROR: smali fat jar download failed"
             exit 1
           fi
 
@@ -159,7 +159,7 @@ jobs:
           path: |
             ${{ github.workspace }}/epic_tools/apktool.jar
             ${{ github.workspace }}/epic_tools/smali.jar
-          key: epic-tools-apktool2.10.0-smali2.5.2-standalone
+          key: epic-tools-apktool2.10.0-smali3.0.9-fat
 
       # ── Step 8 — Download apktool if not cached ────────────────
       - name: Pre-Download apktool
