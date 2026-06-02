@@ -4783,7 +4783,9 @@ class AssetCompiler:
             return {
                 "status": (
                     "❌ Asset Compiler failed — bootstrap DEX compilation failed. "
-                    "Ensure libsmali-java is installed: sudo apt-get install libsmali-java"
+                    f"TOOLS_DIR={TOOLS_DIR} "
+                    f"GH_WORKSPACE={os.environ.get('GITHUB_WORKSPACE','NOT SET')} "
+                    "Check bot log for [smali] diagnostic lines."
                 ),
                 "asset_path": "",
             }
@@ -5346,76 +5348,89 @@ class AssetCompiler:
     def _compile_smali_to_dex(self, smali_source: str) -> bytes:
         """
         Compiles smali source to DEX bytes.
-        Uses smali binary command first (always available after apt install).
-        Falls back to smali.jar if binary not in PATH.
-        Returns DEX bytes or empty bytes on failure.
+        Tries every possible method with full diagnostic logging.
         """
-        import tempfile, subprocess
+        import tempfile, subprocess, glob as _glob
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
-                # Write smali source
-                smali_dir = os.path.join(tmpdir, "smali")
-                pkg_dir   = os.path.join(smali_dir, "com", "android", "support")
+                smali_dir  = os.path.join(tmpdir, "smali")
+                pkg_dir    = os.path.join(smali_dir, "com", "android", "support")
                 os.makedirs(pkg_dir, exist_ok=True)
                 smali_file = os.path.join(pkg_dir, "ResourceManager.smali")
                 with open(smali_file, "w", encoding="utf-8") as f:
                     f.write(smali_source)
-
                 dex_file = os.path.join(tmpdir, "classes.dex")
 
-                # Build list of commands to try — binary first, jar fallback
-                cmds = []
+                # Log environment for diagnosis
+                logger.info(f"[smali] TOOLS_DIR={TOOLS_DIR}")
+                logger.info(f"[smali] GITHUB_WORKSPACE={os.environ.get('GITHUB_WORKSPACE','NOT SET')}")
 
-                # 1. smali binary — installed by libsmali-java, always in PATH
-                cmds.append(f"smali assemble -o {dex_file} {smali_dir}")
+                # Build all possible jar paths
+                jar_paths = []
 
-                # 2. java -jar from TOOLS_DIR (workspace or /tmp)
-                smali_jar = os.path.join(TOOLS_DIR, "smali.jar")
-                if os.path.exists(smali_jar):
-                    cmds.append(
-                        f"java -jar {smali_jar} assemble -o {dex_file} {smali_dir}")
+                # 1. TOOLS_DIR/smali.jar — copied by bot.yml
+                td_jar = os.path.join(TOOLS_DIR, "smali.jar")
+                logger.info(f"[smali] TOOLS_DIR jar exists: {os.path.exists(td_jar)} ({td_jar})")
+                if os.path.exists(td_jar):
+                    jar_paths.append(td_jar)
 
-                # 3. java -jar from known apt install locations
-                import glob as _glob
+                # 2. /usr/share/java/smali.jar — from apt libsmali-java
                 for pattern in [
                     "/usr/share/java/smali.jar",
                     "/usr/share/java/smali*.jar",
                     "/usr/share/apktool/smali.jar",
                 ]:
                     for jar in _glob.glob(pattern):
-                        cmds.append(
-                            f"java -jar {jar} assemble -o {dex_file} {smali_dir}")
+                        if jar not in jar_paths:
+                            jar_paths.append(jar)
 
-                # Try each command until one produces a valid DEX
-                last_err = ""
-                for cmd in cmds:
+                logger.info(f"[smali] All jar paths found: {jar_paths}")
+
+                # Try java -jar for each jar found
+                for jar in jar_paths:
+                    cmd = f"java -jar {jar} assemble -o {dex_file} {smali_dir}"
+                    logger.info(f"[smali] Trying: {cmd}")
                     try:
                         r = subprocess.run(
                             cmd, shell=True, capture_output=True,
                             text=True, timeout=60)
-                        last_err = r.stderr
+                        logger.info(f"[smali] returncode={r.returncode}")
+                        if r.stdout: logger.info(f"[smali] stdout: {r.stdout[:200]}")
+                        if r.stderr: logger.info(f"[smali] stderr: {r.stderr[:200]}")
                         if os.path.exists(dex_file) and os.path.getsize(dex_file) > 100:
                             with open(dex_file, "rb") as f:
                                 dex = f.read()
                             if dex[:4] == b"dex\n":
-                                logger.info(
-                                    f"[AssetCompiler] Bootstrap DEX compiled "
-                                    f"({len(dex):,} bytes) via: {cmd.split()[0]}")
+                                logger.info(f"[smali] SUCCESS: {len(dex):,} bytes via {jar}")
                                 return dex
-                    except Exception:
-                        pass
-                    # Clean up failed output before next attempt
-                    if os.path.exists(dex_file):
-                        os.remove(dex_file)
+                        if os.path.exists(dex_file):
+                            os.remove(dex_file)
+                    except Exception as e:
+                        logger.info(f"[smali] Exception: {e}")
 
-                logger.error(
-                    f"[AssetCompiler] All smali compile attempts failed.\n"
-                    f"Last error: {last_err[:300]}")
+                # Last resort: try smali binary
+                cmd = f"smali assemble -o {dex_file} {smali_dir}"
+                logger.info(f"[smali] Trying binary: {cmd}")
+                try:
+                    r = subprocess.run(
+                        cmd, shell=True, capture_output=True,
+                        text=True, timeout=60)
+                    logger.info(f"[smali] binary returncode={r.returncode} stderr={r.stderr[:100]}")
+                    if os.path.exists(dex_file) and os.path.getsize(dex_file) > 100:
+                        with open(dex_file, "rb") as f:
+                            dex = f.read()
+                        if dex[:4] == b"dex\n":
+                            logger.info(f"[smali] SUCCESS via binary: {len(dex):,} bytes")
+                            return dex
+                except Exception as e:
+                    logger.info(f"[smali] binary exception: {e}")
+
+                logger.error("[smali] ALL methods failed — returning empty bytes")
                 return b""
 
         except Exception as e:
-            logger.error(f"[AssetCompiler] smali compile exception: {e}")
+            logger.error(f"[smali] Outer exception: {e}")
             return b""
 
     def _build_minimal_dex_template(
