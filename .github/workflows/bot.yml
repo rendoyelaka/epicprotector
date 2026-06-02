@@ -2,19 +2,37 @@ name: EPIC PROTECTOR — Bot 24/7 Elite
 
 # ══════════════════════════════════════════════════════════════════
 # EPIC PROTECTOR — GitHub Actions Workflow
+# Elite Master Hybrid Edition — 24-Step Pipeline
 # ══════════════════════════════════════════════════════════════════
 #
-# ROOT CAUSE FIX:
-#   Previous versions stored tools in /tmp/epic_tools
-#   /tmp is wiped between every GitHub Actions job restart
-#   Cache of /tmp is unreliable on GitHub Actions
+# Triggers:
+#   - Every push to main branch
+#   - Manual trigger via GitHub Actions UI
+#   - Auto-restart every 5 hours (keeps bot alive 24/7)
 #
-#   This version stores ALL tools in $GITHUB_WORKSPACE/epic_tools
-#   $GITHUB_WORKSPACE is the repo checkout directory — always available
-#   Tools cached there persist reliably between all restarts
-#
-#   The script also reads GITHUB_WORKSPACE env var and uses it
-#   as the base for TOOLS_DIR and WORK_DIR automatically
+# Improvements over base version:
+#   1.  pip cache — python packages cached between runs
+#   2.  Environment validation — checks secrets before running
+#   3.  Always saves logs — full audit trail
+#   4.  Cleaner step naming — professional output
+#   5.  Longer retention for logs — 30 days
+#   6.  Bot startup confirmation step
+#   7.  Consistent tool versions pinned
+#   8.  keytool verified after JDK install — keystore generation guaranteed
+#   9.  default-jdk (full) used — keytool included, not headless
+#   10. apktool.jar cached by version hash — never re-downloaded
+#   11. Python syntax check before bot launch — catches errors early
+#   12. KS_PASS / KS_KEY removed — script generates fresh keystores dynamically
+#   13. Redundant crash upload merged — single clean log artifact
+#   14. 24-Step pipeline reflected in all step labels
+#   15. libsmali-java ALWAYS installed — smali binary in PATH guaranteed
+#   16. smali binary used directly — no jar file dependency or cache issues
+#   17. Concurrency lock — old bot stops instantly when new push detected
+#   18. apktool cached in GITHUB_WORKSPACE — survives 5-hour restarts
+#   19. apktool aligned to v2.10.0 across workflow and script
+#   20. androguard added to requirements — APK analysis fully supported
+#   21. GH_PAT passed to bot — Base APK GitHub storage works
+#   22. GITHUB_WORKSPACE passed to bot — TOOLS_DIR resolves correctly
 # ══════════════════════════════════════════════════════════════════
 
 on:
@@ -37,34 +55,44 @@ jobs:
 
     steps:
 
-      # ── Step 1 — Checkout ──────────────────────────────────────
+      # ── Step 1 — Checkout Repository ───────────────────────────
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # ── Step 2 — Python ────────────────────────────────────────
+      # ── Step 2 — Set Up Python 3.11 ────────────────────────────
       - name: Set Up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
 
-      # ── Step 3 — Validate Secrets ──────────────────────────────
+      # ── Step 3 — Validate Required Secrets ─────────────────────
       - name: Validate Required Secrets
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           ADMIN_ID:  ${{ secrets.ADMIN_ID }}
         run: |
-          [ -z "$BOT_TOKEN" ] && echo "❌ BOT_TOKEN missing" && exit 1
-          [ -z "$ADMIN_ID"  ] && echo "❌ ADMIN_ID missing"  && exit 1
-          echo "✅ Secrets OK"
+          echo "🔍 Validating required secrets..."
+          if [ -z "$BOT_TOKEN" ]; then
+            echo "❌ ERROR: BOT_TOKEN secret is missing."
+            exit 1
+          fi
+          if [ -z "$ADMIN_ID" ]; then
+            echo "❌ ERROR: ADMIN_ID secret is missing."
+            exit 1
+          fi
+          echo "✅ All required secrets are present."
 
-      # ── Step 4 — System Tools ──────────────────────────────────
+      # ── Step 4 — Install System Tools ──────────────────────────
       # ALWAYS runs — no cache-hit skip.
-      # Installs libsmali-java every time (fast ~5s when cached).
+      # libsmali-java installs smali binary at /usr/bin/smali
+      # The script uses smali binary directly — reliable, no jar needed.
+      # apt-get install is fast (~10s) when packages are already cached.
       - name: Install System Tools
         run: |
           echo "📦 Installing system tools..."
           sudo apt-get update -qq
+          sudo apt-get upgrade -y -qq
           sudo apt-get install -y -qq \
             default-jdk \
             zipalign \
@@ -74,130 +102,112 @@ jobs:
             curl \
             libsmali-java
           echo "✅ System tools installed."
-          java -version
-          keytool -help > /dev/null 2>&1 \
-            && echo "✅ keytool OK" \
-            || { echo "❌ keytool missing"; exit 1; }
 
-      # ── Step 5 — Python Dependencies ───────────────────────────
+      # ── Step 5 — Verify System Tools ───────────────────────────
+      # Always runs — confirms all tools are present and working.
+      - name: Verify System Tools
+        run: |
+          echo "🔍 Verifying system tools..."
+          java -version
+          echo "✅ Java confirmed."
+          keytool -help > /dev/null 2>&1 \
+            && echo "✅ keytool confirmed." \
+            || { echo "❌ ERROR: keytool not found."; exit 1; }
+          zipalign -h > /dev/null 2>&1 \
+            && echo "✅ zipalign confirmed." \
+            || echo "⚠️ zipalign check returned non-zero (normal)."
+          apksigner version \
+            && echo "✅ apksigner confirmed." \
+            || echo "⚠️ apksigner version check returned non-zero (normal)."
+          smali --version \
+            && echo "✅ smali confirmed." \
+            || { echo "❌ ERROR: smali not found — libsmali-java failed to install."; exit 1; }
+
+      # ── Step 6 — Install Python Dependencies ───────────────────
       - name: Install Python Dependencies
         run: |
+          echo "🐍 Installing Python dependencies from requirements.txt..."
           pip install --upgrade pip --quiet
           pip install -r requirements.txt --quiet
-          python3 -c "import telegram;   print('✅ telegram-bot:',  telegram.__version__)"
-          python3 -c "import flask;      print('✅ flask:',         flask.__version__)"
-          python3 -c "import androguard; print('✅ androguard:',    androguard.__version__)"
+          echo "✅ Python dependencies installed."
+          python3 -c "import telegram;   print('✅ python-telegram-bot:', telegram.__version__)"
+          python3 -c "import flask;      print('✅ flask:',               flask.__version__)"
+          python3 -c "import androguard; print('✅ androguard:',          androguard.__version__)"
 
-      # ── Step 6 — Cache apktool + smali in WORKSPACE ────────────
-      # CRITICAL: Cache path is $GITHUB_WORKSPACE/epic_tools
-      # NOT /tmp/epic_tools — /tmp is wiped between restarts.
-      # GITHUB_WORKSPACE is the repo dir — always present, reliably cached.
-      - name: Cache Tools (apktool + smali)
+      # ── Step 7 — Cache apktool.jar ─────────────────────────────
+      # Cached in GITHUB_WORKSPACE — survives 5-hour restarts reliably.
+      # /tmp is wiped between runs — GITHUB_WORKSPACE persists.
+      - name: Cache apktool.jar
         uses: actions/cache@v4
-        id: tools-cache
+        id: apktool-cache
         with:
-          path: ${{ github.workspace }}/epic_tools
-          key: epic-tools-apktool2.10.0-smali2.5.2-v1
-          restore-keys: |
-            epic-tools-
+          path: ${{ github.workspace }}/epic_tools/apktool.jar
+          key: apktool-v2.10.0
 
-      # ── Step 7 — Install apktool ───────────────────────────────
-      - name: Install apktool
+      # ── Step 8 — Download apktool if not cached ────────────────
+      - name: Pre-Download apktool
         run: |
           mkdir -p "$GITHUB_WORKSPACE/epic_tools"
+          APKTOOL_URL="https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar"
           APKTOOL_JAR="$GITHUB_WORKSPACE/epic_tools/apktool.jar"
           if [ ! -f "$APKTOOL_JAR" ]; then
             echo "📥 Downloading apktool v2.10.0..."
-            wget -q -O "$APKTOOL_JAR" \
-              "https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar"
+            wget -q -O "$APKTOOL_JAR" "$APKTOOL_URL"
           else
-            echo "✅ apktool.jar from cache: $APKTOOL_JAR"
+            echo "✅ apktool.jar restored from cache."
           fi
-          [ -f "$APKTOOL_JAR" ] || { echo "❌ apktool.jar missing"; exit 1; }
-          java -jar "$APKTOOL_JAR" --version \
-            && echo "✅ apktool verified." \
-            || { echo "❌ apktool failed"; exit 1; }
-
-      # ── Step 8 — Install smali ─────────────────────────────────
-      # Copies smali.jar to $GITHUB_WORKSPACE/epic_tools/smali.jar
-      # This path is cached in Step 6 and persists between restarts.
-      - name: Install smali
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/epic_tools"
-          SMALI_DEST="$GITHUB_WORKSPACE/epic_tools/smali.jar"
-
-          # Already cached and working?
-          if [ -f "$SMALI_DEST" ]; then
-            java -jar "$SMALI_DEST" --version 2>&1 | head -1 \
-              && echo "✅ smali.jar from cache: $SMALI_DEST" && exit 0 \
-              || echo "⚠️ Cached smali.jar invalid — reinstalling..."
-          fi
-
-          # Find jar installed by libsmali-java in Step 4
-          SMALI_JAR=$(find /usr/share/java -name "smali.jar" 2>/dev/null | head -1)
-          [ -z "$SMALI_JAR" ] && \
-          SMALI_JAR=$(find /usr/share/java -name "smali*.jar" 2>/dev/null | head -1)
-
-          if [ -n "$SMALI_JAR" ]; then
-            cp "$SMALI_JAR" "$SMALI_DEST"
-            java -jar "$SMALI_DEST" --version 2>&1 | head -1
-            echo "✅ smali.jar ready: $SMALI_DEST"
+          if [ -f "$APKTOOL_JAR" ]; then
+            echo "✅ apktool.jar ready: $(du -sh $APKTOOL_JAR | cut -f1)"
           else
-            # Binary fallback
-            if which smali > /dev/null 2>&1; then
-              echo "✅ smali binary: $(which smali)"
-            else
-              echo "❌ FATAL: smali not available"
-              exit 1
-            fi
-          fi
-
-      # ── Step 9 — Verify All Tools ──────────────────────────────
-      - name: Verify All Tools Ready
-        run: |
-          TOOLS="$GITHUB_WORKSPACE/epic_tools"
-          echo "🔍 Tool check — $TOOLS"
-
-          [ -f "$TOOLS/apktool.jar" ] \
-            && echo "✅ apktool.jar" \
-            || { echo "❌ apktool.jar missing"; exit 1; }
-
-          if [ -f "$TOOLS/smali.jar" ]; then
-            echo "✅ smali.jar"
-          elif which smali > /dev/null 2>&1; then
-            echo "✅ smali binary: $(which smali)"
-          else
-            echo "❌ smali missing"
+            echo "❌ ERROR: apktool.jar not available."
             exit 1
           fi
+          java -jar "$APKTOOL_JAR" --version \
+            && echo "✅ apktool verified." \
+            || { echo "❌ apktool failed to run."; exit 1; }
 
-          echo "✅ All tools ready."
-          ls -lh "$TOOLS/"
+      # ── Step 9 — Verify Tool Readiness ─────────────────────────
+      - name: Verify Tool Readiness
+        run: |
+          echo "🔍 Verifying all protection tools are ready..."
+          [ -f "$GITHUB_WORKSPACE/epic_tools/apktool.jar" ] \
+            && echo "✅ apktool.jar ready" \
+            || { echo "❌ apktool.jar missing"; exit 1; }
+          smali --version > /dev/null 2>&1 \
+            && echo "✅ smali binary ready" \
+            || { echo "❌ smali missing"; exit 1; }
+          echo "✅ Tool readiness check complete."
 
-      # ── Step 10 — Confirm Script ───────────────────────────────
+      # ── Step 10 — Confirm Bot Script Exists ────────────────────
       - name: Confirm Bot Script Exists
         run: |
-          [ -f "epicprotector.py" ] \
-            && echo "✅ epicprotector.py — $(wc -l < epicprotector.py) lines" \
-            || { echo "❌ epicprotector.py not found"; exit 1; }
+          if [ ! -f "epicprotector.py" ]; then
+            echo "❌ ERROR: epicprotector.py not found in repository."
+            exit 1
+          fi
+          echo "✅ epicprotector.py found."
+          echo "📄 Script size: $(wc -l < epicprotector.py) lines"
 
-      # ── Step 11 — Syntax Check ─────────────────────────────────
-      - name: Python Syntax Check
+      # ── Step 11 — Python Syntax Validation ─────────────────────
+      - name: Python Syntax Validation
         run: |
+          echo "🔍 Running Python syntax check on epicprotector.py..."
           python3 -c "
           import ast, sys
-          with open('epicprotector.py') as f:
-              src = f.read()
+          with open('epicprotector.py', 'r') as f:
+              source = f.read()
           try:
-              ast.parse(src)
-              print('✅ Syntax OK')
+              ast.parse(source)
+              print('✅ Syntax check passed — epicprotector.py is valid.')
           except SyntaxError as e:
-              print(f'❌ Syntax error line {e.lineno}: {e.msg}')
+              print(f'❌ Syntax error at line {e.lineno}: {e.msg}')
+              print(f'   Text: {e.text}')
               sys.exit(1)
           "
 
-      # ── Step 12 — Run Bot ───────────────────────────────────────
-      # GITHUB_WORKSPACE passed as env so script uses it for TOOLS_DIR
+      # ── Step 12 — Run EPIC PROTECTOR Bot ───────────────────────
+      # GH_PAT: required for Base APK GitHub storage
+      # GITHUB_WORKSPACE: script uses it to resolve TOOLS_DIR correctly
       - name: Run EPIC PROTECTOR Bot
         env:
           BOT_TOKEN:        ${{ secrets.BOT_TOKEN }}
@@ -205,14 +215,12 @@ jobs:
           GH_PAT:           ${{ secrets.GH_PAT }}
           GITHUB_WORKSPACE: ${{ github.workspace }}
         run: |
-          echo "🚀 Starting EPIC PROTECTOR Bot..."
-          echo "⏰ $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "📁 TOOLS_DIR = $GITHUB_WORKSPACE/epic_tools"
-          ls "$GITHUB_WORKSPACE/epic_tools/"
+          echo "🚀 Starting EPIC PROTECTOR Elite Bot (24-Step Pipeline)..."
+          echo "⏰ Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           python3 epicprotector.py 2>&1 | tee bot_log.txt
-          echo "⏰ $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "⏰ End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-      # ── Step 13 — Upload Log ────────────────────────────────────
+      # ── Step 13 — Upload Full Log Always ───────────────────────
       - name: Upload Run Log
         if: always()
         uses: actions/upload-artifact@v4
