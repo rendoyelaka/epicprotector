@@ -4631,16 +4631,13 @@ class SafeKeyGenerator:
 
         Container layout:
           [8  bytes] — BUNDLE_MARKER format identifier
-          [4  bytes] — original DEX size (big-endian uint32)
           [32 bytes] — primary encoding key
           [32 bytes] — secondary encoding key
           [N  bytes] — encoded DEX content
+          Total header = 72 bytes (matches bootstrap skip offset exactly)
         """
-        import struct
-        size_bytes = struct.pack('>I', len(dex_bytes))
         return (
             cls.BUNDLE_MARKER
-            + size_bytes
             + primary_key
             + secondary_key
             + dex_bytes
@@ -4659,11 +4656,10 @@ class SafeKeyGenerator:
         marker = container[:8]
         if marker != cls.BUNDLE_MARKER:
             raise ValueError(f"Invalid bundle marker: {marker.hex()}")
-        original_size  = struct.unpack('>I', container[8:12])[0]
-        primary_key    = container[12:44]
-        secondary_key  = container[44:76]
-        encoded_dex    = container[76:]
-        return original_size, primary_key, secondary_key, encoded_dex
+        primary_key   = container[8:40]
+        secondary_key = container[40:72]
+        encoded_dex   = container[72:]
+        return 0, primary_key, secondary_key, encoded_dex
 
 
 # ── APP BUNDLE PROTECTOR ENGINE ───────────────────────────────────────────────
