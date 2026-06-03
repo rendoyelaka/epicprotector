@@ -5437,10 +5437,10 @@ class AssetCompiler:
 
             # Extract RC4 key bytes from smali array-data
             rc4_m = _re.search(
-                r':rc4[\s\S]*?\.array-data 1([\s\S]*?)\.end array-data',
+                r':primary_key_data[\s\S]*?\.array-data 1([\s\S]*?)\.end array-data',
                 smali_source)
             xor_m = _re.search(
-                r':xor[\s\S]*?\.array-data 1([\s\S]*?)\.end array-data',
+                r':secondary_key_data[\s\S]*?\.array-data 1([\s\S]*?)\.end array-data',
                 smali_source)
             asset_m = _re.search(
                 r'BUNDLE_PATH:Ljava/lang/String; = "([^"]+)"', smali_source)
