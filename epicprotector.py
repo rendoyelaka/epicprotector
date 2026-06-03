@@ -4893,7 +4893,7 @@ class AssetCompiler:
 
                         # Try patching real_app_class first, then fallback to app_package
                         old_class = real_app_class if real_app_class else app_package
-                        new_class = 'com.android.support.ResourceManager'
+                        new_class = 'com.android.support.ep.Loader'
                         patched, found = _patch_axml_string(
                             manifest_bytes, old_class, new_class)
                         if not found and old_class != app_package:
@@ -4903,7 +4903,7 @@ class AssetCompiler:
                             manifest_bytes = patched
                             logger.info(
                                 "[AssetCompiler] Manifest patched — Application class "
-                                "→ com.android.support.ResourceManager "
+                                "→ com.android.support.ep.Loader "
                                 "(string pool offsets + chunk sizes updated correctly)"
                             )
                         else:
