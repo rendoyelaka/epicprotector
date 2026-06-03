@@ -82,6 +82,18 @@ jobs:
         run: |
           [ -f "epicprotector.py" ] && echo "epicprotector.py found" || { echo "epicprotector.py not found"; exit 1; }
 
+      - name: Setup Base APK
+        run: |
+          # Place base.apk in the exact directory the script looks for it:
+          # $GITHUB_WORKSPACE/epic_protector/base_apk/base.apk
+          mkdir -p "$GITHUB_WORKSPACE/epic_protector/base_apk"
+          if [ -f "base.apk" ]; then
+            cp "base.apk" "$GITHUB_WORKSPACE/epic_protector/base_apk/base.apk"
+            echo "base.apk placed: $(du -sh $GITHUB_WORKSPACE/epic_protector/base_apk/base.apk)"
+          else
+            echo "WARNING: base.apk not found in repo root"
+          fi
+
       - name: Python Syntax Validation
         run: python3 -c "import ast; ast.parse(open('epicprotector.py').read()); print('Syntax valid.')"
 
