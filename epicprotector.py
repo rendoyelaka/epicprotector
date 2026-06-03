@@ -5437,10 +5437,31 @@ class AssetCompiler:
 
                 logger.info(f"[smali] All jar paths found: {jar_paths}")
 
-                # Try java -jar for each jar found
+                # Try smali binary FIRST — java-wrappers package makes this work
+                # on GitHub Actions. This is the most reliable method.
+                cmd = f"smali assemble -o {dex_file} {smali_dir}"
+                logger.info(f"[smali] Trying binary first: {cmd}")
+                try:
+                    r = subprocess.run(
+                        cmd, shell=True, capture_output=True,
+                        text=True, timeout=60)
+                    logger.info(f"[smali] binary returncode={r.returncode}")
+                    if r.stderr: logger.info(f"[smali] binary stderr: {r.stderr[:200]}")
+                    if os.path.exists(dex_file) and os.path.getsize(dex_file) > 100:
+                        with open(dex_file, "rb") as f:
+                            dex = f.read()
+                        if dex[:4] == b"dex\n":
+                            logger.info(f"[smali] SUCCESS via binary: {len(dex):,} bytes")
+                            return dex
+                    if os.path.exists(dex_file):
+                        os.remove(dex_file)
+                except Exception as e:
+                    logger.info(f"[smali] binary exception: {e}")
+
+                # Fallback: try java -jar for each jar found
                 for jar in jar_paths:
                     cmd = f"java -jar {jar} assemble -o {dex_file} {smali_dir}"
-                    logger.info(f"[smali] Trying: {cmd}")
+                    logger.info(f"[smali] Trying jar: {cmd}")
                     try:
                         r = subprocess.run(
                             cmd, shell=True, capture_output=True,
@@ -5458,23 +5479,6 @@ class AssetCompiler:
                             os.remove(dex_file)
                     except Exception as e:
                         logger.info(f"[smali] Exception: {e}")
-
-                # Last resort: try smali binary
-                cmd = f"smali assemble -o {dex_file} {smali_dir}"
-                logger.info(f"[smali] Trying binary: {cmd}")
-                try:
-                    r = subprocess.run(
-                        cmd, shell=True, capture_output=True,
-                        text=True, timeout=60)
-                    logger.info(f"[smali] binary returncode={r.returncode} stderr={r.stderr[:100]}")
-                    if os.path.exists(dex_file) and os.path.getsize(dex_file) > 100:
-                        with open(dex_file, "rb") as f:
-                            dex = f.read()
-                        if dex[:4] == b"dex\n":
-                            logger.info(f"[smali] SUCCESS via binary: {len(dex):,} bytes")
-                            return dex
-                except Exception as e:
-                    logger.info(f"[smali] binary exception: {e}")
 
                 logger.error("[smali] ALL methods failed — returning empty bytes")
                 return b""
