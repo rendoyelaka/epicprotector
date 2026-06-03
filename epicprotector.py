@@ -5470,15 +5470,27 @@ class AssetCompiler:
             # Patch XOR key (32 bytes at fixed offset)
             d[self._XOR_PH_OFFSET : self._XOR_PH_OFFSET + 32] = xor_key
 
-            # Patch asset path string (pad/truncate to fixed placeholder length)
-            asset_b = asset_str.encode('utf-8')
-            asset_b = asset_b[:self._ASSET_PH_LEN].ljust(self._ASSET_PH_LEN, b' ')
-            d[self._ASSET_PH_OFFSET : self._ASSET_PH_OFFSET + self._ASSET_PH_LEN] = asset_b
+            # Patch asset path string.
+            # DEX string format: [ULEB128 utf16_size][MUTF-8 bytes][0x00]
+            # The utf16_size byte is at ASSET_PH_OFFSET-1.
+            # MUST NOT pad with spaces — AssetManager.open() and loadClass()
+            # include trailing bytes in the string → FileNotFoundException / crash.
+            asset_enc = asset_str.encode('utf-8')[:self._ASSET_PH_LEN - 1]
+            d[self._ASSET_PH_OFFSET - 1] = len(asset_enc)   # utf16_size
+            d[self._ASSET_PH_OFFSET : self._ASSET_PH_OFFSET + len(asset_enc)] = asset_enc
+            d[self._ASSET_PH_OFFSET + len(asset_enc)] = 0x00  # null terminator
+            for _i in range(self._ASSET_PH_OFFSET + len(asset_enc) + 1,
+                            self._ASSET_PH_OFFSET + self._ASSET_PH_LEN):
+                d[_i] = 0x00  # zero out remaining placeholder bytes
 
-            # Patch app class string (pad/truncate to fixed placeholder length)
-            app_b = app_str.encode('utf-8')
-            app_b = app_b[:self._APP_PH_LEN].ljust(self._APP_PH_LEN, b' ')
-            d[self._APP_PH_OFFSET : self._APP_PH_OFFSET + self._APP_PH_LEN] = app_b
+            # Patch app class string — same approach
+            app_enc = app_str.encode('utf-8')[:self._APP_PH_LEN - 1]
+            d[self._APP_PH_OFFSET - 1] = len(app_enc)       # utf16_size
+            d[self._APP_PH_OFFSET : self._APP_PH_OFFSET + len(app_enc)] = app_enc
+            d[self._APP_PH_OFFSET + len(app_enc)] = 0x00    # null terminator
+            for _i in range(self._APP_PH_OFFSET + len(app_enc) + 1,
+                            self._APP_PH_OFFSET + self._APP_PH_LEN):
+                d[_i] = 0x00
 
             # Fix DEX SHA-1 signature (bytes 12-31 = SHA1 of bytes 32 onward)
             sig = hashlib.sha1(bytes(d[32:])).digest()
