@@ -5465,6 +5465,10 @@ class AssetCompiler:
             rc4_key   = parse_bytes(rc4_m.group(1))
             xor_key   = parse_bytes(xor_m.group(1))
             asset_str = asset_m.group(1)
+            # ep.Loader template calls AssetManager.open() WITHOUT "assets/" prefix
+            # Strip it here so the path embedded in DEX is correct
+            if asset_str.startswith("assets/"):
+                asset_str = asset_str[len("assets/"):]
             app_str   = app_m.group(1)
 
             if len(rc4_key) != 32 or len(xor_key) != 32:
