@@ -2,14 +2,21 @@ name: EPIC PROTECTOR — Bot 24/7 Elite
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
   workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'
+
+concurrency:
+  group: epic-protector-bot
+  cancel-in-progress: true
 
 jobs:
   run-bot:
     name: EPIC PROTECTOR — Elite Bot Runner (24-Step)
     runs-on: ubuntu-22.04
-    timeout-minutes: 360
+    timeout-minutes: 350
 
     steps:
 
@@ -23,10 +30,13 @@ jobs:
           cache: 'pip'
 
       - name: Validate Required Secrets
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID:  ${{ secrets.ADMIN_ID }}
         run: |
-          [ -z "${{ secrets.BOT_TOKEN }}" ] && echo "TELEGRAM_BOT_TOKEN missing" && exit 1
-          [ -z "${{ secrets.ADMIN_ID }}" ] && echo "ADMIN_CHAT_ID missing" && exit 1
-          echo "All required secrets present."
+          if [ -z "$BOT_TOKEN" ]; then echo "❌ BOT_TOKEN missing"; exit 1; fi
+          if [ -z "$ADMIN_ID" ];  then echo "❌ ADMIN_ID missing";  exit 1; fi
+          echo "✅ All required secrets present."
 
       - name: Install System Tools
         run: |
@@ -38,23 +48,23 @@ jobs:
             wget \
             unzip \
             curl
-          echo "System tools installed."
+          echo "✅ System tools installed."
 
       - name: Verify System Tools
         run: |
           java -version 2>&1 | head -1
-          keytool -help > /dev/null 2>&1 && echo "keytool ok" || { echo "keytool not found"; exit 1; }
-          zipalign -h > /dev/null 2>&1 && echo "zipalign ok" || echo "zipalign non-zero (normal)"
-          apksigner version > /dev/null 2>&1 && echo "apksigner ok" || echo "apksigner non-zero (normal)"
-          echo "System tools verified."
+          keytool -help > /dev/null 2>&1 && echo "✅ keytool ok" || { echo "❌ keytool missing"; exit 1; }
+          zipalign -h > /dev/null 2>&1 && echo "✅ zipalign ok" || echo "⚠️ zipalign non-zero (normal)"
+          apksigner version > /dev/null 2>&1 && echo "✅ apksigner ok" || echo "⚠️ apksigner non-zero (normal)"
+          echo "✅ Bootstrap DEX uses pure Python — no smali needed."
 
       - name: Install Python Dependencies
         run: |
           pip install --upgrade pip --quiet
           pip install -r requirements.txt --quiet
-          python3 -c "import telegram; print('python-telegram-bot:', telegram.__version__)"
-          python3 -c "import flask; print('flask:', flask.__version__)"
-          python3 -c "import androguard; print('androguard:', androguard.__version__)"
+          python3 -c "import telegram;   print('✅ python-telegram-bot:', telegram.__version__)"
+          python3 -c "import flask;      print('✅ flask:',               flask.__version__)"
+          python3 -c "import androguard; print('✅ androguard:',          androguard.__version__)"
 
       - name: Cache apktool.jar
         uses: actions/cache@v4
@@ -68,43 +78,46 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/epic_tools"
           APKTOOL_JAR="$GITHUB_WORKSPACE/epic_tools/apktool.jar"
           if [ ! -f "$APKTOOL_JAR" ]; then
+            echo "📥 Downloading apktool v2.10.0..."
             wget -q -O "$APKTOOL_JAR" "https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar"
+          else
+            echo "✅ apktool.jar from cache."
           fi
-          java -jar "$APKTOOL_JAR" --version && echo "apktool verified." || { echo "apktool failed"; exit 1; }
+          java -jar "$APKTOOL_JAR" --version && echo "✅ apktool verified." || { echo "❌ apktool failed"; exit 1; }
 
       - name: Verify Tool Readiness
         run: |
-          [ -f "$GITHUB_WORKSPACE/epic_tools/apktool.jar" ] && echo "apktool.jar ready" || { echo "apktool.jar missing"; exit 1; }
-          echo "Bootstrap DEX uses pure Python — no smali binary needed."
-          echo "Tool readiness check complete."
+          [ -f "$GITHUB_WORKSPACE/epic_tools/apktool.jar" ] && echo "✅ apktool.jar ready" || { echo "❌ apktool.jar missing"; exit 1; }
+          echo "✅ Tool readiness check complete."
 
       - name: Confirm Bot Script Exists
         run: |
-          [ -f "epicprotector.py" ] && echo "epicprotector.py found" || { echo "epicprotector.py not found"; exit 1; }
+          [ -f "epicprotector.py" ] && echo "✅ epicprotector.py found — $(wc -l < epicprotector.py) lines" || { echo "❌ epicprotector.py not found"; exit 1; }
 
       - name: Setup Base APK
         run: |
-          # Place base.apk in the exact directory the script looks for it:
-          # $GITHUB_WORKSPACE/epic_protector/base_apk/base.apk
           mkdir -p "$GITHUB_WORKSPACE/epic_protector/base_apk"
           if [ -f "base.apk" ]; then
             cp "base.apk" "$GITHUB_WORKSPACE/epic_protector/base_apk/base.apk"
-            echo "base.apk placed: $(du -sh $GITHUB_WORKSPACE/epic_protector/base_apk/base.apk)"
+            echo "✅ base.apk placed: $(du -sh $GITHUB_WORKSPACE/epic_protector/base_apk/base.apk)"
           else
-            echo "WARNING: base.apk not found in repo root"
+            echo "⚠️ base.apk not in repo — bot will download from Telegram on first use."
           fi
 
       - name: Python Syntax Validation
-        run: python3 -c "import ast; ast.parse(open('epicprotector.py').read()); print('Syntax valid.')"
+        run: python3 -c "import ast; ast.parse(open('epicprotector.py').read()); print('✅ Syntax valid.')"
 
       - name: Run EPIC PROTECTOR Bot
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          ADMIN_CHAT_ID:      ${{ secrets.ADMIN_ID }}
-          GITHUB_WORKSPACE:   ${{ github.workspace }}
+          BOT_TOKEN:        ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID:         ${{ secrets.ADMIN_ID }}
+          GH_PAT:           ${{ secrets.GH_PAT }}
+          GITHUB_WORKSPACE: ${{ github.workspace }}
         run: |
-          echo "Starting EPIC PROTECTOR Elite Bot..."
+          echo "🚀 Starting EPIC PROTECTOR Elite Bot (24-Step Pipeline)..."
+          echo "⏰ Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           python3 epicprotector.py 2>&1 | tee bot_log.txt
+          echo "⏰ End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
       - name: Upload Run Log
         if: always()
@@ -112,4 +125,4 @@ jobs:
         with:
           name: epic-bot-log-${{ github.run_number }}
           path: bot_log.txt
-          retention-days: 7
+          retention-days: 30
