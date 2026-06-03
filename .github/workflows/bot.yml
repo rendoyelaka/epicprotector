@@ -120,19 +120,10 @@ jobs:
           apksigner version \
             && echo "✅ apksigner confirmed." \
             || echo "⚠️ apksigner version check returned non-zero (normal)."
-          # java-wrappers provides /usr/bin/smali that correctly invokes the
-          # libsmali-java jar. Install it now so "smali assemble" works as a binary.
-          # The epicprotector.py script tries "smali assemble" as its last resort
-          # and this makes that path succeed reliably.
-          sudo apt-get install -y -qq java-wrappers
+          # Confirm smali binary works (java-wrappers already installed above)
           smali --version 2>&1 | head -1 \
-            && echo "✅ smali binary confirmed via java-wrappers" \
-            || { echo "❌ smali binary still not working"; exit 1; }
-          # Copy smali jar to TOOLS_DIR so script finds it via jar path too
-          mkdir -p "$GITHUB_WORKSPACE/epic_tools"
-          SMALI_JAR=$(find /usr/share/java -name "smali.jar" 2>/dev/null | head -1)
-          [ -n "$SMALI_JAR" ] && cp "$SMALI_JAR" "$GITHUB_WORKSPACE/epic_tools/smali.jar" \
-            && echo "✅ smali.jar copied to epic_tools"
+            && echo "✅ smali binary confirmed" \
+            || { echo "❌ smali binary not working"; exit 1; }
 
       # ── Step 6 — Install Python Dependencies ───────────────────
       - name: Install Python Dependencies
@@ -154,7 +145,7 @@ jobs:
         with:
           path: |
             ${{ github.workspace }}/epic_tools/apktool.jar
-            ${{ github.workspace }}/epic_tools/smali.jar
+            # smali is a binary (not a jar) — no need to cache it
           key: epic-tools-apktool2.10.0-smali3.0.9-fat-v2
 
       # ── Step 8 — Download apktool if not cached ────────────────
@@ -186,10 +177,10 @@ jobs:
           [ -f "$GITHUB_WORKSPACE/epic_tools/apktool.jar" ] \
             && echo "✅ apktool.jar ready" \
             || { echo "❌ apktool.jar missing"; exit 1; }
-          [ -f "$GITHUB_WORKSPACE/epic_tools/smali.jar" ] \
-            && java -jar "$GITHUB_WORKSPACE/epic_tools/smali.jar" --version 2>&1 | head -1 \
-            && echo "✅ smali.jar ready" \
-            || { echo "❌ smali.jar missing"; exit 1; }
+          # Validate smali using the binary — not java -jar (library jars have no Main-Class)
+          smali --version 2>&1 | head -1 \
+            && echo "✅ smali binary ready" \
+            || { echo "❌ smali binary not working"; exit 1; }
           echo "✅ Tool readiness check complete."
 
       # ── Step 10 — Confirm Bot Script Exists ────────────────────
