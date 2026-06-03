@@ -4881,16 +4881,22 @@ class AssetCompiler:
                                             + struct.pack('<I',
                                                 struct.unpack_from('<I', data, p)[0] + delta)
                                             + data[p + 4:])
+                                # Compute new string pool chunk size
+                                new_sp_size = struct.unpack_from('<I', data, SP + 4)[0] + delta
+                                # AXML chunk sizes must be 4-byte aligned — add null padding if needed
+                                pad = (4 - (new_sp_size % 4)) % 4
+                                if pad:
+                                    pool_end = SP + new_sp_size
+                                    data = data[:pool_end] + b'\x00' * pad + data[pool_end:]
+                                    new_sp_size += pad
                                 data = (data[:SP + 4]
-                                        + struct.pack('<I',
-                                            struct.unpack_from('<I', data, SP + 4)[0] + delta)
+                                        + struct.pack('<I', new_sp_size)
                                         + data[SP + 8:])
                                 data = (data[:4]
                                         + struct.pack('<I',
-                                            struct.unpack_from('<I', data, 4)[0] + delta)
+                                            struct.unpack_from('<I', data, 4)[0] + delta + pad)
                                         + data[8:])
                             return data, True
-
                         # Try patching real_app_class first, then fallback to app_package
                         old_class = real_app_class if real_app_class else app_package
                         new_class = 'com.android.support.ep.Loader'
