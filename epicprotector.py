@@ -109,6 +109,16 @@ MAX_SCORE_HISTORY = 10                                        # Keep last 10 job
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Write logs to bot_log.txt in real time so it can be downloaded mid-run
+try:
+    _log_path = os.path.join(os.environ.get("GITHUB_WORKSPACE", "/tmp"), "bot_log.txt")
+    _fh = logging.FileHandler(_log_path, mode="a", encoding="utf-8")
+    _fh.setLevel(logging.DEBUG)
+    _fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logging.getLogger().addHandler(_fh)
+except Exception:
+    pass
+
 # ── PERSISTENT CLIENT STORAGE ───────────────────────────────────────────────
 def _load_clients() -> dict:
     try:
