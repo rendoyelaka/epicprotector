@@ -11966,7 +11966,8 @@ async def button_handler(update, context):
                 if r.get(field) is not None:
                     result_lines.append(f"   `{field}: {r[field]}`")
             if r.get("status"):
-                result_lines.append(f"   _{r['status'][:80]}_")
+                _st = r['status'][:80].replace("_", r"\_").replace("*", r"\*").replace("`", r"\`")
+                result_lines.append(f"   _{_st}_")
 
         # Calculate cumulative score
         all_done   = list(done_steps)
