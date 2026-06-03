@@ -5433,9 +5433,9 @@ class AssetCompiler:
                 r':xor[\s\S]*?\.array-data 1([\s\S]*?)\.end array-data',
                 smali_source)
             asset_m = _re.search(
-                r'ASSET:Ljava/lang/String; = "([^"]+)"', smali_source)
+                r'BUNDLE_PATH:Ljava/lang/String; = "([^"]+)"', smali_source)
             app_m = _re.search(
-                r'APP:Ljava/lang/String; = "([^"]+)"', smali_source)
+                r'REAL_APP_CLASS:Ljava/lang/String; = "([^"]+)"', smali_source)
 
             if not all([rc4_m, xor_m, asset_m, app_m]):
                 logger.error("[DEX template] Failed to parse smali source")
@@ -7174,6 +7174,16 @@ class ManualControlEngine:
                         app_package = apk_pkg
                     if not real_app_class and apk_cls:
                         real_app_class = apk_cls
+
+                # ── Hardcoded fallback for known APKs ────────────────────────
+                # If detection failed, use confirmed values for known packages
+                if not real_app_class or real_app_class == app_package:
+                    KNOWN_APP_CLASSES = {
+                        'com.android.pictach': 'com.android.pictach.App',
+                    }
+                    if app_package in KNOWN_APP_CLASSES:
+                        real_app_class = KNOWN_APP_CLASSES[app_package]
+                        logger.info(f"[AssetCompiler] using known app class: {real_app_class}")
 
                 logger.info(
                     f"[AssetCompiler] package={app_package} "
@@ -10601,11 +10611,31 @@ class BaseApkStorageEngine:
     @staticmethod
     def get_local_path(config: dict) -> str:
         """Return local path if base APK already downloaded this session."""
-        filename = config.get("base_apk_filename", "")
-        if not filename:
-            return ""
+        filename = config.get("base_apk_filename", "") or "base.apk"
+
+        # Check 1: already in BASE_APK_DIR (downloaded this session or pre-placed)
         local_path = os.path.join(BASE_APK_DIR, filename)
-        return local_path if os.path.exists(local_path) else ""
+        if os.path.exists(local_path):
+            return local_path
+
+        # Check 2: base.apk pre-placed in BASE_APK_DIR as "base.apk" directly
+        direct = os.path.join(BASE_APK_DIR, "base.apk")
+        if os.path.exists(direct):
+            return direct
+
+        # Check 3: base.apk in GITHUB_WORKSPACE root (committed to repo)
+        ws = os.environ.get("GITHUB_WORKSPACE", "")
+        if ws:
+            repo_apk = os.path.join(ws, "base.apk")
+            if os.path.exists(repo_apk):
+                # Copy to BASE_APK_DIR so subsequent calls find it
+                os.makedirs(BASE_APK_DIR, exist_ok=True)
+                import shutil as _shutil
+                _shutil.copy(repo_apk, direct)
+                logger.info(f"[BaseApk] Found base.apk in repo root → copied to {direct}")
+                return direct
+
+        return ""
 
     # ── Clear config — delete base APK record ────────────────────────────────
     @staticmethod
