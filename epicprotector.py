@@ -7264,7 +7264,21 @@ class ManualControlEngine:
                 if keystore_ctx is not None and "asset_compiler_ok" in keystore_ctx:
                     asset_compiler_ok = keystore_ctx["asset_compiler_ok"]
 
-                if not asset_compiler_ok:
+                # CRITICAL: if asset_compiler ran successfully, the asset bundle
+                # already contains RC4+XOR encrypted DEX. Adding another encryption
+                # layer here breaks the bootstrap decoder — it only knows how to
+                # decode ONE layer. Skip dex_encryption entirely when asset_compiler ran.
+                asset_compiler_ran = "asset_compiler" in (completed_ops or set())
+                if keystore_ctx and keystore_ctx.get("asset_path"):
+                    asset_compiler_ran = True
+
+                if asset_compiler_ran:
+                    result["status"]    = (
+                        "✅ DEX Encryption skipped — Asset Compiler already encrypted "
+                        "the DEX with RC4+XOR. Double encryption would break the bootstrap."
+                    )
+                    result["dex_count"] = 0
+                elif not asset_compiler_ok:
                     result["status"]    = (
                         "⏭️ DEX Encoding skipped — Asset Compiler did not complete "
                         "successfully. Fix Asset Compiler first."
