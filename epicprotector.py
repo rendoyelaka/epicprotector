@@ -5431,13 +5431,17 @@ class AssetCompiler:
             # We parse them out to patch into the template
             import re as _re
 
-            # Extract RC4 key bytes from smali array-data
+            # Extract key bytes from smali array-data.
+            # IMPORTANT: use MULTILINE + anchor to match label DEFINITIONS only.
+            # The label name also appears in fill-array-data instructions BEFORE
+            # the actual label definition — a plain search finds that reference
+            # first and then matches the WRONG array-data block (primary key for both).
             rc4_m = _re.search(
-                r':primary_key_data[\s\S]*?\.array-data 1([\s\S]*?)\.end array-data',
-                smali_source)
+                r'^\s+:primary_key_data\s*\n\s+\.array-data 1([\s\S]*?)\.end array-data',
+                smali_source, _re.MULTILINE)
             xor_m = _re.search(
-                r':secondary_key_data[\s\S]*?\.array-data 1([\s\S]*?)\.end array-data',
-                smali_source)
+                r'^\s+:secondary_key_data\s*\n\s+\.array-data 1([\s\S]*?)\.end array-data',
+                smali_source, _re.MULTILINE)
             asset_m = _re.search(
                 r'BUNDLE_PATH:Ljava/lang/String; = "([^"]+)"', smali_source)
             app_m = _re.search(
