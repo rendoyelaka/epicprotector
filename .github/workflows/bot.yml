@@ -100,7 +100,8 @@ jobs:
             wget \
             unzip \
             curl \
-            libsmali-java
+            libsmali-java \
+            java-wrappers
           echo "✅ System tools installed."
 
       # ── Step 5 — Verify System Tools ───────────────────────────
