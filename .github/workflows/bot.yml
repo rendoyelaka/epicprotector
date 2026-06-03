@@ -119,24 +119,19 @@ jobs:
           apksigner version \
             && echo "✅ apksigner confirmed." \
             || echo "⚠️ apksigner version check returned non-zero (normal)."
-          # Download smali fat jar — the only jar that runs with java -jar.
-          # Regular smali-X.Y.Z.jar is a library jar (no Main-Class in MANIFEST.MF)
-          # and fails with "no main manifest attribute".
-          # The fat jar bundles all dependencies and has the correct Main-Class entry.
+          # java-wrappers provides /usr/bin/smali that correctly invokes the
+          # libsmali-java jar. Install it now so "smali assemble" works as a binary.
+          # The epicprotector.py script tries "smali assemble" as its last resort
+          # and this makes that path succeed reliably.
+          sudo apt-get install -y -qq java-wrappers
+          smali --version 2>&1 | head -1 \
+            && echo "✅ smali binary confirmed via java-wrappers" \
+            || { echo "❌ smali binary still not working"; exit 1; }
+          # Copy smali jar to TOOLS_DIR so script finds it via jar path too
           mkdir -p "$GITHUB_WORKSPACE/epic_tools"
-          SMALI_JAR="$GITHUB_WORKSPACE/epic_tools/smali.jar"
-          if [ ! -f "$SMALI_JAR" ]; then
-            echo "📥 Downloading smali-3.0.9-fat.jar..."
-            wget -q -O "$SMALI_JAR" \
-              "https://github.com/baksmali/smali/releases/download/v3.0.9/smali-3.0.9-fat.jar"
-          fi
-          if [ -f "$SMALI_JAR" ]; then
-            java -jar "$SMALI_JAR" --version 2>&1 | head -1
-            echo "✅ smali fat jar ready: $SMALI_JAR"
-          else
-            echo "❌ ERROR: smali fat jar download failed"
-            exit 1
-          fi
+          SMALI_JAR=$(find /usr/share/java -name "smali.jar" 2>/dev/null | head -1)
+          [ -n "$SMALI_JAR" ] && cp "$SMALI_JAR" "$GITHUB_WORKSPACE/epic_tools/smali.jar" \
+            && echo "✅ smali.jar copied to epic_tools"
 
       # ── Step 6 — Install Python Dependencies ───────────────────
       - name: Install Python Dependencies
@@ -159,7 +154,7 @@ jobs:
           path: |
             ${{ github.workspace }}/epic_tools/apktool.jar
             ${{ github.workspace }}/epic_tools/smali.jar
-          key: epic-tools-apktool2.10.0-smali3.0.9-fat
+          key: epic-tools-apktool2.10.0-smali3.0.9-fat-v2
 
       # ── Step 8 — Download apktool if not cached ────────────────
       - name: Pre-Download apktool
