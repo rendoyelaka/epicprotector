@@ -24,8 +24,8 @@ jobs:
 
       - name: Validate Required Secrets
         run: |
-          [ -z "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && echo "TELEGRAM_BOT_TOKEN missing" && exit 1
-          [ -z "${{ secrets.ADMIN_CHAT_ID }}" ] && echo "ADMIN_CHAT_ID missing" && exit 1
+          [ -z "${{ secrets.BOT_TOKEN }}" ] && echo "TELEGRAM_BOT_TOKEN missing" && exit 1
+          [ -z "${{ secrets.ADMIN_ID }}" ] && echo "ADMIN_CHAT_ID missing" && exit 1
           echo "All required secrets present."
 
       - name: Install System Tools
@@ -87,8 +87,8 @@ jobs:
 
       - name: Run EPIC PROTECTOR Bot
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          ADMIN_CHAT_ID:      ${{ secrets.ADMIN_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_CHAT_ID:      ${{ secrets.ADMIN_ID }}
           GITHUB_WORKSPACE:   ${{ github.workspace }}
         run: |
           echo "Starting EPIC PROTECTOR Elite Bot..."
