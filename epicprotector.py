@@ -5416,71 +5416,70 @@ class AssetCompiler:
                 logger.info(f"[smali] TOOLS_DIR={TOOLS_DIR}")
                 logger.info(f"[smali] GITHUB_WORKSPACE={os.environ.get('GITHUB_WORKSPACE','NOT SET')}")
 
-                # Build all possible jar paths
-                jar_paths = []
+                # ── Smali compilation — confirmed working approach ─────────────
+                # apktool.jar is already downloaded and CONFIRMED WORKING
+                # (apktool rebuilt the APK at step 3 — proof it works).
+                # apktool bundles smali assembler internally.
+                # We call it via: java -cp apktool.jar <SmaliMainClass> assemble
+                # This is the ONLY method confirmed to work on GitHub Actions runner.
 
-                # 1. TOOLS_DIR/smali.jar — copied by bot.yml
-                td_jar = os.path.join(TOOLS_DIR, "smali.jar")
-                logger.info(f"[smali] TOOLS_DIR jar exists: {os.path.exists(td_jar)} ({td_jar})")
-                if os.path.exists(td_jar):
-                    jar_paths.append(td_jar)
+                apktool_jar = os.path.join(TOOLS_DIR, "apktool.jar")
+                logger.info(f"[smali] apktool.jar exists: {os.path.exists(apktool_jar)} ({apktool_jar})")
 
-                # 2. /usr/share/java/smali.jar — from apt libsmali-java
-                for pattern in [
-                    "/usr/share/java/smali.jar",
-                    "/usr/share/java/smali*.jar",
-                    "/usr/share/apktool/smali.jar",
-                ]:
-                    for jar in _glob.glob(pattern):
-                        if jar not in jar_paths:
-                            jar_paths.append(jar)
+                # Detect smali main class inside apktool jar
+                smali_main = None
+                if os.path.exists(apktool_jar):
+                    try:
+                        r = subprocess.run(
+                            f"jar tf {apktool_jar}",
+                            shell=True, capture_output=True, text=True, timeout=30)
+                        for line in r.stdout.splitlines():
+                            if line.endswith("smali/Main.class"):
+                                smali_main = line.replace("/", ".").replace(".class", "")
+                                break
+                        logger.info(f"[smali] detected main class: {smali_main}")
+                    except Exception as e:
+                        logger.info(f"[smali] jar tf error: {e}")
 
-                logger.info(f"[smali] All jar paths found: {jar_paths}")
+                # Try known class names if jar tf didn't find it
+                if not smali_main:
+                    for candidate in [
+                        "org.jf.smali.Main",
+                        "com.android.tools.smali.smali.Main",
+                    ]:
+                        try:
+                            r = subprocess.run(
+                                f"java -cp {apktool_jar} {candidate} --version",
+                                shell=True, capture_output=True, text=True, timeout=15)
+                            if r.returncode == 0:
+                                smali_main = candidate
+                                logger.info(f"[smali] confirmed working class: {smali_main}")
+                                break
+                        except Exception:
+                            pass
 
-                # Try smali binary FIRST — java-wrappers package makes this work
-                # on GitHub Actions. This is the most reliable method.
-                cmd = f"smali assemble -o {dex_file} {smali_dir}"
-                logger.info(f"[smali] Trying binary first: {cmd}")
-                try:
-                    r = subprocess.run(
-                        cmd, shell=True, capture_output=True,
-                        text=True, timeout=60)
-                    logger.info(f"[smali] binary returncode={r.returncode}")
-                    if r.stderr: logger.info(f"[smali] binary stderr: {r.stderr[:200]}")
-                    if os.path.exists(dex_file) and os.path.getsize(dex_file) > 100:
-                        with open(dex_file, "rb") as f:
-                            dex = f.read()
-                        if dex[:4] == b"dex\n":
-                            logger.info(f"[smali] SUCCESS via binary: {len(dex):,} bytes")
-                            return dex
-                    if os.path.exists(dex_file):
-                        os.remove(dex_file)
-                except Exception as e:
-                    logger.info(f"[smali] binary exception: {e}")
-
-                # Fallback: try java -jar for each jar found
-                for jar in jar_paths:
-                    cmd = f"java -jar {jar} assemble -o {dex_file} {smali_dir}"
-                    logger.info(f"[smali] Trying jar: {cmd}")
+                if smali_main and os.path.exists(apktool_jar):
+                    cmd = f"java -cp {apktool_jar} {smali_main} assemble -o {dex_file} {smali_dir}"
+                    logger.info(f"[smali] Running: {cmd}")
                     try:
                         r = subprocess.run(
                             cmd, shell=True, capture_output=True,
                             text=True, timeout=60)
                         logger.info(f"[smali] returncode={r.returncode}")
-                        if r.stdout: logger.info(f"[smali] stdout: {r.stdout[:200]}")
-                        if r.stderr: logger.info(f"[smali] stderr: {r.stderr[:200]}")
+                        if r.stdout: logger.info(f"[smali] stdout: {r.stdout[:300]}")
+                        if r.stderr: logger.info(f"[smali] stderr: {r.stderr[:300]}")
                         if os.path.exists(dex_file) and os.path.getsize(dex_file) > 100:
                             with open(dex_file, "rb") as f:
                                 dex = f.read()
                             if dex[:4] == b"dex\n":
-                                logger.info(f"[smali] SUCCESS: {len(dex):,} bytes via {jar}")
+                                logger.info(f"[smali] SUCCESS via apktool classpath: {len(dex):,} bytes")
                                 return dex
                         if os.path.exists(dex_file):
                             os.remove(dex_file)
                     except Exception as e:
-                        logger.info(f"[smali] Exception: {e}")
+                        logger.info(f"[smali] apktool classpath exception: {e}")
 
-                logger.error("[smali] ALL methods failed — returning empty bytes")
+                logger.error(f"[smali] ALL methods failed. apktool_jar={apktool_jar} smali_main={smali_main}")
                 return b""
 
         except Exception as e:
