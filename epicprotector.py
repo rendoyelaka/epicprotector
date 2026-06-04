@@ -4629,15 +4629,19 @@ class SafeKeyGenerator:
         """
         Wraps encoded DEX bytes in a legitimate-looking binary container.
 
-        Container layout:
+        Container layout (76-byte header):
           [8  bytes] — BUNDLE_MARKER format identifier
+          [4  bytes] — original DEX size (big-endian uint32)
           [32 bytes] — primary encoding key
           [32 bytes] — secondary encoding key
           [N  bytes] — encoded DEX content
-          Total header = 72 bytes (matches bootstrap skip offset exactly)
+          Total header = 76 bytes (matches bootstrap skip offset exactly)
         """
+        import struct
+        orig_size_bytes = struct.pack('>I', len(dex_bytes))
         return (
             cls.BUNDLE_MARKER
+            + orig_size_bytes
             + primary_key
             + secondary_key
             + dex_bytes
