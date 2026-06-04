@@ -71,15 +71,15 @@ jobs:
         id: apktool-cache
         with:
           path: ${{ github.workspace }}/epic_tools/apktool.jar
-          key: epic-tools-apktool-2.10.0-v3
+          key: epic-tools-apktool-3.0.2-v1
 
       - name: Pre-Download apktool
         run: |
           mkdir -p "$GITHUB_WORKSPACE/epic_tools"
           APKTOOL_JAR="$GITHUB_WORKSPACE/epic_tools/apktool.jar"
           if [ ! -f "$APKTOOL_JAR" ]; then
-            echo "📥 Downloading apktool v2.10.0..."
-            wget -q -O "$APKTOOL_JAR" "https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar"
+            echo "📥 Downloading apktool v3.0.2..."
+            wget -q -O "$APKTOOL_JAR" "https://github.com/iBotPeaches/Apktool/releases/download/v3.0.2/apktool_3.0.2.jar"
           else
             echo "✅ apktool.jar from cache."
           fi
