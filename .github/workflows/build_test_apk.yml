@@ -1,1 +1,215 @@
+name: Build Test APK
 
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Protected Test APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq default-jdk zipalign apksigner
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O cmdtools.zip
+          unzip -q cmdtools.zip -d cmdtools
+          yes | cmdtools/cmdline-tools/bin/sdkmanager \
+            --sdk_root=$HOME/android-sdk \
+            "build-tools;34.0.0" \
+            "platforms;android-34" 2>/dev/null | tail -1
+          echo "$HOME/android-sdk/build-tools/34.0.0" >> $GITHUB_PATH
+
+      - name: Build Protected APK
+        run: |
+          export ANDROID_SDK=$HOME/android-sdk
+          export D8=$HOME/android-sdk/build-tools/34.0.0/d8
+          export ANDROID_JAR=$HOME/android-sdk/platforms/android-34/android.jar
+          python3 << 'PYEOF'
+          import os, sys, zipfile, subprocess, tempfile
+
+          APK_IN    = "base.apk"
+          APK_OUT   = "base_protected.apk"
+          APP_CLASS = "com.android.pictach.App"
+          D8        = os.environ["D8"]
+          ANDROID_JAR = os.environ["ANDROID_JAR"]
+
+          RC4_KEY = bytes([
+            0x3A,0x7F,0x91,0xC2,0x5E,0x18,0xB4,0x6D,
+            0x2C,0x9A,0x47,0xF3,0x8B,0x1E,0x55,0xD9,
+            0x74,0xA3,0x2F,0x6C,0xE8,0x1B,0x90,0x43,
+            0x7D,0xC6,0x5A,0xF1,0x38,0x84,0x2E,0x96
+          ])
+          XOR_KEY = bytes([
+            0xB7,0x4C,0xE3,0x21,0x9F,0x68,0xD5,0x3E,
+            0x82,0x17,0xAC,0x59,0xF4,0x6B,0x30,0xE7,
+            0xC1,0x8D,0x42,0xFA,0x75,0x29,0xB6,0x4E,
+            0x93,0x1C,0x67,0xDA,0x5F,0xA8,0x3C,0x71
+          ])
+
+          def rc4(data, key):
+            S = list(range(256))
+            j = 0
+            for i in range(256):
+              j = (j + S[i] + key[i % len(key)]) % 256
+              S[i], S[j] = S[j], S[i]
+            out = bytearray(len(data))
+            i = j = 0
+            for k in range(len(data)):
+              i=(i+1)%256; j=(j+S[i])%256
+              S[i],S[j]=S[j],S[i]
+              out[k]=data[k]^S[(S[i]+S[j])%256]
+            return bytes(out)
+
+          def xor_enc(data, key):
+            return bytes(data[i]^key[i%len(key)] for i in range(len(data)))
+
+          print("[1/6] Reading classes.dex...")
+          with zipfile.ZipFile(APK_IN, 'r') as zf:
+            real_dex = zf.read("classes.dex")
+          print(f"      {len(real_dex):,} bytes")
+
+          print("[2/6] Encrypting...")
+          enc_dex = xor_enc(rc4(real_dex, RC4_KEY), XOR_KEY)
+          assert rc4(xor_enc(enc_dex, XOR_KEY), RC4_KEY) == real_dex
+          print(f"      {len(enc_dex):,} bytes OK")
+
+          print("[3/6] Writing bootstrap Java...")
+          rc4_java = ", ".join(str(b if b<128 else b-256) for b in RC4_KEY)
+          xor_java = ", ".join(str(b if b<128 else b-256) for b in XOR_KEY)
+
+          java_src = f"""package com.android.support.ep;
+          import android.app.Application;
+          import android.content.Context;
+          import dalvik.system.DexClassLoader;
+          import java.io.*;
+          import java.lang.reflect.*;
+          import java.util.zip.*;
+          public class Loader extends Application {{
+            private static final byte[] RC4_KEY = {{{rc4_java}}};
+            private static final byte[] XOR_KEY = {{{xor_java}}};
+            private static byte[] rc4(byte[] data, byte[] key) {{
+              int[] S=new int[256]; for(int i=0;i<256;i++) S[i]=i;
+              int j=0;
+              for(int i=0;i<256;i++){{j=(j+S[i]+(key[i%key.length]&0xFF))%256;int t=S[i];S[i]=S[j];S[j]=t;}}
+              byte[] out=new byte[data.length]; int a=0; j=0;
+              for(int k=0;k<data.length;k++){{a=(a+1)%256;j=(j+S[a])%256;int t=S[a];S[a]=S[j];S[j]=t;out[k]=(byte)(data[k]^S[(S[a]+S[j])%256]);}}
+              return out;
+            }}
+            private static byte[] xorDec(byte[] data, byte[] key) {{
+              byte[] out=new byte[data.length];
+              for(int i=0;i<data.length;i++) out[i]=(byte)(data[i]^key[i%key.length]);
+              return out;
+            }}
+            @Override protected void attachBaseContext(Context base) {{
+              super.attachBaseContext(base);
+              try {{
+                ZipFile apk=new ZipFile(base.getPackageCodePath());
+                ZipEntry entry=apk.getEntry("classes2.dex");
+                InputStream in=apk.getInputStream(entry);
+                ByteArrayOutputStream buf=new ByteArrayOutputStream();
+                byte[] chunk=new byte[4096]; int n;
+                while((n=in.read(chunk))!=-1) buf.write(chunk,0,n);
+                in.close(); apk.close();
+                byte[] decrypted=rc4(xorDec(buf.toByteArray(),XOR_KEY),RC4_KEY);
+                String cacheDir=base.getCodeCacheDir().getAbsolutePath();
+                String dexPath=cacheDir+"/ep_r.dex";
+                FileOutputStream fos=new FileOutputStream(dexPath);
+                fos.write(decrypted); fos.close();
+                ClassLoader parent=getClass().getClassLoader();
+                DexClassLoader loader=new DexClassLoader(dexPath,cacheDir,null,parent);
+                Thread.currentThread().setContextClassLoader(loader);
+                Class<?> ctx=getClass().getSuperclass().getSuperclass();
+                Field f=ctx.getDeclaredField("mClassLoader");
+                f.setAccessible(true); f.set(this,loader);
+                new File(dexPath).delete();
+              }} catch(Exception e){{e.printStackTrace();}}
+            }}
+            @Override public void onCreate() {{
+              try {{
+                ClassLoader cl=getClass().getClassLoader();
+                Class<?> appClass=cl.loadClass("{APP_CLASS}");
+                Constructor<?> ctor=appClass.getDeclaredConstructor();
+                ctor.setAccessible(true);
+                Application realApp=(Application)ctor.newInstance();
+                realApp.attachBaseContext(getBaseContext());
+                realApp.onCreate();
+              }} catch(Exception e){{e.printStackTrace();}}
+              super.onCreate();
+            }}
+          }}"""
+
+          with tempfile.TemporaryDirectory() as tmp:
+            java_dir = os.path.join(tmp,"src","com","android","support","ep")
+            os.makedirs(java_dir)
+            open(os.path.join(java_dir,"Loader.java"),'w').write(java_src)
+
+            print("[4/6] Compiling Java...")
+            cls_dir = os.path.join(tmp,"classes")
+            os.makedirs(cls_dir)
+            r = subprocess.run(
+              ["javac","-source","8","-target","8",
+               "-cp",ANDROID_JAR,"-d",cls_dir,
+               os.path.join(java_dir,"Loader.java")],
+              capture_output=True, text=True)
+            if r.returncode != 0: print("JAVAC:",r.stderr); sys.exit(1)
+            print("      OK")
+
+            print("[5/6] Converting to DEX...")
+            cls_file = os.path.join(cls_dir,"com","android","support","ep","Loader.class")
+            r = subprocess.run(
+              [D8,"--output",tmp,"--min-api","21","--lib",ANDROID_JAR,cls_file],
+              capture_output=True, text=True)
+            if r.returncode != 0: print("D8:",r.stderr); sys.exit(1)
+            bootstrap_dex = open(os.path.join(tmp,"classes.dex"),'rb').read()
+            print(f"      {len(bootstrap_dex):,} bytes OK")
+
+            print("[6/6] Assembling APK...")
+            unsigned = os.path.join(tmp,"unsigned.apk")
+            with zipfile.ZipFile(APK_IN,'r') as zin, \
+                 zipfile.ZipFile(unsigned,'w',zipfile.ZIP_DEFLATED) as zout:
+              for item in zin.infolist():
+                if item.filename == "classes.dex":
+                  info = zipfile.ZipInfo("classes.dex")
+                  info.compress_type = zipfile.ZIP_STORED
+                  zout.writestr(info, bootstrap_dex)
+                elif item.filename.startswith("META-INF/"): continue
+                else: zout.writestr(item, zin.read(item.filename))
+              info2 = zipfile.ZipInfo("classes2.dex")
+              info2.compress_type = zipfile.ZIP_STORED
+              zout.writestr(info2, enc_dex)
+
+            aligned = os.path.join(tmp,"aligned.apk")
+            subprocess.run(["zipalign","-v","-p","4",unsigned,aligned],capture_output=True)
+
+            ks = os.path.join(tmp,"test.ks")
+            subprocess.run([
+              "keytool","-genkeypair","-v",
+              "-keystore",ks,"-alias","testkey",
+              "-keyalg","RSA","-keysize","2048","-validity","3650",
+              "-storepass","testpass","-keypass","testpass",
+              "-dname","CN=Test,O=Test,C=US"
+            ], capture_output=True)
+
+            r = subprocess.run([
+              "apksigner","sign",
+              "--ks",ks,"--ks-pass","pass:testpass",
+              "--out",APK_OUT, aligned
+            ], capture_output=True, text=True)
+            if r.returncode != 0: print("SIGN:",r.stderr); sys.exit(1)
+
+          print(f"\nSUCCESS: {APK_OUT} ({os.path.getsize(APK_OUT)/1024/1024:.1f} MB)")
+          PYEOF
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: base_protected_apk
+          path: base_protected.apk
+          retention-days: 7
