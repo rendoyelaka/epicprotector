@@ -158,7 +158,7 @@ SESSION_TIMEOUT_SECONDS = 1800  # 30 minutes — compliance sessions expire afte
 
 # ── TOOL INSTALLER ───────────────────────────────────────────────────────────
 class ToolInstaller:
-    APKTOOL_URL = "https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar"
+    APKTOOL_URL = "https://github.com/iBotPeaches/Apktool/releases/download/v3.0.2/apktool_3.0.2.jar"
     DEX2JAR_URL = "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
 
     def __init__(self):
