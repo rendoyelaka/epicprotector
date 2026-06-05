@@ -113,13 +113,33 @@ jobs:
           ADMIN_ID:         ${{ secrets.ADMIN_ID }}
           GH_PAT:           ${{ secrets.GH_PAT }}
           GITHUB_WORKSPACE: ${{ github.workspace }}
+          PYTHONUNBUFFERED: "1"
+          EPIC_DEBUG:       "1"
         run: |
           echo "🚀 Starting EPIC PROTECTOR Elite Bot (24-Step Pipeline)..."
           echo "⏰ Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-          python3 epicprotector.py 2>&1 | tee bot_log.txt
+          python3 -u epicprotector.py 2>&1 | tee bot_log.txt
           echo "⏰ End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
-      - name: Upload Run Log
+      - name: Show Last 200 Lines of Log
+        if: always()
+        run: |
+          echo "========== LAST 200 LOG LINES =========="
+          tail -200 bot_log.txt || echo "No log file found"
+
+      - name: Show All ERROR and WARNING Lines
+        if: always()
+        run: |
+          echo "========== ALL ERRORS & WARNINGS =========="
+          grep -n -E "ERROR|WARNING|WARN|error|exception|Exception|Traceback|Step [0-9]+.*FAIL|❌|✗" bot_log.txt || echo "No errors found in log"
+
+      - name: Show Asset Compiler & DEX Encryption Logs
+        if: always()
+        run: |
+          echo "========== ASSET COMPILER + DEX ENC LOGS =========="
+          grep -n -E "AssetCompiler|DEXEncryption|Step 17|Step 18|bootstrap|manifest patch|BUNDLE|REAL_APP|class.*→|Loader|ResourceManager" bot_log.txt || echo "No matching lines"
+
+      - name: Upload Full Run Log
         if: always()
         uses: actions/upload-artifact@v4
         with:
