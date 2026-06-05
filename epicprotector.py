@@ -93,7 +93,6 @@ SCRIPT_VERSION = "2.2"
 _BASE = os.environ.get("GITHUB_WORKSPACE", "/tmp")
 WORK_DIR   = os.path.join(_BASE, "epic_protector")
 TOOLS_DIR  = os.path.join(_BASE, "epic_tools")
-DB_FILE    = os.path.join(WORK_DIR, "clients.json")          # persistent storage
 MAX_APK_MB = 45                                               # Telegram bot limit
 
 # ── BASE APK PERSISTENT STORAGE CONFIG ───────────────────────────────────────
@@ -119,28 +118,6 @@ try:
 except Exception:
     pass
 
-# ── PERSISTENT CLIENT STORAGE ───────────────────────────────────────────────
-def _load_clients() -> dict:
-    try:
-        os.makedirs(WORK_DIR, exist_ok=True)
-        if os.path.exists(DB_FILE):
-            with open(DB_FILE, "r") as f:
-                return {int(k): v for k, v in json.load(f).items()}
-    except Exception as e:
-        logger.warning(f"Could not load clients DB: {e}")
-    return {}
-
-def _save_clients(clients: dict):
-    try:
-        os.makedirs(WORK_DIR, exist_ok=True)
-        with open(DB_FILE, "w") as f:
-            json.dump({str(k): v for k, v in clients.items()}, f, indent=2)
-    except Exception as e:
-        logger.warning(f"Could not save clients DB: {e}")
-
-registered_clients: dict = _load_clients()
-
-pending_contact   = {}
 
 # ── SESSION STATE — SMALI TREE SELECTOR ──────────────────────────────────────
 smali_tree_workspace  = {}   # workspace path for current tree session
@@ -150,7 +127,6 @@ smali_scan_results    = {}   # red flag scan results waiting for admin decision
 
 # ── JOB HISTORY & APK STATUS TRACKING ────────────────────────────────────────
 job_history: list = []          # list of job result dicts — all protection jobs
-apk_status:  dict = {}          # per-client APK processing status {client_id: status_str}
 SESSION_TIMEOUT_SECONDS = 1800  # 30 minutes — compliance sessions expire after this
 
 # ── COMPLIANCE SCANNER STATE ─────────────────────────────────────────────────
@@ -4629,19 +4605,15 @@ class SafeKeyGenerator:
         """
         Wraps encoded DEX bytes in a legitimate-looking binary container.
 
-        Container layout (76-byte header):
+        Container layout:
           [8  bytes] — BUNDLE_MARKER format identifier
-          [4  bytes] — original DEX size (big-endian uint32)
           [32 bytes] — primary encoding key
           [32 bytes] — secondary encoding key
           [N  bytes] — encoded DEX content
-          Total header = 76 bytes (matches bootstrap skip offset exactly)
+          Total header = 72 bytes (matches bootstrap skip offset exactly)
         """
-        import struct
-        orig_size_bytes = struct.pack('>I', len(dex_bytes))
         return (
             cls.BUNDLE_MARKER
-            + orig_size_bytes
             + primary_key
             + secondary_key
             + dex_bytes
@@ -4655,7 +4627,7 @@ class SafeKeyGenerator:
         Raises ValueError if marker does not match.
         """
         import struct
-        if len(container) < 76:
+        if len(container) < 72:
             raise ValueError("Container too small — not a valid app bundle")
         marker = container[:8]
         if marker != cls.BUNDLE_MARKER:
@@ -4903,7 +4875,7 @@ class AssetCompiler:
                             return data, True
                         # Try patching real_app_class first, then fallback to app_package
                         old_class = real_app_class if real_app_class else app_package
-                        new_class = 'com.android.support.ResourceManager'
+                        new_class = 'com.android.support.ep.Loader'
                         patched, found = _patch_axml_string(
                             manifest_bytes, old_class, new_class)
                         if not found and old_class != app_package:
@@ -4913,7 +4885,7 @@ class AssetCompiler:
                             manifest_bytes = patched
                             logger.info(
                                 "[AssetCompiler] Manifest patched — Application class "
-                                "→ com.android.support.ResourceManager "
+                                "→ com.android.support.ep.Loader "
                                 "(string pool offsets + chunk sizes updated correctly)"
                             )
                         else:
@@ -5036,8 +5008,6 @@ class AssetCompiler:
             dex_enc_primary_bytes   = dex_enc_primary_bytes,
             dex_enc_secondary_bytes = dex_enc_secondary_bytes,
             has_dex_enc_layer       = has_dex_enc,
-            bot_token               = BOT_TOKEN,
-            admin_id                = str(ADMIN_ID),
         )
 
         # Try to compile smali → DEX using smali.jar via apktool
@@ -5068,8 +5038,6 @@ class AssetCompiler:
         dex_enc_primary_bytes: str = "",
         dex_enc_secondary_bytes: str = "",
         has_dex_enc_layer: bool = False,
-        bot_token: str = "",
-        admin_id: str = "",
     ) -> str:
         """
         Builds the full smali source code for the bootstrap loader class.
@@ -5146,10 +5114,6 @@ class AssetCompiler:
 # Real app Application class — hardcoded at build time
 .field private static final REAL_APP_CLASS:Ljava/lang/String; = "{app_class_path.replace('/', '.')}"
 
-# Crash reporter — Telegram bot token + admin chat id
-.field private static final CR_TOKEN:Ljava/lang/String; = "{bot_token}"
-.field private static final CR_CHAT:Ljava/lang/String; = "{admin_id}"
-
 .method static constructor <clinit>()V
     .locals 3
 
@@ -5219,12 +5183,12 @@ class AssetCompiler:
     invoke-virtual {{v1}}, Ljava/io/ByteArrayOutputStream;->toByteArray()[B
     move-result-object v0
 {dex_enc_block}
-    # Step 3 — Skip bundle container header (76 bytes)
+    # Step 3 — Skip bundle container header (72 bytes)
     # CRITICAL ORDER: Step-18 decode MUST happen first (above via dex_enc_block)
     # because Step-18 encoded the entire bundle_container including the header.
-    # Only AFTER Step-18 decode is the header accessible at bytes 0-75.
-    # Header: 8 marker + 4 size + 32 primary_key + 32 secondary_key = 76 bytes
-    const/16 v1, 76
+    # Only AFTER Step-18 decode is the header accessible at bytes 0-71.
+    # Header: 8 marker + 32 primary_key + 32 secondary_key = 72 bytes
+    const/16 v1, 72
     array-length v2, v0
     invoke-static {{v0, v1, v2}}, Ljava/util/Arrays;->copyOfRange([BII)[B
     move-result-object v0
@@ -5304,100 +5268,12 @@ class AssetCompiler:
 
     :catch_0
     move-exception v0
-
-    # Send crash report to Telegram
-    invoke-virtual {{v0}}, Ljava/lang/Throwable;->toString()Ljava/lang/String;
-    move-result-object v1
-
-    sget-object v2, Lcom/android/support/ResourceManager;->CR_TOKEN:Ljava/lang/String;
-    sget-object v3, Lcom/android/support/ResourceManager;->CR_CHAT:Ljava/lang/String;
-
-    new-instance v4, Ljava/lang/StringBuilder;
-    invoke-direct {{v4}}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v5, "[EPIC BOOTSTRAP CRASH]\n"
-    invoke-virtual {{v4, v5}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v4
-    invoke-virtual {{v4, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v4
-    invoke-virtual {{v4}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
-    move-result-object v5
-
-    invoke-static {{v2, v3, v5}}, Lcom/android/support/ResourceManager;->sendTelegram(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V
-
     invoke-virtual {{v0}}, Ljava/lang/Throwable;->printStackTrace()V
+    # Still call super even on failure — keeps Android lifecycle intact
     invoke-super {{p0}}, Landroid/app/Application;->onCreate()V
     return-void
 
     .catch Ljava/lang/Exception; {{:try_start_0 .. :try_end_0}} :catch_0
-
-.end method
-
-# ── Telegram crash reporter ──────────────────────────────────────────────────
-.method private static sendTelegram(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V
-    .locals 6
-
-    :try_tg_start
-
-    new-instance v0, Ljava/lang/StringBuilder;
-    invoke-direct {{v0}}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v1, "https://api.telegram.org/bot"
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v0
-    invoke-virtual {{v0, p0}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v0
-    const-string v1, "/sendMessage"
-    invoke-virtual {{v0, v1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v0
-    invoke-virtual {{v0}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
-    move-result-object v0
-
-    new-instance v1, Ljava/net/URL;
-    invoke-direct {{v1, v0}}, Ljava/net/URL;-><init>(Ljava/lang/String;)V
-    invoke-virtual {{v1}}, Ljava/net/URL;->openConnection()Ljava/net/URLConnection;
-    move-result-object v1
-    check-cast v1, Ljava/net/HttpURLConnection;
-
-    const/4 v2, 0x1
-    invoke-virtual {{v1, v2}}, Ljava/net/HttpURLConnection;->setDoOutput(Z)V
-    const-string v2, "POST"
-    invoke-virtual {{v1, v2}}, Ljava/net/HttpURLConnection;->setRequestMethod(Ljava/lang/String;)V
-    const-string v2, "Content-Type"
-    const-string v3, "application/x-www-form-urlencoded"
-    invoke-virtual {{v1, v2, v3}}, Ljava/net/HttpURLConnection;->setRequestProperty(Ljava/lang/String;Ljava/lang/String;)V
-
-    new-instance v2, Ljava/lang/StringBuilder;
-    invoke-direct {{v2}}, Ljava/lang/StringBuilder;-><init>()V
-    const-string v3, "chat_id="
-    invoke-virtual {{v2, v3}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v2
-    invoke-virtual {{v2, p1}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v2
-    const-string v3, "&text="
-    invoke-virtual {{v2, v3}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v2
-    invoke-virtual {{v2, p2}}, Ljava/lang/StringBuilder;->append(Ljava/lang/String;)Ljava/lang/StringBuilder;
-    move-result-object v2
-    invoke-virtual {{v2}}, Ljava/lang/StringBuilder;->toString()Ljava/lang/String;
-    move-result-object v2
-
-    const-string v3, "UTF-8"
-    invoke-virtual {{v2, v3}}, Ljava/lang/String;->getBytes(Ljava/lang/String;)[B
-    move-result-object v2
-
-    invoke-virtual {{v1}}, Ljava/net/HttpURLConnection;->getOutputStream()Ljava/io/OutputStream;
-    move-result-object v3
-    invoke-virtual {{v3, v2}}, Ljava/io/OutputStream;->write([B)V
-    invoke-virtual {{v3}}, Ljava/io/OutputStream;->close()V
-    invoke-virtual {{v1}}, Ljava/net/HttpURLConnection;->getResponseCode()I
-
-    :try_tg_end
-    return-void
-
-    :catch_tg
-    move-exception v0
-    return-void
-
-    .catch Ljava/lang/Exception; {{:try_tg_start .. :try_tg_end}} :catch_tg
 
 .end method
 
@@ -5505,14 +5381,14 @@ class AssetCompiler:
     # Pure Python patches the placeholders at runtime — no smali binary needed.
     # This eliminates ALL external tool dependencies for bootstrap compilation.
     _BOOTSTRAP_TEMPLATE_B64 = (
-        "ZGV4CjAzNQCYGZ5HW588eTQAQGu3ttkwtVUBTZmywgHECwAAcAAAAHhWNBIAAAAAAAAAABgLAABBAAAAcAAAABgAAAB0AQAAFAAAANQBAAAEAAAAxAIAABoAAADkAgAAAQAAALQDAADwBwAA1AMAANQDAADeAwAA5gMAAAgEAAAVBAAAGAQAABwEAAAfBAAAIwQAACcEAAAtBAAAMgQAAE0EAABoBAAAjAQAALMEAADbBAAA/AQAABMFAAAmBQAAPwUAAFYFAABqBQAAfgUAAJIFAACpBQAAygUAAOEFAAD1BQAAAgYAABIGAAAoBgAANwYAADoGAAA+BgAARAYAAEkGAABNBgAAUAYAAFQGAABoBgAAfQYAAJUGAACoBgAArwYAAOEGAADuBgAA/QYAAAgHAAAYBwAAMAcAAEYHAABRBwAAXgcAAGgHAABuBwAAfwcAAIoHAACQBwAAnwcAALYHAADBBwAAzgcAANQHAADbBwAABAAAAAsAAAAMAAAADQAAAA4AAAAPAAAAEAAAABEAAAASAAAAEwAAABQAAAAVAAAAFgAAABcAAAAYAAAAGQAAABoAAAAbAAAAIAAAACUAAAAmAAAAJwAAACgAAAApAAAABQAAAAAAAAAACAAABgAAAAIAAAAAAAAABgAAAAMAAAAAAAAACAAAAAcAAADwBwAACAAAAAgAAADwBwAABgAAAAkAAAAAAAAACAAAAAsAAAA8CAAABwAAAAwAAAAICAAABgAAAA0AAAAAAAAACAAAAA8AAAA0CAAACAAAABAAAAAACAAAIAAAABIAAAAAAAAAIQAAABIAAAAYCAAAIQAAABIAAAD4BwAAJAAAABIAAAAQCAAAIgAAABIAAAAgCAAAIwAAABIAAAAsCAAABgAAABQAAAAAAAAACQAAABQAAAAgCAAACgAAABQAAADoBwAABAAMAAMAAAAEABQAHAAAAAQADAAdAAAABAAUAB8AAAABAAwAKgAAAAEAAgAvAAAAAQABADAAAAABAAsANQAAAAMAAwA2AAAABAALAAAAAAAEAAsANQAAAAQAEwA4AAAABAATAEAAAAAFABAAAQAAAAYACwABAAAABgARAD0AAAAGAA8APwAAAAcACwArAAAABwAAADkAAAAIAAkAMQAAAAkABQAyAAAACQAEADMAAAAMAAcAPAAAAA0ACAAuAAAADQANADsAAAAOAAsANwAAAA8ABgA0AAAADwAOADoAAAAQAAoAPgAAABEAEgAtAAAABAAAAAEAAAABAAAAAAAAAB4AAAAAAAAA+QoAAEIIAAAIPGNsaW5pdD4ABjxpbml0PgAgQVNTRVRfUEFUSF9QTEFDRUhPTERFUl9YWFhYWFhYWFgAC0JVTkRMRV9QQVRIAAFJAAJJTAABTAACTEkAAkxMAARMTElJAANMTEwAGUxhbmRyb2lkL2FwcC9BcHBsaWNhdGlvbjsAGUxhbmRyb2lkL2NvbnRlbnQvQ29udGV4dDsAIkxhbmRyb2lkL2NvbnRlbnQvcmVzL0Fzc2V0TWFuYWdlcjsAJUxjb20vYW5kcm9pZC9zdXBwb3J0L1Jlc291cmNlTWFuYWdlcjsAJkxkYWx2aWsvc3lzdGVtL0luTWVtb3J5RGV4Q2xhc3NMb2FkZXI7AB9MamF2YS9pby9CeXRlQXJyYXlPdXRwdXRTdHJlYW07ABVMamF2YS9pby9JbnB1dFN0cmVhbTsAEUxqYXZhL2xhbmcvQ2xhc3M7ABdMamF2YS9sYW5nL0NsYXNzTG9hZGVyOwAVTGphdmEvbGFuZy9FeGNlcHRpb247ABJMamF2YS9sYW5nL09iamVjdDsAEkxqYXZhL2xhbmcvU3RyaW5nOwASTGphdmEvbGFuZy9UaHJlYWQ7ABVMamF2YS9sYW5nL1Rocm93YWJsZTsAH0xqYXZhL2xhbmcvcmVmbGVjdC9Db25zdHJ1Y3RvcjsAFUxqYXZhL25pby9CeXRlQnVmZmVyOwASTGphdmEvdXRpbC9BcnJheXM7AAtQUklNQVJZX0tFWQAOUkVBTF9BUFBfQ0xBU1MAFFJlc291cmNlTWFuYWdlci5qYXZhAA1TRUNPTkRBUllfS0VZAAFWAAJWTAAEVkxJSQADVkxMAAJWWgABWgACW0IAEltMamF2YS9sYW5nL0NsYXNzOwATW0xqYXZhL2xhbmcvT2JqZWN0OwAWW0xqYXZhL25pby9CeXRlQnVmZmVyOwARYXR0YWNoQmFzZUNvbnRleHQABWNsb3NlADBjb20ucGxhY2Vob2xkZXIuYXBwLkFwcGxpY2F0aW9uX1hYWFhYWFhYWFhYWFhYWFgAC2NvcHlPZlJhbmdlAA1jdXJyZW50VGhyZWFkAAlnZXRBc3NldHMA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EQAQACoAAAAEAAAAAQAAAAEAAAAAAAAAHAAAAAAAAABACgAAgAcAAAg8Y2xpbml0PgAGPGluaXQ+AANBUFAABUFTU0VUAB9BU1NFVF9QQVRIX1BMQUNFSE9MREVSX1hYWFhYWFhYAAFJAAJJTAABTAACTEwABExMSUkAA0xMTAAZTGFuZHJvaWQvYXBwL0FwcGxpY2F0aW9uOwAZTGFuZHJvaWQvY29udGVudC9Db250ZXh0OwAiTGFuZHJvaWQvY29udGVudC9yZXMvQXNzZXRNYW5hZ2VyOwAfTGNvbS9hbmRyb2lkL3N1cHBvcnQvZXAvTG9hZGVyOwAmTGRhbHZpay9zeXN0ZW0vSW5NZW1vcnlEZXhDbGFzc0xvYWRlcjsAH0xqYXZhL2lvL0J5dGVBcnJheU91dHB1dFN0cmVhbTsAFUxqYXZhL2lvL0lucHV0U3RyZWFtOwARTGphdmEvbGFuZy9DbGFzczsAF0xqYXZhL2xhbmcvQ2xhc3NMb2FkZXI7ABVMamF2YS9sYW5nL0V4Y2VwdGlvbjsAEkxqYXZhL2xhbmcvT2JqZWN0OwASTGphdmEvbGFuZy9TdHJpbmc7ABJMamF2YS9sYW5nL1RocmVhZDsAFUxqYXZhL2xhbmcvVGhyb3dhYmxlOwAZTGphdmEvbGFuZy9yZWZsZWN0L0ZpZWxkOwAVTGphdmEvbmlvL0J5dGVCdWZmZXI7ABJMamF2YS91dGlsL0FycmF5czsAC0xvYWRlci5qYXZhAAdSQzRfS0VZAAFWAAJWTAAEVkxJSQADVkxMAAJWWgAHWE9SX0tFWQABWgACW0IAFltMamF2YS9uaW8vQnl0ZUJ1ZmZlcjsAEWF0dGFjaEJhc2VDb250ZXh0AAVjbG9zZQAxY29tLnBsYWNlaG9sZGVyLmFwcC5BcHBsaWNhdGlvbl9YWFhYWFhYWFhYWFhYWFhYWAALY29weU9mUmFuZ2UADWN1cnJlbnRUaHJlYWQACWdldEFzc2V0cwAIZ2V0Q2xhc3MADmdldENsYXNzTG9hZGVyABBnZXREZWNsYXJlZEZpZWxkAAxtQ2xhc3NMb2FkZXIACG9uQ3JlYXRlAARvcGVuAA9wcmludFN0YWNrVHJhY2UAA3JjNAAEcmVhZAADc2V0AA1zZXRBY2Nlc3NpYmxlABVzZXRDb250ZXh0Q2xhc3NMb2FkZXIAC3RvQnl0ZUFycmF5AAR3cmFwAAV3cml0ZQADeG9yAAACAAAAFAAUAAIAAAALAAsAAQAAAAwAAAABAAAACQAAAAEAAAAUAAAAAQAAABMAAAABAAAAAgAAAAMAAAAUAAAAAAAAAAIAAAAVAAkAAhcpFwQAAAAAAAAAAAAAAAIAAAAAAAAAAAAAADwAAAATACAAIwAUACYAEAAAAGkAAgATASAAIxEUACYBGwAAAGkBAwAOAAAAAAMBACAAAACqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqgADAQAgAAAAu7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7sBAAEAAQAAAAAAAAAEAAAAcBAAAAAADgAKAAIAAAAAAAAAAABTAAAAEwAAASMAFAASARMHAAE1cQgAjRJPAgAB2AEBASj5IZISARIDEwcAATVxFwBIBAABlAUBAkgFCQWQAwMEkAMDBdQzAAFIBQADTwQAA08FAAHYAQEBKOohhCNFFAASARICEgM1QyEA2AEBAdQRAAFIBgABkAICBtQiAAFIBwACTwYAAk8HAAGQBgYH1GYAAUgGAAZIBwgDt2eNd08HBQPYAwMBKOARBQAABwACAAAAAAAAAAAAFgAAACFQIwEUACFiEgM1AxAAlAQDAkgEBgRIAAUDt0CNAE8AAQPYAwMBIVAo8REBDAACAAQAAQAAAAAAcwAAAG8gAQC6AG4QAwALAAwAYgEBAG4gBQAQAAwAIgEGAHAQDQABABMCABAjIhQAbiARACAACgMS9DJDBwASBG5ADwAhNCj1bhAQAAAAbhAOAAEADAATAUgAIQJxMBoAEAIMAGIBAgBxIAoAEAAMAGIBAwBxIAsAEAAMAHEQGQAAAAwBEhIjIhUAEgNNAQIDbhAEAAsADAMiAQUAcDAMACEDcQAUAAAADARuIBUAFABuEBMACwAMBRoGMABuIBIAZQAMBhIXbiAYAHYAbjAXALYBbyABALoADgANAG4QFgAAAG8gAQC6AA4AAAAAAAAAZwABAAEBCmsBAAEAAQAAAAAAAAAEAAAAbxACAAAADgAEAAQCABoBGgEaARoGiIAEkA8BgYAEmBADCrAQAQroEQgEpBIBAagUDgAAAAAAAAABAAAAAAAAAAEAAAA9AAAAcAAAAAIAAAAWAAAAZAEAAAMAAAASAAAAvAEAAAQAAAAEAAAAlAIAAAUAAAAbAAAAtAIAAAYAAAABAAAAjAMAAAIgAAA9AAAArAMAAAEQAAAJAAAANAcAAAUgAAABAAAAgAcAAAMQAAACAAAAiAcAAAEgAAAGAAAAkAcAAAAgAAABAAAAQAoAAAAQAAABAAAAaAoAAA=="
     )
-    _RC4_PH_OFFSET   = 2188   # 32 bytes of 0xAA
-    _XOR_PH_OFFSET   = 2228   # 32 bytes of 0xBB
-    _ASSET_PH_OFFSET = 999    # 31-char ASSET_PATH_PLACEHOLDER_XXXXXXXX
-    _ASSET_PH_LEN    = 32
-    _APP_PH_OFFSET   = 1712   # 49-char com.placeholder.app.Application_XXXX...
-    _APP_PH_LEN      = 48
+    _RC4_PH_OFFSET   = 2000   # 32 bytes of 0xAA
+    _XOR_PH_OFFSET   = 2040   # 32 bytes of 0xBB
+    _ASSET_PH_OFFSET = 971    # 31-char ASSET_PATH_PLACEHOLDER_XXXXXXXX
+    _ASSET_PH_LEN    = 31
+    _APP_PH_OFFSET   = 1578   # 49-char com.placeholder.app.Application_XXXX...
+    _APP_PH_LEN      = 49
 
     def _compile_smali_to_dex(self, smali_source: str) -> bytes:
         """
@@ -9831,16 +9707,6 @@ def run_flask():
 
 def is_admin(uid): return uid == ADMIN_ID
 
-def register_client(user):
-    if user.id not in registered_clients:
-        registered_clients[user.id] = {
-            "name":     user.full_name,
-            "username": user.username or "no_username",
-            "joined":   datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        _save_clients(registered_clients)
-
-
 # ── SESSION STATE — MANUAL CONTROL PANEL ─────────────────────────────────────
 pending_manual      = {}   # tracks admin session mode
 manual_apk_path     = {}   # uploaded APK path
@@ -9886,13 +9752,6 @@ def base_apk_kb():
         [InlineKeyboardButton("🔙 Back",             callback_data="back_admin")],
     ])
 
-def client_kb():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📁 Request APK",   callback_data="client_request_apk")],
-        [InlineKeyboardButton("📊 My APK Status", callback_data="client_apk_status")],
-        [InlineKeyboardButton("💬 Contact Admin", callback_data="client_contact")],
-    ])
-
 def back_a(): return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_admin")]])
 
 
@@ -9924,13 +9783,11 @@ def _build_quick_test_keyboard(selected: set, engine: "ManualControlEngine") -> 
     rows.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
 
     return InlineKeyboardMarkup(rows)
-def back_c(): return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_client")]])
 
 
 # ── START HANDLER ─────────────────────────────────────────────────────────────
 async def start(update, context):
     user = update.effective_user
-    register_client(user)
     if is_admin(user.id):
         await update.message.reply_text(
             f"👑 *Welcome back, Admin!*\n\n"
@@ -9938,13 +9795,6 @@ async def start(update, context):
             f"24-Step Android Protection Pipeline\n\n"
             f"Choose an action:",
             parse_mode="Markdown", reply_markup=admin_kb())
-    else:
-        await update.message.reply_text(
-            f"🛡️ *Welcome to EPIC PROTECTOR!*\n\n"
-            f"Hello {user.first_name}!\n\n"
-            f"Elite Android protection for hospitals, hotels, "
-            f"medical, pharma & data management.\n\nChoose an option:",
-            parse_mode="Markdown", reply_markup=client_kb())
 
 
 # ── SESSION STATE — MANUAL CONTROL PANEL ─────────────────────────────────────
@@ -9960,7 +9810,7 @@ async def start(update, context):
 
 
 # ── DELIVER PROTECTED APK HELPER ─────────────────────────────────────────────
-async def _deliver_protected_apk(update, context, status_msg, results, apk_name, client_id=None):
+async def _deliver_protected_apk(update, context, status_msg, results, apk_name):
     """Deliver final protected APK to admin after protection."""
     if results.get("SUCCESS"):
         job_history.append({
@@ -13860,32 +13710,6 @@ async def button_handler(update, context):
                 text="⚠️ No signed APK produced.",
                 reply_markup=back_a())
 
-    # ── CLIENT CALLBACKS ──────────────────────────────────────────────────────
-    elif data == "client_request_apk":
-        pending_contact[user.id] = "request_apk"
-        await query.edit_message_text(
-            "📁 *Request APK*\n\nType your request message and send it:",
-            parse_mode="Markdown", reply_markup=back_c())
-
-    elif data == "client_apk_status":
-        status = apk_status.get(user.id, "No APK processed yet.")
-        await query.edit_message_text(
-            f"📊 *Your APK Status*\n\n{status}",
-            parse_mode="Markdown", reply_markup=back_c())
-
-    elif data == "client_contact":
-        pending_contact[user.id] = "contact"
-        await query.edit_message_text(
-            "💬 *Contact Admin*\n\nType your message:",
-            parse_mode="Markdown", reply_markup=back_c())
-
-    elif data == "back_client":
-        pending_contact.pop(user.id, None)
-        await query.edit_message_text(
-            "🛡️ *EPIC PROTECTOR*\n\nChoose an option:",
-            parse_mode="Markdown", reply_markup=client_kb())
-
-
 
 # ── MESSAGE HANDLER ───────────────────────────────────────────────────────────
 async def message_handler(update, context):
@@ -13908,32 +13732,11 @@ async def message_handler(update, context):
                 ]))
         return
 
-    # ── Client: contact or request message ───────────────────────────────────
-    if not is_admin(user.id) and pending_contact.get(user.id):
-        mode = pending_contact.pop(user.id)
-        tag  = "📁 APK Request" if mode == "request_apk" else "💬 Client Message"
-        info = registered_clients.get(user.id, {})
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=f"{tag}\n\nFrom: {info.get('name','?')} (@{info.get('username','?')})\n"
-                     f"ID: `{user.id}`\n\nMessage:\n{text}",
-                parse_mode="Markdown")
-            await update.message.reply_text(
-                "✅ Message sent to admin.", reply_markup=client_kb())
-        except Exception as e:
-            await update.message.reply_text(f"❌ Failed: {e}", reply_markup=client_kb())
-        return
-
     # ── Default ───────────────────────────────────────────────────────────────
     if is_admin(user.id):
         await update.message.reply_text(
             "👑 *Admin Panel*\n\nChoose an action:",
             parse_mode="Markdown", reply_markup=admin_kb())
-    else:
-        await update.message.reply_text(
-            "🛡️ *EPIC PROTECTOR*\n\nChoose an option:",
-            parse_mode="Markdown", reply_markup=client_kb())
 
 
 # ── DOCUMENT HANDLER ──────────────────────────────────────────────────────────
@@ -14065,10 +13868,6 @@ async def document_handler(update, context):
         return
 
     # Protect APK now auto-loads from Base APK — no document upload needed
-
-    if not is_admin(user.id):
-        await update.message.reply_text(
-            "📎 Contact admin to receive files.", reply_markup=client_kb())
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
