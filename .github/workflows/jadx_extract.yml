@@ -1,0 +1,297 @@
+name: EPIC PROTECTOR — JADX Source Extraction
+
+# ── Trigger ───────────────────────────────────────────────────────────────────
+# Manual only — never runs automatically
+# Go to: GitHub repo → Actions → JADX Source Extraction → Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      apk_filename:
+        description: 'APK filename in repo root (default: base.apk)'
+        required: false
+        default: 'base.apk'
+      include_resources:
+        description: 'Include resources/layouts/XML (true/false)'
+        required: false
+        default: 'true'
+
+jobs:
+  extract-source:
+    name: Extract Java Source with JADX
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+
+      # ── Step 1: Checkout repo ───────────────────────────────────────────────
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ── Step 2: Verify APK exists ───────────────────────────────────────────
+      - name: Verify APK Exists
+        run: |
+          APK="${{ github.event.inputs.apk_filename }}"
+          if [ ! -f "$APK" ]; then
+            echo "❌ $APK not found in repo root"
+            echo "Place your APK in the repo root and push it first"
+            exit 1
+          fi
+          SIZE=$(du -sh "$APK" | cut -f1)
+          echo "✅ Found: $APK ($SIZE)"
+
+      # ── Step 3: Install Java ────────────────────────────────────────────────
+      - name: Install Java
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends default-jdk
+          java -version 2>&1 | head -1
+          echo "✅ Java ready"
+
+      # ── Step 4: Download JADX ───────────────────────────────────────────────
+      - name: Cache JADX
+        uses: actions/cache@v4
+        id: jadx-cache
+        with:
+          path: ${{ github.workspace }}/epic_tools/jadx
+          key: epic-tools-jadx-1.5.0-v1
+
+      - name: Download JADX
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/epic_tools"
+          JADX_DIR="$GITHUB_WORKSPACE/epic_tools/jadx"
+          JADX_BIN="$JADX_DIR/bin/jadx"
+
+          if [ ! -f "$JADX_BIN" ]; then
+            echo "📥 Downloading JADX v1.5.0..."
+            wget -q -O /tmp/jadx.zip \
+              "https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip"
+            unzip -q /tmp/jadx.zip -d "$JADX_DIR"
+            chmod +x "$JADX_BIN"
+            echo "✅ JADX downloaded and extracted"
+          else
+            echo "✅ JADX from cache"
+          fi
+
+          "$JADX_BIN" --version
+          echo "✅ JADX verified"
+
+      # ── Step 5: Run JADX extraction ─────────────────────────────────────────
+      - name: Extract Source Code with JADX
+        run: |
+          APK="${{ github.event.inputs.apk_filename }}"
+          JADX_BIN="$GITHUB_WORKSPACE/epic_tools/jadx/bin/jadx"
+          OUTPUT_DIR="$GITHUB_WORKSPACE/jadx_output"
+          INCLUDE_RES="${{ github.event.inputs.include_resources }}"
+
+          mkdir -p "$OUTPUT_DIR"
+
+          echo "🔍 Starting JADX extraction..."
+          echo "   Input:  $APK"
+          echo "   Output: $OUTPUT_DIR"
+          echo "   Resources: $INCLUDE_RES"
+          echo ""
+
+          # Build jadx command
+          JADX_ARGS=(
+            --output-dir "$OUTPUT_DIR"
+            --threads-count 4
+            --show-bad-code
+            --no-imports
+            --export-gradle
+          )
+
+          if [ "$INCLUDE_RES" = "true" ]; then
+            JADX_ARGS+=(--export-gradle)
+          fi
+
+          # Run JADX
+          "$JADX_BIN" "${JADX_ARGS[@]}" "$APK" 2>&1 | tee /tmp/jadx_log.txt
+
+          echo ""
+          echo "=== EXTRACTION SUMMARY ==="
+          echo "Output directory contents:"
+          find "$OUTPUT_DIR" -type f | wc -l | xargs -I{} echo "  Total files: {}"
+          find "$OUTPUT_DIR" -name "*.java" | wc -l | xargs -I{} echo "  Java files: {}"
+          find "$OUTPUT_DIR" -name "*.xml" | wc -l | xargs -I{} echo "  XML files: {}"
+          echo ""
+          echo "Top-level structure:"
+          ls -la "$OUTPUT_DIR"
+          echo "✅ Extraction complete"
+
+      # ── Step 6: Also run CFR for comparison ─────────────────────────────────
+      - name: Download CFR
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/epic_tools"
+          CFR_JAR="$GITHUB_WORKSPACE/epic_tools/cfr.jar"
+
+          if [ ! -f "$CFR_JAR" ]; then
+            echo "📥 Downloading CFR..."
+            wget -q -O "$CFR_JAR" \
+              "https://github.com/leibnitz27/cfr/releases/download/0.152/cfr-0.152.jar"
+            echo "✅ CFR downloaded"
+          fi
+          java -jar "$CFR_JAR" --version 2>&1 | head -2
+          echo "✅ CFR verified"
+
+      - name: Convert DEX to JAR for CFR
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/epic_tools"
+          D2J_DIR="$GITHUB_WORKSPACE/epic_tools/dex2jar"
+          APK="${{ github.event.inputs.apk_filename }}"
+
+          # Download dex2jar
+          if [ ! -d "$D2J_DIR" ]; then
+            echo "📥 Downloading dex2jar..."
+            wget -q -O /tmp/dex2jar.zip \
+              "https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip"
+            unzip -q /tmp/dex2jar.zip -d "$D2J_DIR"
+            chmod +x "$D2J_DIR"/dex-tools-v2.4/*.sh
+            echo "✅ dex2jar ready"
+          fi
+
+          # Convert APK to JAR
+          D2J_SCRIPT=$(find "$D2J_DIR" -name "d2j-dex2jar.sh" | head -1)
+          if [ -f "$D2J_SCRIPT" ]; then
+            "$D2J_SCRIPT" "$APK" -o "$GITHUB_WORKSPACE/classes.jar" 2>&1 || true
+            if [ -f "$GITHUB_WORKSPACE/classes.jar" ]; then
+              echo "✅ DEX converted to JAR: $(du -sh $GITHUB_WORKSPACE/classes.jar)"
+            else
+              echo "⚠️ JAR conversion failed — skipping CFR step"
+            fi
+          fi
+
+      - name: Extract Source with CFR
+        run: |
+          CFR_JAR="$GITHUB_WORKSPACE/epic_tools/cfr.jar"
+          JAR="$GITHUB_WORKSPACE/classes.jar"
+          CFR_OUTPUT="$GITHUB_WORKSPACE/cfr_output"
+
+          if [ ! -f "$JAR" ]; then
+            echo "⚠️ classes.jar not found — skipping CFR extraction"
+            mkdir -p "$CFR_OUTPUT"
+            echo "CFR extraction skipped — JAR conversion failed" > "$CFR_OUTPUT/SKIPPED.txt"
+            exit 0
+          fi
+
+          mkdir -p "$CFR_OUTPUT"
+          echo "🔍 Running CFR extraction..."
+
+          java -jar "$CFR_JAR" "$JAR" \
+            --outputdir "$CFR_OUTPUT" \
+            --silent true \
+            2>&1 | tail -5 || true
+
+          JAVA_COUNT=$(find "$CFR_OUTPUT" -name "*.java" 2>/dev/null | wc -l)
+          echo "✅ CFR extracted $JAVA_COUNT Java files"
+
+      # ── Step 7: Create extraction report ────────────────────────────────────
+      - name: Generate Extraction Report
+        run: |
+          APK="${{ github.event.inputs.apk_filename }}"
+          OUTPUT_DIR="$GITHUB_WORKSPACE/jadx_output"
+          CFR_OUTPUT="$GITHUB_WORKSPACE/cfr_output"
+          REPORT="$GITHUB_WORKSPACE/EXTRACTION_REPORT.txt"
+
+          {
+            echo "================================================"
+            echo "EPIC PROTECTOR — Source Extraction Report"
+            echo "================================================"
+            echo "Date:        $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "APK:         $APK"
+            echo "APK size:    $(du -sh $APK | cut -f1)"
+            echo ""
+            echo "=== JADX Results ==="
+            echo "Java files:  $(find $OUTPUT_DIR -name '*.java' 2>/dev/null | wc -l)"
+            echo "XML files:   $(find $OUTPUT_DIR -name '*.xml' 2>/dev/null | wc -l)"
+            echo "Total files: $(find $OUTPUT_DIR -type f 2>/dev/null | wc -l)"
+            echo ""
+            echo "=== CFR Results ==="
+            echo "Java files:  $(find $CFR_OUTPUT -name '*.java' 2>/dev/null | wc -l)"
+            echo ""
+            echo "=== Package Structure (JADX) ==="
+            find "$OUTPUT_DIR/sources" -type d 2>/dev/null | head -30 || echo "No sources dir"
+            echo ""
+            echo "=== JADX Extraction Log (last 20 lines) ==="
+            tail -20 /tmp/jadx_log.txt 2>/dev/null || echo "No log"
+            echo "================================================"
+          } > "$REPORT"
+
+          cat "$REPORT"
+
+      # ── Step 8: Package everything into zip ─────────────────────────────────
+      - name: Package Output
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          echo "📦 Creating output archives..."
+
+          # JADX output zip
+          if [ -d "jadx_output" ]; then
+            zip -r -q "source_jadx.zip" "jadx_output/"
+            echo "✅ source_jadx.zip: $(du -sh source_jadx.zip | cut -f1)"
+          fi
+
+          # CFR output zip
+          if [ -d "cfr_output" ] && [ "$(ls -A cfr_output)" ]; then
+            zip -r -q "source_cfr.zip" "cfr_output/"
+            echo "✅ source_cfr.zip: $(du -sh source_cfr.zip | cut -f1)"
+          fi
+
+          # JAR file (for JD-GUI if needed)
+          if [ -f "classes.jar" ]; then
+            echo "✅ classes.jar ready: $(du -sh classes.jar | cut -f1)"
+          fi
+
+          echo "✅ Packaging complete"
+
+      # ── Step 9: Upload all artifacts ────────────────────────────────────────
+      - name: Upload JADX Source
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-jadx-${{ github.run_number }}
+          path: source_jadx.zip
+          retention-days: 30
+
+      - name: Upload CFR Source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-cfr-${{ github.run_number }}
+          path: source_cfr.zip
+          retention-days: 30
+
+      - name: Upload JAR
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: classes-jar-${{ github.run_number }}
+          path: classes.jar
+          retention-days: 30
+
+      - name: Upload Extraction Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extraction-report-${{ github.run_number }}
+          path: EXTRACTION_REPORT.txt
+          retention-days: 30
+
+      # ── Step 10: Final summary ───────────────────────────────────────────────
+      - name: Final Summary
+        if: always()
+        run: |
+          echo ""
+          echo "================================================"
+          echo "✅ EXTRACTION COMPLETE"
+          echo "================================================"
+          echo ""
+          echo "Download your source code from GitHub Actions:"
+          echo "  Repo → Actions → This run → Artifacts"
+          echo ""
+          echo "Artifacts available:"
+          echo "  source-jadx-${{ github.run_number }}    ← Best quality Java source"
+          echo "  source-cfr-${{ github.run_number }}     ← CFR alternative output"
+          echo "  classes-jar-${{ github.run_number }}    ← JAR for JD-GUI viewing"
+          echo "  extraction-report-${{ github.run_number }} ← Summary report"
+          echo ""
+          echo "Recommended: Download source-jadx first"
+          echo "================================================"
