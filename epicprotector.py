@@ -11660,7 +11660,7 @@ class ManualControlEngine:
             "protection_score",
         ],
 
-        # Phase 6: Complete — all 22 steps + score
+        # Phase 6: Complete — all steps including SO Library DEX protection
         "phase_6_complete": [
             "preflight_validation",
             "strip_signature",
@@ -11680,6 +11680,8 @@ class ManualControlEngine:
             "resource_normalisation",
             "aes_key_management",
             "rebuild_apk",
+            "asset_compiler",          # Step 17 — SO Library Compiler: DEX → lib/ chunks
+            "dex_encryption",          # Step 18 — SO Library Encryption: second encode layer
             "integrity_manifest",
             "certificate_aging",
             "keystore_generation",
@@ -16130,6 +16132,11 @@ class BaseApkStorageEngine:
         """
         Save config.json locally and commit to GitHub repo.
         Returns (success: bool, message: str)
+
+        Local save is always attempted first.
+        GitHub commit is best-effort — if GH_PAT is missing or commit
+        fails, local save still counts as success so the admin gets
+        the confirmation message and the APK works for this session.
         """
         local_path = os.path.join(os.getcwd(), BASE_CONFIG)
         try:
@@ -16138,8 +16145,10 @@ class BaseApkStorageEngine:
         except Exception as e:
             return False, f"Local save failed: {e}"
 
+        # Local save succeeded — APK is usable this session regardless of GitHub
         if not GH_PAT:
-            return False, "GH_PAT secret not configured in GitHub Actions"
+            logger.warning("[BaseApkStorage] GH_PAT not set — config saved locally only (will not survive restart)")
+            return True, "Config saved locally. Note: GH_PAT not set — will not persist after restart."
 
         import urllib.request
         import base64
@@ -17283,6 +17292,8 @@ async def button_handler(update, context):
                         keystore_ctx=_kctx2,
                         completed_ops=_done2))
 
+                result["op"] = op_key  # needed so pre-update loop finds rebuild_apk result
+
                 if op_key == "decode_workspace" and result.get("workspace"):
                     current_workspace = result["workspace"]
                     manual_workspace[user.id] = current_workspace
@@ -17620,6 +17631,8 @@ async def button_handler(update, context):
                     rebuilt_apk_override=_apk3,
                     keystore_ctx=_kctx3,
                     completed_ops=_done3))
+
+            result["op"] = op_key  # needed so pre-update loop finds rebuild_apk result
 
             # Update state from results
             if op_key == "decode_workspace" and result.get("workspace"):
@@ -19277,6 +19290,8 @@ async def button_handler(update, context):
                     keystore_ctx=_kctx4,
                     completed_ops=_done4))
 
+            result["op"] = op_key  # needed so pre-update loop finds rebuild_apk result
+
             if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
                 current_apk = result["rebuilt_apk"]
             if op_key == "rebuild_apk" and result.get("workspace"):
@@ -19467,16 +19482,23 @@ async def document_handler(update, context):
 
                 safe_name = doc.file_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 safe_date = new_config['base_apk_uploaded'].replace("&", "&amp;")
+                gh_note = (
+                    "✅ Stored permanently in GitHub.\n"
+                    "Survives every restart and code push.\n"
+                    "You will never need to upload this again."
+                    if GH_PAT else
+                    "⚠️ GH_PAT not set — saved for this session only.\n"
+                    "Add GH_PAT secret in GitHub Actions to make it permanent."
+                )
                 await status_msg.edit_text(
-                    f"📦 <b>Base APK Saved Successfully!</b>\n\n"
+                    f"📦 <b>Base APK Uploaded Successfully!</b>\n\n"
                     f"━━━━━━━━━━━━━━━━━━━━━\n"
                     f"📄 Filename:  <code>{safe_name}</code>\n"
                     f"📏 Size:      <code>{size_mb:.2f} MB</code>\n"
                     f"📅 Saved:     <code>{safe_date}</code>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"✅ Stored permanently in GitHub.\n"
-                    f"Survives every restart and code push.\n"
-                    f"You will never need to upload this again.",
+                    f"{gh_note}\n\n"
+                    f"✅ Ready to protect. Use 🛡️ Protect APK to start.",
                     parse_mode="HTML", reply_markup=base_apk_kb())
             else:
                 safe_msg = str(msg).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
