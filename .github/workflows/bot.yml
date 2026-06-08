@@ -45,6 +45,7 @@ jobs:
             default-jdk \
             zipalign \
             apksigner \
+            libsmali-java \
             wget \
             unzip \
             curl
@@ -56,7 +57,7 @@ jobs:
           keytool -help > /dev/null 2>&1 && echo "✅ keytool ok" || { echo "❌ keytool missing"; exit 1; }
           zipalign -h > /dev/null 2>&1 && echo "✅ zipalign ok" || echo "⚠️ zipalign non-zero (normal)"
           apksigner version > /dev/null 2>&1 && echo "✅ apksigner ok" || echo "⚠️ apksigner non-zero (normal)"
-          echo "✅ Bootstrap DEX uses pure Python — no smali needed."
+          smali --version > /dev/null 2>&1 && echo "✅ smali assembler ok" || echo "⚠️ smali not available — template fallback will be used"
 
       - name: Install Python Dependencies
         run: |
@@ -133,11 +134,11 @@ jobs:
           echo "========== ALL ERRORS & WARNINGS =========="
           grep -n -E "ERROR|WARNING|WARN|error|exception|Exception|Traceback|Step [0-9]+.*FAIL|❌|✗" bot_log.txt || echo "No errors found in log"
 
-      - name: Show Asset Compiler & DEX Encryption Logs
+      - name: Show SO Library Compiler Logs
         if: always()
         run: |
-          echo "========== ASSET COMPILER + DEX ENC LOGS =========="
-          grep -n -E "AssetCompiler|DEXEncryption|Step 17|Step 18|bootstrap|manifest patch|BUNDLE|REAL_APP|class.*→|Loader|ResourceManager" bot_log.txt || echo "No matching lines"
+          echo "========== SO LIBRARY COMPILER + ENCRYPTION LOGS =========="
+          grep -n -E "SOLibraryCompiler|SOLibraryEncryption|NativeLoader|libcore\.so|lib/arm64|lib/armeabi|chunk|Step 17|Step 18|bootstrap|manifest patch" bot_log.txt || echo "No matching lines"
 
       - name: Upload Full Run Log
         if: always()
