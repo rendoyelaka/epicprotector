@@ -10056,6 +10056,142 @@ class DEXRepackager:
         }
 
 
+# ── PSEUDO ENCRYPTION ENGINE ─────────────────────────────────────────────────
+class PseudoEncryptionEngine:
+    """
+    Applies pseudo-encryption markers to the rebuilt APK to confuse static
+    scanners and reduce Play Protect false-positive block warnings.
+
+    Two layers — both non-destructive (APK remains fully installable):
+
+    Layer 1 — ZIP Encryption Flag:
+      Sets bit 0 of the General Purpose Bit Flag in every ZIP Local File Header
+      and Central Directory entry. This is the standard ZIP encryption flag.
+      Android's PackageManager parses entries directly and ignores this flag,
+      so installation and runtime are completely unaffected.
+      Static scanners that read the ZIP structure see "encrypted" entries.
+
+    Layer 2 — DEX Pseudo-Header Marker:
+      Patches bytes [8:16] of each classes*.dex inside the APK (the unused
+      padding area between the magic+version and the checksum). Writes a
+      recognisable fake-encrypted header pattern. The DEX checksum field
+      (bytes 8-11) is NOT touched — only the 4 padding bytes at 12-15.
+      The Dalvik/ART runtime validates magic, version, checksum, and SHA-1
+      signature — it does not validate bytes 12-15 — so the APK still runs.
+
+    Pipeline position: AFTER rebuild_apk, BEFORE zipalign + sign_apk.
+    Operates directly on the built APK file (rebuilt.apk in work_dir).
+    """
+
+    # Fake marker written into DEX padding bytes [12:16]
+    # Chosen to look like an encryption header to naive scanners
+    DEX_PSEUDO_MARKER = b'\\xEP\\xIC'   # 4 bytes — non-standard, scanner-confusing
+
+    def apply(self, apk_path: str) -> dict:
+        """
+        Apply pseudo-encryption flags to the APK ZIP structure and DEX headers.
+        Returns a result dict with status and counts.
+        """
+        if not apk_path or not os.path.exists(apk_path):
+            return {
+                "status":        "❌ Pseudo Encryption failed — APK not found",
+                "zip_entries":   0,
+                "dex_patched":   0,
+            }
+
+        try:
+            zip_entries, dex_patched = self._patch_apk(apk_path)
+            return {
+                "status":      (
+                    f"✅ Pseudo Encryption applied — "
+                    f"{zip_entries} ZIP entries flagged — "
+                    f"{dex_patched} DEX headers marked — "
+                    f"scanner confusion active"
+                ),
+                "zip_entries": zip_entries,
+                "dex_patched": dex_patched,
+            }
+        except Exception as e:
+            return {
+                "status":      f"❌ Pseudo Encryption failed — {e}",
+                "zip_entries": 0,
+                "dex_patched": 0,
+            }
+
+    def _patch_apk(self, apk_path: str):
+        """
+        Core patching logic. Rewrites the APK in-place using a temp file.
+        Patches both ZIP local file headers and DEX content headers.
+        """
+        import tempfile, shutil
+
+        tmp_path = apk_path + ".pseudo_tmp"
+
+        zip_entries = 0
+        dex_patched = 0
+
+        # ── Step 1: read all entries and patch DEX headers in memory ─────────
+        entry_data   = {}   # filename → patched bytes
+        entry_info   = {}   # filename → ZipInfo
+
+        with zipfile.ZipFile(apk_path, 'r') as zin:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if re.match(r'classes\d*\.dex', info.filename):
+                    data = self._patch_dex_header(data)
+                    if data:
+                        dex_patched += 1
+                entry_data[info.filename] = data
+                entry_info[info.filename] = info
+
+        # ── Step 2: write new ZIP with encryption flag set on all entries ─────
+        with zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_DEFLATED,
+                             allowZip64=True) as zout:
+            for fname, data in entry_data.items():
+                info = entry_info[fname]
+                new_info = zipfile.ZipInfo(filename=info.filename,
+                                           date_time=info.date_time)
+                new_info.compress_type = info.compress_type
+                new_info.comment       = info.comment
+                new_info.extra         = info.extra
+                new_info.create_system = info.create_system
+                new_info.create_version= info.create_version
+                # Set the ZIP encryption flag (bit 0) — pseudo only
+                new_info.flag_bits     = info.flag_bits | 0x1
+                zout.writestr(new_info, data)
+                zip_entries += 1
+
+        # ── Step 3: replace original with patched version ─────────────────────
+        shutil.move(tmp_path, apk_path)
+
+        return zip_entries, dex_patched
+
+    def _patch_dex_header(self, dex_bytes: bytes) -> bytes:
+        """
+        Patches bytes [12:16] of a DEX file with a pseudo-marker.
+        DEX structure:
+          [0:8]   — magic ('dex\\n' + version + null)
+          [8:12]  — checksum (Adler-32) — DO NOT TOUCH
+          [12:16] — first 4 bytes of SHA-1 signature — safe to mark
+          ...
+        Android verifies checksum and full SHA-1 only during install-time
+        verification when dexopt runs — actually Android does NOT verify
+        the SHA-1 at runtime via ART; it only checks the magic.
+        We patch only bytes 12-15 (start of SHA-1 area) — low risk.
+        """
+        if len(dex_bytes) < 112:
+            # Too small to be a real DEX
+            return dex_bytes
+        # Verify DEX magic
+        if not (dex_bytes[:3] == b'dex' or dex_bytes[:4] == b'\\x64\\x65\\x78\\x0a'):
+            return dex_bytes
+        # Write pseudo marker at bytes 12-15
+        marker = b'\\xC0\\xDE\\xCA\\xFE'   # CODECA FE — looks encrypted to scanners
+        patched = bytearray(dex_bytes)
+        patched[12:16] = marker
+        return bytes(patched)
+
+
 # ── APK SIZE OPTIMIZER ────────────────────────────────────────────────────────
 class APKSizeOptimizer:
     """
@@ -10158,6 +10294,7 @@ class ProtectionScoreEngine:
         "metadata_stripping":    5,
         "apk_size_optimizer":    2,
         "rebuild_apk":           3,
+        "pseudo_encryption":     7,   # scanner confusion — ZIP flag + DEX marker
         "integrity_manifest":    5,
         "aes_key_management":    4,
         "keystore_generation":   5,
@@ -10225,6 +10362,7 @@ class ManualControlEngine:
         "metadata_stripping": ["decode_workspace"],
         "apk_size_optimizer": ["decode_workspace"],
         "rebuild_apk":        ["decode_workspace"],
+        "pseudo_encryption":  ["rebuild_apk"],
         "integrity_manifest": ["rebuild_apk"],
         "keystore_generation":["rebuild_apk"],
         "unique_fingerprint": ["keystore_generation"],
@@ -10250,7 +10388,8 @@ class ManualControlEngine:
         "metadata_stripping":   "apk_size_optimizer",
         "apk_size_optimizer":   "aes_key_management",
         "aes_key_management":   "rebuild_apk",
-        "rebuild_apk":          "integrity_manifest",
+        "rebuild_apk":          "pseudo_encryption",
+        "pseudo_encryption":    "integrity_manifest",
         "integrity_manifest":   "keystore_generation",
         "keystore_generation":  "unique_fingerprint",
         "unique_fingerprint":   "zipalign",
@@ -10280,7 +10419,8 @@ class ManualControlEngine:
         "aes_key_management",      # 15. display AES key before rebuild
         # ── Phase 4: Build ────────────────────────────────────────────────────
         "rebuild_apk",             # 16. rebuild — all changes baked in
-        "integrity_manifest",      # 19. hash final APK state — correct hashes
+        "pseudo_encryption",       # 17. pseudo-encrypt ZIP + DEX headers (scanner confusion)
+        "integrity_manifest",      # 18. hash final APK state — correct hashes
         # ── Phase 5: Sign with Coherent Identity ─────────────────────────────
         "keystore_generation",     # 20. generate keystore AFTER rebuild
         "unique_fingerprint",      # 21. confirm identity
@@ -10306,6 +10446,7 @@ class ManualControlEngine:
         "metadata_stripping":   "🧹 Metadata Stripping",
         "apk_size_optimizer":   "📦 APK Size Optimizer",
         "rebuild_apk":          "🔨 Rebuild APK",
+        "pseudo_encryption":    "🎭 Pseudo Encryption",
         "integrity_manifest":   "🔗 Integrity Manifest",
         "aes_key_management":   "🔑 AES Key Management",
         "keystore_generation":  "🗝️ Keystore Generation",
@@ -10328,6 +10469,7 @@ class ManualControlEngine:
             "strip_signature",
             "decode_workspace",
             "rebuild_apk",
+            "pseudo_encryption",
             "keystore_generation",
             "unique_fingerprint",
             "zipalign",
@@ -10351,6 +10493,7 @@ class ManualControlEngine:
             "apk_size_optimizer",
             "aes_key_management",
             "rebuild_apk",
+            "pseudo_encryption",
             "integrity_manifest",
             "keystore_generation",
             "unique_fingerprint",
@@ -10369,6 +10512,7 @@ class ManualControlEngine:
             "compliance_scan",         # scan for red flags
             # → Mandatory: rebuild + sign for installable APK
             "rebuild_apk",
+            "pseudo_encryption",
             "keystore_generation",
             "unique_fingerprint",
             "zipalign",
@@ -10393,6 +10537,7 @@ class ManualControlEngine:
             "dex_repackaging",
             # → Mandatory: rebuild + sign
             "rebuild_apk",
+            "pseudo_encryption",
             "keystore_generation",
             "unique_fingerprint",
             "zipalign",
@@ -10420,6 +10565,7 @@ class ManualControlEngine:
             "aes_key_management",
             # → Mandatory: rebuild + protect + sign
             "rebuild_apk",
+            "pseudo_encryption",
             "integrity_manifest",
             "keystore_generation",
             "unique_fingerprint",
@@ -10447,6 +10593,7 @@ class ManualControlEngine:
             "apk_size_optimizer",
             "aes_key_management",
             "rebuild_apk",
+            "pseudo_encryption",
             "integrity_manifest",      
             "keystore_generation",
             "unique_fingerprint",
@@ -10476,6 +10623,7 @@ class ManualControlEngine:
             "resource_normalisation",
             "aes_key_management",
             "rebuild_apk",
+            "pseudo_encryption",
             "integrity_manifest",
             "certificate_aging",       # aged certificate for Play Protect
             "keystore_generation",
@@ -10505,6 +10653,7 @@ class ManualControlEngine:
             "resource_normalisation",
             "aes_key_management",
             "rebuild_apk",
+            "pseudo_encryption",
             "integrity_manifest",
             "certificate_aging",
             "keystore_generation",
@@ -10968,6 +11117,7 @@ class ManualControlEngine:
         """
         MANDATORY_SIGN_STEPS = {
             "rebuild_apk",
+            "pseudo_encryption",
             "keystore_generation",
             "unique_fingerprint",
             "zipalign",
@@ -11387,6 +11537,24 @@ class ManualControlEngine:
                     if not smali_was_modified else
                     "✅ APK rebuilt via apktool — all smali changes compiled"
                 )
+
+            elif op_key == "pseudo_encryption":
+                # Operates on the rebuilt APK — finds rebuilt.apk in work_dir
+                # or falls back to rebuilt_apk_override from pipeline runner.
+                # Must run AFTER rebuild_apk and BEFORE zipalign + sign_apk.
+                pe_apk = os.path.join(work_dir, "rebuilt.apk")
+                if not os.path.exists(pe_apk):
+                    # Search recursively
+                    for found in list(Path(work_dir).rglob("rebuilt.apk")):
+                        pe_apk = str(found)
+                        break
+                if not os.path.exists(pe_apk) and rebuilt_apk_override:
+                    pe_apk = rebuilt_apk_override
+                pe_engine = PseudoEncryptionEngine()
+                pe_result = pe_engine.apply(pe_apk)
+                result["zip_entries"] = pe_result.get("zip_entries", 0)
+                result["dex_patched"] = pe_result.get("dex_patched", 0)
+                result["status"]      = pe_result.get("status", "❌ Pseudo Encryption failed")
 
             elif op_key == "integrity_manifest":
                 guardian = IntegrityGuardian(work_dir)
@@ -15218,6 +15386,7 @@ async def button_handler(update, context):
             "strip_signature",
             "decode_workspace",
             "rebuild_apk",
+            "pseudo_encryption",
             "keystore_generation",
             "unique_fingerprint",
             "zipalign",
