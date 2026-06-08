@@ -7231,6 +7231,10 @@ class ManualControlEngine:
                 result["asset_compiler_ok"] = asset_ok
                 if keystore_ctx is not None:
                     keystore_ctx["asset_compiler_ok"] = asset_ok
+                    # Store asset_path so dex_encryption guard works across ALL runners
+                    # and separate batches — line 7270 checks keystore_ctx.get("asset_path")
+                    if asset_ok and r.get("asset_path"):
+                        keystore_ctx["asset_path"] = r["asset_path"]
 
             elif op_key == "dex_encryption":
                 # DEX Encoding runs on the rebuilt APK — not on the workspace.
