@@ -16644,9 +16644,20 @@ async def button_handler(update, context):
                   pending_base_apk, smali_tree_workspace, smali_tree_path,
                   smali_selected_files, smali_scan_results]:
             d.pop(user.id, None)
-        await query.edit_message_text(
-            "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
-            parse_mode="Markdown", reply_markup=admin_kb())
+        # Try edit first (text msgs) — fallback send+delete for document msgs
+        try:
+            await query.edit_message_text(
+                "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
+                parse_mode="Markdown", reply_markup=admin_kb())
+        except Exception:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(
+                chat_id=user.id,
+                text="👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
+                parse_mode="Markdown", reply_markup=admin_kb())
         return
 
     # ── BACK TO SESSION CHECKLIST (from smali tree) ───────────────────────────
@@ -16680,17 +16691,31 @@ async def button_handler(update, context):
         }
         quick_test_selected[user.id] = default
 
-        count = len(default)
-        await query.edit_message_text(
+        count  = len(default)
+        qt_text = (
             f"🧪 *Quick Test Panel*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"📦 `{apk_name}`\n\n"
             f"Tap any step to toggle ON ☑️ / OFF ☐\n"
             f"Then tap *▶️ Proceed & Get APK*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"✅ *{count} steps selected*",
-            parse_mode="Markdown",
-            reply_markup=_build_quick_test_keyboard(default, engine))
+            f"✅ *{count} steps selected*"
+        )
+        qt_kb = _build_quick_test_keyboard(default, engine)
+        # Try edit first (text msgs) — fallback send+delete for document msgs
+        try:
+            await query.edit_message_text(
+                qt_text, parse_mode="Markdown", reply_markup=qt_kb)
+        except Exception:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=qt_text,
+                parse_mode="Markdown",
+                reply_markup=qt_kb)
 
     # ── QUICK TEST PANEL — TOGGLE STEP ────────────────────────────────────────
     elif data.startswith("qt_toggle_"):
