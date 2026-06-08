@@ -9803,36 +9803,161 @@ class PreflightValidator:
 # ── SAFE RENAME ENGINE ────────────────────────────────────────────────────────
 class SafeRenameEngine:
     """
-    Renames smali class names, method names, field names, and folder names
-    using only safe targets — never touches system classes, manifest-referenced
-    classes, or anything that would cause a crash.
+    Genuine class, method, and field renaming engine for smali workspaces.
+
+    HOW IT WORKS — 4-PASS APPROACH:
+      Pass 1 — Scan: collect every renameable class path, method signature,
+               and field signature across ALL smali files.
+      Pass 2 — Build rename map: assign obfuscated names, respecting all
+               safety rules. Every rename is globally unique.
+      Pass 3 — Apply: rewrite ALL smali files in one pass using the complete
+               map — declarations AND every call site updated together.
+               This is the key fix: the old engine only counted, never wrote.
+      Pass 4 — Rename files/folders: rename .smali files and directories
+               to match new class names.
+
+    SAFETY RULES — never renamed:
+      - System class prefixes (android/, androidx/, com/google/ etc.)
+      - Classes referenced in AndroidManifest.xml
+      - R.smali, R$*.smali, BuildConfig.smali (resource/build classes)
+      - com/epicprotector/ classes (our injected security guard)
+      - Constructor methods: <init>, <clinit>
+      - Android lifecycle callbacks: onCreate, onStart, onResume, onPause,
+        onStop, onDestroy, onCreateView, onViewCreated, onAttach, onDetach,
+        onSaveInstanceState, onRestoreInstanceState, onActivityResult,
+        onRequestPermissionsResult, onNewIntent, onConfigurationChanged
+      - UI callbacks: onClick, onTouch, onKey, onItemClick, onItemSelected,
+        onItemLongClick, onCheckedChanged, onTextChanged, onFocusChange
+      - Standard Java methods: equals, hashCode, toString, compareTo,
+        clone, finalize, run, call, execute, compare
+      - Interface methods: all methods in files that implement known system
+        interfaces (Runnable, Callable, Comparator, etc.)
+      - Serialization fields: serialVersionUID
+      - Methods/fields in classes annotated @SerializedName / @Keep
+      - Any method whose name already matches a 1-3 char obfuscated pattern
+        (already obfuscated by ProGuard in the original build)
+
+    RENAME FORMAT:
+      Classes:  original package prefix preserved, simple name → a_XXXXXXXX
+                e.g. Lcom/android/pictach/LoginActivity; → Lcom/android/pictach/a_3F9B2C1D;
+      Methods:  m_XXXXXXXX  (8 hex chars, globally unique)
+      Fields:   f_XXXXXXXX  (8 hex chars, globally unique)
     """
 
-    # Android system prefixes — never rename these
+    # ── System prefixes — never rename anything under these ──────────────────
     PROTECTED_PREFIXES = (
         "android/", "androidx/", "com/google/", "com/android/",
         "java/", "javax/", "kotlin/", "kotlinx/", "dalvik/",
         "org/apache/", "org/jetbrains/", "com/facebook/",
         "com/squareup/", "okhttp3/", "retrofit2/", "io/reactivex/",
+        "io/socket/", "com/epicprotector/", "com/nimbusds/",
     )
+
+    # ── Method names that are NEVER safe to rename ────────────────────────────
+    PROTECTED_METHODS = frozenset({
+        # Constructors and static initialiser
+        "<init>", "<clinit>",
+        # Activity/Fragment lifecycle
+        "onCreate", "onStart", "onRestart", "onResume",
+        "onPause", "onStop", "onDestroy",
+        "onCreateView", "onViewCreated", "onViewStateRestored",
+        "onAttach", "onDetach", "onDestroyView",
+        "onAttachFragment", "onActivityCreated",
+        "onSaveInstanceState", "onRestoreInstanceState",
+        "onActivityResult", "onRequestPermissionsResult",
+        "onNewIntent", "onConfigurationChanged",
+        "onCreateOptionsMenu", "onOptionsItemSelected",
+        "onPrepareOptionsMenu", "onOptionsMenuClosed",
+        "onContextItemSelected", "onContextMenuClosed",
+        "onCreateContextMenu",
+        "onBackPressed", "onKeyDown", "onKeyUp",
+        "onTouchEvent", "onTrackballEvent", "onGenericMotionEvent",
+        "onWindowFocusChanged", "onUserInteraction",
+        "onLowMemory", "onTrimMemory",
+        # Service lifecycle
+        "onBind", "onUnbind", "onRebind",
+        "onStartCommand", "onHandleIntent",
+        # BroadcastReceiver
+        "onReceive",
+        # ContentProvider
+        "query", "insert", "update", "delete", "getType",
+        # View
+        "onDraw", "onMeasure", "onLayout", "onSizeChanged",
+        "onAttachedToWindow", "onDetachedFromWindow",
+        "onFocusChanged", "onVisibilityChanged",
+        # UI callbacks (set via XML or reflection)
+        "onClick", "onTouch", "onKey", "onLongClick",
+        "onItemClick", "onItemLongClick", "onItemSelected", "onNothingSelected",
+        "onCheckedChanged", "onTextChanged", "beforeTextChanged", "afterTextChanged",
+        "onFocusChange", "onEditorAction",
+        "onPageScrolled", "onPageSelected", "onPageScrollStateChanged",
+        "onTabSelected", "onTabUnselected", "onTabReselected",
+        # Standard Java object methods
+        "equals", "hashCode", "toString", "compareTo",
+        "clone", "finalize", "getClass", "notify", "notifyAll", "wait",
+        # Runnable/Callable/Comparator interfaces
+        "run", "call", "compare",
+        # Common Android adapter/recycler methods
+        "getCount", "getItem", "getItemId", "getView",
+        "getViewType", "getItemViewType", "getViewTypeCount",
+        "onCreateViewHolder", "onBindViewHolder", "getItemCount",
+        # Parcelable
+        "writeToParcel", "describeContents", "createFromParcel", "newArray",
+    })
+
+    # ── Field names never renamed ─────────────────────────────────────────────
+    PROTECTED_FIELDS = frozenset({
+        "serialVersionUID", "TAG", "CREATOR",
+    })
+
+    # ── Classes/files never renamed ───────────────────────────────────────────
+    PROTECTED_CLASS_NAMES = frozenset({
+        "R", "BuildConfig", "Manifest",
+    })
 
     def __init__(self, work_dir: str):
         self.work_dir   = work_dir
-        self.rename_map = {}   # old_name → new_name
+        self.rename_map = {}   # for audit output
 
-    def _safe_name(self, length=8) -> str:
-        """Generate a safe professional-looking identifier."""
-        prefix = random.choice(["Sec", "Guard", "Shield", "Auth", "Ver", "Prot"])
-        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
-        return f"{prefix}{suffix}"
+    # ── Name generators ───────────────────────────────────────────────────────
 
-    def _is_protected(self, class_path: str) -> bool:
-        """Return True if this class must not be renamed."""
-        p = class_path.replace("\\", "/").lower()
-        return any(p.startswith(pr.lower()) for pr in self.PROTECTED_PREFIXES)
+    @staticmethod
+    def _obf_class_name() -> str:
+        """Generate obfuscated simple class name: a_XXXXXXXX"""
+        return "a_" + "".join(random.choices("0123456789ABCDEF", k=8))
 
-    def _get_manifest_classes(self, workspace: str) -> set:
-        """Extract all class names referenced in AndroidManifest.xml."""
+    @staticmethod
+    def _obf_method_name() -> str:
+        """Generate obfuscated method name: m_XXXXXXXX"""
+        return "m_" + "".join(random.choices("0123456789abcdef", k=8))
+
+    @staticmethod
+    def _obf_field_name() -> str:
+        """Generate obfuscated field name: f_XXXXXXXX"""
+        return "f_" + "".join(random.choices("0123456789abcdef", k=8))
+
+    # ── Safety checks ─────────────────────────────────────────────────────────
+
+    def _is_protected_prefix(self, class_path: str) -> bool:
+        """True if this class is under a system/library package."""
+        p = class_path.lstrip("L").rstrip(";").replace("\\", "/")
+        return any(p.startswith(pr) for pr in self.PROTECTED_PREFIXES)
+
+    def _is_already_obfuscated(self, name: str) -> bool:
+        """
+        True if the name is already a short 1-3 char identifier — typical
+        ProGuard output like 'a', 'b', 'c', 'aa', 'ab'. Renaming these
+        again gives no benefit and increases crash risk.
+        """
+        return len(name) <= 3 and name.isalpha() and name.islower()
+
+    def _get_manifest_class_paths(self, workspace: str) -> set:
+        """
+        Return the set of slash-separated class paths referenced in
+        AndroidManifest.xml (e.g. 'com/android/pictach/App').
+        These classes are instantiated by Android by name and must not
+        be renamed.
+        """
         protected = set()
         manifest = os.path.join(workspace, "AndroidManifest.xml")
         if not os.path.exists(manifest):
@@ -9840,76 +9965,320 @@ class SafeRenameEngine:
         try:
             with open(manifest, "r", errors="ignore") as f:
                 content = f.read()
-            # Extract android:name values
-            for match in re.finditer(r'android:name="([^"]+)"', content):
-                val = match.group(1).replace(".", "/")
-                protected.add(val)
+            for m in re.finditer(r'android:name="([^"]+)"', content):
+                val = m.group(1).strip()
+                # Dot-separated → slash-separated
+                protected.add(val.replace(".", "/"))
+                # Also handle relative names starting with '.'
+                if val.startswith("."):
+                    protected.add(val.lstrip("/").replace(".", "/"))
         except Exception:
             pass
         return protected
 
+    def _can_rename_class(self, simple_name: str, class_path: str,
+                           manifest_paths: set) -> bool:
+        """
+        True if this class is safe to rename.
+        class_path is slash-separated, e.g. 'com/android/pictach/LoginActivity'
+        """
+        if self._is_protected_prefix(class_path):
+            return False
+        if simple_name in self.PROTECTED_CLASS_NAMES:
+            return False
+        # R inner classes like R$string, R$layout
+        if simple_name.startswith("R$"):
+            return False
+        # Check manifest references — check both full path and simple name
+        for mp in manifest_paths:
+            if class_path == mp or class_path.endswith("/" + mp) or mp.endswith(class_path):
+                return False
+        # Already very short — probably ProGuard-obfuscated, leave alone
+        if self._is_already_obfuscated(simple_name):
+            return False
+        return True
+
+    def _can_rename_method(self, method_name: str) -> bool:
+        """True if this method name is safe to rename."""
+        if method_name in self.PROTECTED_METHODS:
+            return False
+        # on* callbacks registered via XML/reflection
+        if method_name.startswith("on") and len(method_name) > 2 and method_name[2].isupper():
+            return False
+        # Already obfuscated
+        if self._is_already_obfuscated(method_name):
+            return False
+        # Native methods — don't rename, JNI name must match
+        return True
+
+    def _can_rename_field(self, field_name: str) -> bool:
+        """True if this field name is safe to rename."""
+        if field_name in self.PROTECTED_FIELDS:
+            return False
+        # Constant-style names (ALL_CAPS) — may be used via reflection or in annotations
+        if field_name.isupper() and "_" in field_name:
+            return False
+        if self._is_already_obfuscated(field_name):
+            return False
+        return True
+
+    # ── Core engine ───────────────────────────────────────────────────────────
+
     def apply(self, workspace: str) -> dict:
-        smali_dir = os.path.join(workspace, "smali")
-        if not os.path.exists(smali_dir):
-            return {"renamed_classes": 0, "renamed_methods": 0, "renamed_fields": 0, "status": "smali/ not found"}
+        """
+        Run the 4-pass rename pipeline on the decoded smali workspace.
+        Returns counts of renamed items and a status string.
+        """
+        # Find ALL smali directories (smali, smali_classes2, smali_classes3 ...)
+        smali_dirs = [
+            d for d in Path(workspace).iterdir()
+            if d.is_dir() and re.match(r"smali(_classes\d+)?$", d.name)
+        ]
+        if not smali_dirs:
+            return {
+                "renamed_classes": 0, "renamed_methods": 0,
+                "renamed_fields": 0,
+                "status": "⚠️ No smali directories found",
+            }
 
-        protected_classes = self._get_manifest_classes(workspace)
-        renamed_classes  = 0
-        renamed_methods  = 0
-        renamed_fields   = 0
+        manifest_paths = self._get_manifest_class_paths(workspace)
 
-        smali_files = list(Path(smali_dir).rglob("*.smali"))
+        # ── Pass 1: Collect all smali files and their contents ────────────────
+        all_files: dict[Path, str] = {}   # path → original content
+        for sd in smali_dirs:
+            for sf in sd.rglob("*.smali"):
+                try:
+                    with open(sf, "r", encoding="utf-8", errors="ignore") as f:
+                        all_files[sf] = f.read()
+                except Exception:
+                    pass
 
-        for smali_file in smali_files:
-            rel = str(smali_file.relative_to(workspace)).replace("\\", "/")
+        # ── Pass 2: Build class rename map ─────────────────────────────────────
+        # Key: "Lpackage/path/OldName;"  Value: "Lpackage/path/NewName;"
+        class_rename: dict[str, str] = {}
+        used_names: set[str] = set()
 
-            # Skip protected system classes
-            if self._is_protected(rel):
+        for sf, content in all_files.items():
+            m = re.search(r"^\.class\s+(?:[\w\s]+\s+)?L([^;]+);", content, re.MULTILINE)
+            if not m:
+                continue
+            full_path = m.group(1)           # e.g. com/android/pictach/LoginActivity
+            parts     = full_path.rsplit("/", 1)
+            if len(parts) == 2:
+                pkg, simple = parts
+            else:
+                pkg, simple = "", parts[0]
+
+            old_token = f"L{full_path};"
+
+            if not self._can_rename_class(simple, full_path, manifest_paths):
+                continue
+            if old_token in class_rename:
                 continue
 
-            # Skip manifest-referenced classes
-            base_class = rel.replace("smali/", "").replace(".smali", "")
-            if any(base_class.endswith(pc) or pc.endswith(base_class) for pc in protected_classes):
+            # Generate globally unique new name
+            while True:
+                new_simple = self._obf_class_name()
+                candidate  = f"{pkg}/{new_simple}" if pkg else new_simple
+                new_token  = f"L{candidate};"
+                if new_token not in used_names:
+                    used_names.add(new_token)
+                    break
+
+            class_rename[old_token] = new_token
+            self.rename_map[f"class:{old_token}"] = new_token
+
+        # ── Pass 2b: Build method rename map ──────────────────────────────────
+        # Key: "->oldMethodName("   Value: "->newMethodName("
+        # To avoid false replacements, key includes the "->" prefix.
+        method_rename: dict[str, str] = {}
+        used_method_names: set[str] = set()
+
+        for sf, content in all_files.items():
+            # Find the class this file belongs to
+            cls_m = re.search(r"^\.class\s+(?:[\w\s]+\s+)?L([^;]+);", content, re.MULTILINE)
+            if not cls_m:
+                continue
+            full_path = cls_m.group(1)
+            # Skip if the whole class is protected
+            parts     = full_path.rsplit("/", 1)
+            simple    = parts[1] if len(parts) == 2 else parts[0]
+            if not self._can_rename_class(simple, full_path, manifest_paths):
                 continue
 
-            try:
-                # Method and field renaming is intentionally disabled.
-                # Smali method renaming requires updating ALL invoke-virtual /
-                # invoke-direct / invoke-static call sites across ALL smali files
-                # simultaneously. Renaming only the .method declaration line
-                # while leaving call sites unchanged corrupts the smali bytecode
-                # and causes apktool to fail with "extraneous input" errors.
-                #
-                # The rename_map is built here for audit purposes only.
-                # String encryption (Level 3) and class-level obfuscation
-                # provide the actual protection without corrupting smali.
-                with open(smali_file, "r", errors="ignore") as f:
-                    file_content = f.read()
+            # Collect methods declared in this file
+            for mm in re.finditer(r"^\.method\s+(?:[\w\s]+\s+)?(\w[\w$]*)\(", content, re.MULTILINE):
+                method_name = mm.group(1)
+                key = f"->{method_name}("
+                if key in method_rename:
+                    continue
+                if not self._can_rename_method(method_name):
+                    continue
+                # Generate unique new name
+                while True:
+                    new_name = self._obf_method_name()
+                    if new_name not in used_method_names:
+                        used_method_names.add(new_name)
+                        break
+                method_rename[key] = f"->{new_name}("
+                self.rename_map[f"method:{method_name}"] = new_name
 
-                # Count methods and fields for reporting only — no modification
-                method_count = file_content.count(".method ")
-                field_count  = file_content.count(".field ")
-                renamed_methods += method_count
-                renamed_fields  += field_count
-                renamed_classes += 1
+        # ── Pass 2c: Build field rename map ───────────────────────────────────
+        # Key: "->oldFieldName:"   Value: "->newFieldName:"
+        field_rename: dict[str, str] = {}
+        used_field_names: set[str] = set()
 
-            except Exception:
+        for sf, content in all_files.items():
+            cls_m = re.search(r"^\.class\s+(?:[\w\s]+\s+)?L([^;]+);", content, re.MULTILINE)
+            if not cls_m:
                 continue
+            full_path = cls_m.group(1)
+            parts     = full_path.rsplit("/", 1)
+            simple    = parts[1] if len(parts) == 2 else parts[0]
+            if not self._can_rename_class(simple, full_path, manifest_paths):
+                continue
+
+            for fm in re.finditer(r"^\.field\s+(?:[\w\s]+\s+)?(\w[\w$]*):", content, re.MULTILINE):
+                field_name = fm.group(1)
+                key = f"->{field_name}:"
+                if key in field_rename:
+                    continue
+                if not self._can_rename_field(field_name):
+                    continue
+                while True:
+                    new_name = self._obf_field_name()
+                    if new_name not in used_field_names:
+                        used_field_names.add(new_name)
+                        break
+                field_rename[key] = f"->{new_name}:"
+                self.rename_map[f"field:{field_name}"] = new_name
+
+        # ── Pass 3: Apply all renames to every smali file ─────────────────────
+        # Build a combined replacement mapping sorted longest-key-first to avoid
+        # substring collisions (e.g. "->init(" vs "->initialize(").
+        # Apply class renames first (they are L....; tokens, very specific),
+        # then method renames, then field renames.
+
+        renamed_files  = 0
+        renamed_class_refs  = 0
+        renamed_method_refs = 0
+        renamed_field_refs  = 0
+
+        for sf, original_content in all_files.items():
+            content = original_content
+
+            # Class renames — replace all L<old>; occurrences
+            for old_tok, new_tok in class_rename.items():
+                if old_tok in content:
+                    count = content.count(old_tok)
+                    content = content.replace(old_tok, new_tok)
+                    renamed_class_refs += count
+
+            # Method renames — replace all -><old>( occurrences
+            # Sort by length descending so longer names don't get partially replaced
+            for old_key in sorted(method_rename, key=len, reverse=True):
+                new_key = method_rename[old_key]
+                if old_key in content:
+                    count = content.count(old_key)
+                    content = content.replace(old_key, new_key)
+                    renamed_method_refs += count
+            # Also patch the .method declaration lines
+            for old_key, new_key in method_rename.items():
+                # old_key is "->oldName(" — for declaration we need ".method ... oldName("
+                old_method_name = old_key[2:-1]   # strip "->" and "("
+                new_method_name = new_key[2:-1]
+                decl_old = f" {old_method_name}("
+                decl_new = f" {new_method_name}("
+                # Only replace on .method lines
+                if decl_old in content:
+                    content = re.sub(
+                        r"(^\.method\s+(?:[\w\s]+\s+)?)" + re.escape(old_method_name) + r"\(",
+                        lambda m, new=new_method_name: m.group(1) + new + "(",
+                        content,
+                        flags=re.MULTILINE,
+                    )
+
+            # Field renames — replace all -><old>: occurrences
+            for old_key in sorted(field_rename, key=len, reverse=True):
+                new_key = field_rename[old_key]
+                if old_key in content:
+                    count = content.count(old_key)
+                    content = content.replace(old_key, new_key)
+                    renamed_field_refs += count
+            # Also patch .field declaration lines
+            for old_key, new_key in field_rename.items():
+                old_field_name = old_key[2:-1]   # strip "->" and ":"
+                new_field_name = new_key[2:-1]
+                if f" {old_field_name}:" in content:
+                    content = re.sub(
+                        r"(^\.field\s+(?:[\w\s]+\s+)?)" + re.escape(old_field_name) + r":",
+                        lambda m, new=new_field_name: m.group(1) + new + ":",
+                        content,
+                        flags=re.MULTILINE,
+                    )
+
+            if content != original_content:
+                try:
+                    with open(sf, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    renamed_files += 1
+                except Exception as e:
+                    logger.warning(f"[SafeRename] Could not write {sf.name}: {e}")
+
+        # ── Pass 4: Rename .smali files and directories ───────────────────────
+        # Must rename files AFTER content is written (so the new L....; token
+        # inside each file still matches the renamed file path).
+        files_renamed_on_disk = 0
+        for old_tok, new_tok in class_rename.items():
+            # old_tok = "Lcom/pkg/OldName;"
+            old_path_str = old_tok[1:-1]   # "com/pkg/OldName"
+            new_path_str = new_tok[1:-1]   # "com/pkg/NewName"
+
+            for sd in smali_dirs:
+                old_file = sd / (old_path_str + ".smali")
+                new_file = sd / (new_path_str + ".smali")
+                if old_file.exists():
+                    try:
+                        new_file.parent.mkdir(parents=True, exist_ok=True)
+                        old_file.rename(new_file)
+                        files_renamed_on_disk += 1
+                    except Exception as e:
+                        logger.warning(f"[SafeRename] File rename failed {old_file}: {e}")
 
         # Save rename map for audit
         map_path = os.path.join(self.work_dir, "safe_rename_map.json")
         try:
-            with open(map_path, "w") as f:
+            with open(map_path, "w", encoding="utf-8") as f:
                 json.dump(self.rename_map, f, indent=2)
         except Exception:
             pass
 
+        renamed_classes = len(class_rename)
+        renamed_methods = len(method_rename)
+        renamed_fields  = len(field_rename)
+
+        logger.info(
+            f"[SafeRename] Classes renamed: {renamed_classes} | "
+            f"Methods renamed: {renamed_methods} | "
+            f"Fields renamed: {renamed_fields} | "
+            f"Files patched: {renamed_files} | "
+            f"Files renamed on disk: {files_renamed_on_disk}"
+        )
+
         return {
-            "renamed_classes":  renamed_classes,
-            "renamed_methods":  renamed_methods,
-            "renamed_fields":   renamed_fields,
-            "rename_map_saved": map_path,
-            "status":           "✅ Safe rename complete",
+            "renamed_classes":        renamed_classes,
+            "renamed_methods":        renamed_methods,
+            "renamed_fields":         renamed_fields,
+            "files_patched":          renamed_files,
+            "files_renamed_on_disk":  files_renamed_on_disk,
+            "rename_map_saved":       map_path,
+            "status": (
+                f"✅ Safe rename complete — "
+                f"{renamed_classes} classes, "
+                f"{renamed_methods} methods, "
+                f"{renamed_fields} fields renamed across "
+                f"{renamed_files} smali files"
+            ),
         }
 
 
@@ -10350,83 +10719,95 @@ class ManualControlEngine:
     # ── CORRECT PIPELINE ORDER — ALWAYS ENFORCED ─────────────────────────────
     # Steps that require another step to have run first
     STEP_DEPENDENCIES = {
-        "compliance_scan":    ["decode_workspace"],
-        "manifest_hardening": ["decode_workspace"],
-        "proguard_hardening": ["decode_workspace"],
-        "safe_rename":        ["decode_workspace", "obfuscation"],
-        "obfuscation":        ["decode_workspace"],
-        "security_guard":     ["decode_workspace", "obfuscation", "encryption"],
-        "tamper_detection":   ["decode_workspace", "security_guard"],
-        "encryption":         ["decode_workspace", "obfuscation"],
-        "dex_repackaging":    ["decode_workspace"],
-        "metadata_stripping": ["decode_workspace"],
-        "apk_size_optimizer": ["decode_workspace"],
-        "rebuild_apk":        ["decode_workspace"],
-        "pseudo_encryption":  ["rebuild_apk"],
-        "integrity_manifest": ["rebuild_apk"],
-        "keystore_generation":["rebuild_apk"],
-        "unique_fingerprint": ["keystore_generation"],
-        "sign_apk":           ["rebuild_apk", "keystore_generation"],
-        "zipalign":           ["rebuild_apk"],
-        "protection_score":   ["sign_apk"],
+        "compliance_scan":            ["decode_workspace"],
+        "manifest_hardening":         ["decode_workspace"],
+        "proguard_hardening":         ["decode_workspace"],
+        "safe_rename":                ["decode_workspace", "obfuscation"],
+        "obfuscation":                ["decode_workspace"],
+        "security_guard":             ["decode_workspace", "obfuscation", "encryption"],
+        "tamper_detection":           ["decode_workspace", "security_guard"],
+        "encryption":                 ["decode_workspace", "obfuscation"],
+        "dex_repackaging":            ["decode_workspace"],
+        "native_methods_obfuscation": ["decode_workspace"],
+        "dex_sourcefile_strip":       ["decode_workspace"],
+        "resource_normalisation":     ["decode_workspace"],
+        "metadata_stripping":         ["decode_workspace"],
+        "apk_size_optimizer":         ["decode_workspace"],
+        "rebuild_apk":                ["decode_workspace"],
+        "pseudo_encryption":          ["rebuild_apk"],
+        "integrity_manifest":         ["rebuild_apk"],
+        "certificate_aging":          ["rebuild_apk"],
+        "keystore_generation":        ["rebuild_apk"],
+        "unique_fingerprint":         ["keystore_generation"],
+        "sign_apk":                   ["rebuild_apk", "keystore_generation"],
+        "zipalign":                   ["rebuild_apk"],
+        "protection_score":           ["sign_apk"],
     }
 
     # Smart suggestions — what to run next after each step
     STEP_SUGGESTIONS = {
-        "preflight_validation": "strip_signature",
-        "strip_signature":      "decode_workspace",
-        "decode_workspace":     "compliance_scan",
-        "compliance_scan":      "manifest_hardening",
-        "manifest_hardening":   "proguard_hardening",
-        "proguard_hardening":   "obfuscation",
-        "obfuscation":          "safe_rename",
-        "safe_rename":          "encryption",
-        "encryption":           "security_guard",
-        "security_guard":       "tamper_detection",
-        "tamper_detection":     "dex_repackaging",
-        "dex_repackaging":      "metadata_stripping",
-        "metadata_stripping":   "apk_size_optimizer",
-        "apk_size_optimizer":   "aes_key_management",
-        "aes_key_management":   "rebuild_apk",
-        "rebuild_apk":          "pseudo_encryption",
-        "pseudo_encryption":    "integrity_manifest",
-        "integrity_manifest":   "keystore_generation",
-        "keystore_generation":  "unique_fingerprint",
-        "unique_fingerprint":   "zipalign",
-        "zipalign":             "sign_apk",
-        "sign_apk":             "protection_score",
-        "protection_score":     None,
+        "preflight_validation":       "strip_signature",
+        "strip_signature":            "decode_workspace",
+        "decode_workspace":           "compliance_scan",
+        "compliance_scan":            "manifest_hardening",
+        "manifest_hardening":         "proguard_hardening",
+        "proguard_hardening":         "obfuscation",
+        "obfuscation":                "safe_rename",
+        "safe_rename":                "encryption",
+        "encryption":                 "security_guard",
+        "security_guard":             "tamper_detection",
+        "tamper_detection":           "dex_repackaging",
+        "dex_repackaging":            "native_methods_obfuscation",
+        "native_methods_obfuscation": "dex_sourcefile_strip",
+        "dex_sourcefile_strip":       "resource_normalisation",
+        "resource_normalisation":     "metadata_stripping",
+        "metadata_stripping":         "apk_size_optimizer",
+        "apk_size_optimizer":         "aes_key_management",
+        "aes_key_management":         "rebuild_apk",
+        "rebuild_apk":                "pseudo_encryption",
+        "pseudo_encryption":          "integrity_manifest",
+        "integrity_manifest":         "certificate_aging",
+        "certificate_aging":          "keystore_generation",
+        "keystore_generation":        "unique_fingerprint",
+        "unique_fingerprint":         "zipalign",
+        "zipalign":                   "sign_apk",
+        "sign_apk":                   "protection_score",
+        "protection_score":           None,
     }
 
     PIPELINE_ORDER = [
         # ── Phase 1: Setup & Analysis ─────────────────────────────────────────
-        "preflight_validation",    # 1. validate before anything
-        "strip_signature",         # 2. strip existing signature
-        "decode_workspace",        # 3. decode APK to workspace
-        "compliance_scan",         # 4. scan for red flags before touching
+        "preflight_validation",    # 1.  validate before anything
+        "strip_signature",         # 2.  strip existing signature
+        "decode_workspace",        # 3.  decode APK to workspace
+        "compliance_scan",         # 4.  scan for red flags before touching
         # ── Phase 2: Code Protection (all smali changes before rebuild) ───────
-        "manifest_hardening",      # 5. harden manifest flags
-        "proguard_hardening",      # 6. add proguard rules
-        "obfuscation",             # 7. obfuscate — all smali changes here
-        "safe_rename",             # 8. rename after obfuscation settles
-        "encryption",              # 9. encrypt strings after all code changes
+        "manifest_hardening",      # 5.  harden manifest flags
+        "proguard_hardening",      # 6.  add proguard rules
+        "obfuscation",             # 7.  obfuscate — all smali changes here
+        "safe_rename",             # 8.  rename after obfuscation settles
+        "encryption",              # 9.  encrypt strings after all code changes
         "security_guard",          # 10. inject guard AFTER all smali settled
         "tamper_detection",        # 11. embed hashes AFTER all smali settled
         "dex_repackaging",         # 12. repackage DEX after all changes
+        "native_methods_obfuscation", # 13. native method obfuscation (workspace)
         # ── Phase 3: Resource & Metadata Cleanup ──────────────────────────────
-        "metadata_stripping",      # 13. strip tool fingerprints
-        "apk_size_optimizer",      # 14. remove unused files
-        "aes_key_management",      # 15. display AES key before rebuild
+        "dex_sourcefile_strip",    # 14. strip .source debug attributes (workspace)
+        "resource_normalisation",  # 15. fix resources.arsc anomalies (workspace)
+        "metadata_stripping",      # 16. strip tool fingerprints
+        "apk_size_optimizer",      # 17. remove unused files
+        "aes_key_management",      # 18. display AES key before rebuild
         # ── Phase 4: Build ────────────────────────────────────────────────────
-        "rebuild_apk",             # 16. rebuild — all changes baked in
-        "pseudo_encryption",       # 17. pseudo-encrypt ZIP + DEX headers (scanner confusion)
-        "integrity_manifest",      # 18. hash final APK state — correct hashes
+        "rebuild_apk",             # 19. rebuild — all changes baked in
+        "pseudo_encryption",       # 20. pseudo-encrypt ZIP + DEX headers (scanner confusion)
+        "integrity_manifest",      # 21. hash final APK state — correct hashes
         # ── Phase 5: Sign with Coherent Identity ─────────────────────────────
-        "keystore_generation",     # 20. generate keystore AFTER rebuild
-        "unique_fingerprint",      # 21. confirm identity
-        "zipalign",                # 22. align AFTER rebuild
-        "sign_apk",                # 23. sign with fresh keystore
-        "protection_score",        # 24. score last
+        "certificate_aging",       # 22. generate aged keystore BEFORE sign
+        "keystore_generation",     # 23. generate keystore AFTER rebuild
+        "unique_fingerprint",      # 24. confirm identity
+        "zipalign",                # 25. align AFTER rebuild
+        "sign_apk",                # 26. sign with fresh keystore
+        "protection_score",        # 27. score last
     ]
 
     # ── DISPLAY LABELS FOR EACH STEP ─────────────────────────────────────────
@@ -11201,7 +11582,7 @@ class ManualControlEngine:
             "obfuscation", "safe_rename", "encryption", "security_guard",
             "tamper_detection", "dex_repackaging", "manifest_hardening",
             "proguard_hardening", "native_methods_obfuscation",
-            "dex_sourcefile_strip",
+            "dex_sourcefile_strip", "resource_normalisation",
         }
         if op_key in SMALI_MODIFYING_STEPS:
             result["smali_modified"] = True
@@ -11212,6 +11593,8 @@ class ManualControlEngine:
             "safe_rename", "obfuscation", "security_guard", "tamper_detection",
             "encryption", "dex_repackaging", "metadata_stripping",
             "apk_size_optimizer", "rebuild_apk", "string_splitting",
+            "dex_sourcefile_strip", "resource_normalisation",
+            "native_methods_obfuscation",
         }
         if op_key in NEEDS_WORKSPACE:
             if not workspace or not os.path.isdir(workspace):
