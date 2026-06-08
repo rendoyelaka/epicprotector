@@ -17243,6 +17243,9 @@ async def button_handler(update, context):
                 "protection_score",
                 "integrity_manifest",
                 "aes_key_management",
+                # DEX protection — must always re-run on rebuilt APK
+                "asset_compiler",
+                "dex_encryption",
             }
             done_steps -= ALWAYS_RERUN_STEPS
             # Also reset workspace so it is rebuilt fresh for this phase
