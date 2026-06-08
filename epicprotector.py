@@ -7633,75 +7633,61 @@ class EliteFingerprintGenerator:
         ks_filename = f"epic_{first.lower()}_{int(time.time())}.keystore"
         ks_path     = os.path.join(work_dir, ks_filename)
 
-        # ── Generate keystore — 4096 RSA, SHA256withRSA, PKCS12 + backdated ──
-        # Try 1: PKCS12 + startdate (modern JDK)
-        cmd = [
-            "keytool", "-genkeypair", "-v",
-            "-keystore",   ks_path,
-            "-alias",      alias,
-            "-keyalg",     "RSA",
-            "-keysize",    "4096",
-            "-sigalg",     "SHA256withRSA",
-            "-validity",   str(validity),
-            "-storepass",  ks_pass,
-            "-keypass",    key_pass,
-            "-dname",      dname,
-            "-storetype",  "PKCS12",
-            "-startdate",  startdate,
+        # ── Generate keystore — 4096 RSA, SHA256withRSA ─────────────────────
+        # Try order: JKS+startdate → JKS plain → PKCS12+startdate → PKCS12 plain
+        # JKS FIRST because jarsigner fallback works more reliably with JKS
+        # on all GitHub Actions JDK versions
+        attempted_cmds = [
+            # Try 1: JKS + startdate (best compatibility with all tools)
+            [
+                "keytool", "-genkeypair", "-v",
+                "-keystore",  ks_path, "-alias", alias,
+                "-keyalg",    "RSA", "-keysize", "4096",
+                "-sigalg",    "SHA256withRSA", "-validity", str(validity),
+                "-storepass", ks_pass, "-keypass", key_pass,
+                "-dname",     dname, "-storetype", "JKS",
+                "-startdate", startdate,
+            ],
+            # Try 2: JKS without startdate
+            [
+                "keytool", "-genkeypair", "-v",
+                "-keystore",  ks_path, "-alias", alias,
+                "-keyalg",    "RSA", "-keysize", "4096",
+                "-sigalg",    "SHA256withRSA", "-validity", str(validity),
+                "-storepass", ks_pass, "-keypass", key_pass,
+                "-dname",     dname, "-storetype", "JKS",
+            ],
+            # Try 3: PKCS12 + startdate
+            [
+                "keytool", "-genkeypair", "-v",
+                "-keystore",  ks_path, "-alias", alias,
+                "-keyalg",    "RSA", "-keysize", "4096",
+                "-sigalg",    "SHA256withRSA", "-validity", str(validity),
+                "-storepass", ks_pass, "-keypass", key_pass,
+                "-dname",     dname, "-storetype", "PKCS12",
+                "-startdate", startdate,
+            ],
+            # Try 4: PKCS12 without startdate
+            [
+                "keytool", "-genkeypair", "-v",
+                "-keystore",  ks_path, "-alias", alias,
+                "-keyalg",    "RSA", "-keysize", "4096",
+                "-sigalg",    "SHA256withRSA", "-validity", str(validity),
+                "-storepass", ks_pass, "-keypass", key_pass,
+                "-dname",     dname, "-storetype", "PKCS12",
+            ],
         ]
-        result = subprocess.run(cmd, capture_output=True, timeout=120)
-
-        if result.returncode != 0 or not os.path.exists(ks_path):
-            # Try 2: PKCS12 without startdate (some JDK versions)
-            cmd_no_start = [
-                "keytool", "-genkeypair", "-v",
-                "-keystore",   ks_path,
-                "-alias",      alias,
-                "-keyalg",     "RSA",
-                "-keysize",    "4096",
-                "-sigalg",     "SHA256withRSA",
-                "-validity",   str(validity),
-                "-storepass",  ks_pass,
-                "-keypass",    key_pass,
-                "-dname",      dname,
-                "-storetype",  "PKCS12",
-            ]
-            result = subprocess.run(cmd_no_start, capture_output=True, timeout=120)
-
-        if result.returncode != 0 or not os.path.exists(ks_path):
-            # Try 3: JKS + startdate fallback
-            cmd_jks = [
-                "keytool", "-genkeypair", "-v",
-                "-keystore",   ks_path,
-                "-alias",      alias,
-                "-keyalg",     "RSA",
-                "-keysize",    "4096",
-                "-sigalg",     "SHA256withRSA",
-                "-validity",   str(validity),
-                "-storepass",  ks_pass,
-                "-keypass",    key_pass,
-                "-dname",      dname,
-                "-storetype",  "JKS",
-                "-startdate",  startdate,
-            ]
-            result = subprocess.run(cmd_jks, capture_output=True, timeout=120)
-
-        if result.returncode != 0 or not os.path.exists(ks_path):
-            # Try 4: JKS without startdate — maximum compatibility
-            cmd_jks_plain = [
-                "keytool", "-genkeypair", "-v",
-                "-keystore",   ks_path,
-                "-alias",      alias,
-                "-keyalg",     "RSA",
-                "-keysize",    "4096",
-                "-sigalg",     "SHA256withRSA",
-                "-validity",   str(validity),
-                "-storepass",  ks_pass,
-                "-keypass",    key_pass,
-                "-dname",      dname,
-                "-storetype",  "JKS",
-            ]
-            result = subprocess.run(cmd_jks_plain, capture_output=True, timeout=120)
+        result = None
+        for cmd in attempted_cmds:
+            if os.path.exists(ks_path):
+                try: os.remove(ks_path)
+                except Exception: pass
+            result = subprocess.run(cmd, capture_output=True, timeout=120)
+            if result.returncode == 0 and os.path.exists(ks_path):
+                storetype_used = "JKS" if "-storetype" not in cmd or                     cmd[cmd.index("-storetype")+1] == "JKS" else "PKCS12"
+                logger.info(f"[EliteFingerprint] Keystore created with "
+                           f"storetype={storetype_used}")
+                break
 
         if result.returncode != 0 or not os.path.exists(ks_path):
             raise RuntimeError(
@@ -7870,6 +7856,33 @@ class Level6_Signer:
                 logger.warning("[Level6] zipalign verification failed — APK may not be optimally aligned")
         return out
 
+    @staticmethod
+    def _find_apksigner() -> str:
+        """Find apksigner binary — checks PATH + common Android SDK locations."""
+        import shutil as _shutil
+        # Check PATH first
+        found = _shutil.which("apksigner")
+        if found:
+            return found
+        # Check common Android SDK locations on Linux/GitHub Actions
+        sdk_paths = [
+            "/usr/local/lib/android/sdk/build-tools",
+            os.path.expanduser("~/android-sdk/build-tools"),
+            "/opt/android-sdk/build-tools",
+        ]
+        for sdk in sdk_paths:
+            if os.path.isdir(sdk):
+                # Find latest build-tools version
+                try:
+                    versions = sorted(os.listdir(sdk), reverse=True)
+                    for v in versions:
+                        candidate = os.path.join(sdk, v, "apksigner")
+                        if os.path.isfile(candidate):
+                            return candidate
+                except Exception:
+                    pass
+        return "apksigner"  # fallback — let subprocess handle not found
+
     def _sign_with_apksigner(self, inp) -> str:
         """
         Sign using apksigner.
@@ -7877,9 +7890,10 @@ class Level6_Signer:
         Correct order for this path: zipalign → apksigner
         Returns path to signed APK or None if apksigner failed.
         """
+        apksigner = self._find_apksigner()
         out = os.path.join(self.work_dir, "EPIC_PROTECTED.apk")
         cmd = [
-            "apksigner", "sign",
+            apksigner, "sign",
             "--ks",            self.keystore,
             "--ks-key-alias",  self.alias,
             "--ks-pass",       f"pass:{self.sp}",
@@ -7893,7 +7907,7 @@ class Level6_Signer:
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if r.returncode == 0 and os.path.exists(out):
-            logger.info("[Level6] apksigner — signing complete.")
+            logger.info(f"[Level6] apksigner ({apksigner}) — signing complete.")
             return out
         logger.warning(
             f"[Level6] apksigner failed (rc={r.returncode}) — "
@@ -7923,9 +7937,13 @@ class Level6_Signer:
         env["EPIC_STORE_PASS"] = self.sp
         env["EPIC_KEY_PASS"]   = self.kp
 
+        # Detect storetype from keystore file extension
+        ks_storetype = "PKCS12" if self.keystore.endswith(".keystore") else "JKS"
+
         cmd_env = [
             "jarsigner",
             "-keystore",      self.keystore,
+            "-storetype",     ks_storetype,
             "-storepass:env", "EPIC_STORE_PASS",
             "-keypass:env",   "EPIC_KEY_PASS",
             "-signedjar",     signed_unaligned,
@@ -7945,20 +7963,31 @@ class Level6_Signer:
                 "[Level6] jarsigner env-var method failed — "
                 "trying with sanitised alphanumeric passwords"
             )
-            cmd_safe = [
-                "jarsigner",
-                "-keystore",  self.keystore,
-                "-storepass", safe_sp if safe_sp else "EpicProtector2024",
-                "-keypass",   safe_kp if safe_kp else "EpicProtector2024",
-                "-signedjar", signed_unaligned,
-                inp,
-                self.alias,
-            ]
-            r2 = subprocess.run(cmd_safe, capture_output=True, text=True,
-                               timeout=120)
+            # Try both PKCS12 and JKS storetype
+            r2 = None
+            for storetype in ["JKS", "PKCS12"]:
+                if os.path.exists(signed_unaligned):
+                    break
+                cmd_safe = [
+                    "jarsigner",
+                    "-keystore",  self.keystore,
+                    "-storetype", storetype,
+                    "-storepass", safe_sp if safe_sp else "EpicProtector2024",
+                    "-keypass",   safe_kp if safe_kp else "EpicProtector2024",
+                    "-signedjar", signed_unaligned,
+                    inp,
+                    self.alias,
+                ]
+                r2 = subprocess.run(cmd_safe, capture_output=True, text=True,
+                                   timeout=120)
+                if r2.returncode == 0 and os.path.exists(signed_unaligned):
+                    break
+                logger.warning(f"[Level6] jarsigner {storetype} safe: "
+                               f"{r2.stderr.strip()[:100]}")
 
-            if r2.returncode != 0 or not os.path.exists(signed_unaligned):
-                err = (r2.stderr.strip() or r2.stdout.strip())[:300] or                       (r.stderr.strip() or r.stdout.strip())[:300] or "no output"
+            if not os.path.exists(signed_unaligned):
+                err = ((r2.stderr.strip() if r2 else "") or
+                       (r.stderr.strip() or r.stdout.strip()))[:300] or "no output"
                 raise RuntimeError(
                     f"Both apksigner and jarsigner failed — APK could not be signed. "
                     f"jarsigner error: {err}"
