@@ -7304,8 +7304,8 @@ class EliteFingerprintGenerator:
           build_duration_secs, steps_ran, github_run_id.
         """
         try:
-            import datetime as _dt
-            now_str = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            from datetime import datetime as _dt_save
+            now_str = _dt_save.now().strftime("%Y-%m-%d %H:%M:%S")
 
             data = {}
             if os.path.exists(self.USED_IDS_FILE):
@@ -7599,8 +7599,9 @@ class EliteFingerprintGenerator:
         # ── Certificate backdating — 1 to 5 years in the past ────────────────
         # Makes certificate look established — not freshly generated today
         # Scanners give higher trust to older certificates
+        from datetime import datetime as _dt_now, timedelta as _td
         days_back  = random.randint(365, 1825)   # 1 to 5 years back
-        start_dt   = datetime.now() - timedelta(days=days_back)
+        start_dt   = _dt_now.now() - _td(days=days_back)
         startdate  = start_dt.strftime("%Y/%m/%d %H:%M:%S")
         backdate_years = round(days_back / 365, 1)
 
@@ -14759,9 +14760,9 @@ class APKMetadataCleanerEngine:
 
     def _random_zip_timestamp(self) -> tuple:
         """Random ZIP timestamp 1-4 years in the past."""
-        import datetime as _dt
+        from datetime import datetime as _dt2, timedelta as _td2
         days_back = random.randint(365, 4 * 365)
-        dt = _dt.datetime.now() - _dt.timedelta(days=days_back)
+        dt = _dt2.now() - _td2(days=days_back)
         return (dt.year, dt.month, dt.day,
                 random.randint(8, 18),
                 random.randint(0, 59),
