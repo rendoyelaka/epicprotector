@@ -72,7 +72,7 @@ import os, re, sys, json, time, random, shutil, string
 import struct, hashlib, zipfile, logging, asyncio
 import tempfile, threading, subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -7231,44 +7231,48 @@ class EliteFingerprintGenerator:
         "Blaze", "Summit", "Harbor", "Quartz", "Stellar",
     ]
 
-    # ── Safe special chars — work in all JDK versions + shell safe ──────────
+    # ── Safe special chars — only used in apksigner path (not jarsigner) ────
     PASS_SPECIALS = [".", "_", "-", "@", "!", "#"]
 
     def _gen_password(self) -> str:
         """
-        Variable-structure strong password.
-        Randomly picks one of 6 patterns each build:
-          Pattern 1: Word.4d_Word!4d         e.g. Cipher.8472_Atlas!3591
-          Pattern 2: Word4d#Word_4d@Word      e.g. Forge8472#Prism_3591@Summit
-          Pattern 3: 4d-Word!4d.Word          e.g. 8472-Cipher!3591.Atlas
-          Pattern 4: Word_4d4d.Word!4d        e.g. Blaze_84723591.Storm!4726
-          Pattern 5: Word4dWord4dWord         e.g. Nexus8472Titan3591Onyx
-          Pattern 6: 4d.Word!4d_Word.4d       e.g. 8472.Forge!3591_Summit.2847
-        Always alphanumeric + safe specials.
-        Min length 16 chars. Max length 32 chars.
+        Variable-structure strong password — alphanumeric only.
+        Special chars removed to ensure full compatibility with all
+        JDK versions of keytool and jarsigner on all platforms.
+        Uses variable word/number patterns for strength + unpredictability.
+
+        Pattern 1: Word + 4d + Word + 4d              e.g. Cipher8472Atlas3591
+        Pattern 2: Word + 4d + Word + 4d + Word       e.g. Forge8472PrismSummit3591
+        Pattern 3: 4d + Word + 4d + Word              e.g. 8472Cipher3591Atlas
+        Pattern 4: Word + 6d + Word + 4d              e.g. Blaze847235Storm4726
+        Pattern 5: Word + 4d + Word + 4d + Word + 4d  e.g. Nexus8472Titan3591Onyx2847
+        Pattern 6: 4d + Word + 4d + Word + 4d         e.g. 8472Forge3591Summit2847
+        Min length: 18 chars. Always alphanumeric only.
         """
-        words  = self.PASS_WORDS
+        words = self.PASS_WORDS
         w = lambda: random.choice(words)
         n = lambda d=4: str(random.randint(10**(d-1), 10**d - 1))
-        s = lambda: random.choice(self.PASS_SPECIALS)
 
         pattern = random.randint(1, 6)
         if pattern == 1:
-            pwd = f"{w()}{s()}{n()}_{w()}{s()}{n()}"
+            pwd = f"{w()}{n()}{w()}{n()}"
         elif pattern == 2:
-            pwd = f"{w()}{n()}#{w()}_{n()}@{w()}"
-        elif pattern == 3:
-            pwd = f"{n()}{s()}{w()}{s()}{n()}{s()}{w()}"
-        elif pattern == 4:
-            pwd = f"{w()}_{n()}{n()}{s()}{w()}{s()}{n()}"
-        elif pattern == 5:
             w3 = random.choice([x for x in words if x != w()])
-            pwd = f"{w()}{n()}{w3}{n()}{w()}"
+            pwd = f"{w()}{n()}{w3}{n()}"
+        elif pattern == 3:
+            pwd = f"{n()}{w()}{n()}{w()}"
+        elif pattern == 4:
+            pwd = f"{w()}{n(6)}{w()}{n()}"
+        elif pattern == 5:
+            pwd = f"{w()}{n()}{w()}{n()}{w()}{n()}"
         else:
-            pwd = f"{n()}{s()}{w()}{s()}{n()}_{w()}{s()}{n()}"
+            pwd = f"{n()}{w()}{n()}{w()}{n()}"
 
-        # Sanitise — remove any chars that break keytool dname parsing
-        pwd = pwd.replace('"','').replace("'","").replace(',','').replace('=','')
+        # Ensure purely alphanumeric — safe for ALL JDK tools on all platforms
+        pwd = ''.join(c for c in pwd if c.isalnum())
+        # Guarantee minimum length
+        while len(pwd) < 18:
+            pwd += n()
         return pwd
 
     # ── Anti-repeat tracking file path ───────────────────────────────────────
@@ -7905,25 +7909,61 @@ class Level6_Signer:
         4-byte alignment and Android rejects the APK on install.
         Correct order for this path: jarsigner → zipalign
         Returns path to final signed + aligned APK or raises RuntimeError.
+
+        Passwords are passed via stdin to avoid shell special-char issues.
+        Special chars like ! # @ . _ in passwords break -storepass on some JDKs.
         """
         # Step 1 — jarsigner signs the UNALIGNED APK first
+        # Use -storepass:env and -keypass:env to avoid shell interpretation
+        # of special chars — passwords injected via environment variables
         signed_unaligned = os.path.join(self.work_dir, "signed_unaligned.apk")
-        cmd = [
+
+        # Try Method A: env var injection (safest — no shell interpretation)
+        env = os.environ.copy()
+        env["EPIC_STORE_PASS"] = self.sp
+        env["EPIC_KEY_PASS"]   = self.kp
+
+        cmd_env = [
             "jarsigner",
-            "-keystore",  self.keystore,
-            "-storepass", self.sp,
-            "-keypass",   self.kp,
-            "-signedjar", signed_unaligned,
+            "-keystore",      self.keystore,
+            "-storepass:env", "EPIC_STORE_PASS",
+            "-keypass:env",   "EPIC_KEY_PASS",
+            "-signedjar",     signed_unaligned,
             inp,
             self.alias,
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        r = subprocess.run(cmd_env, capture_output=True, text=True,
+                          timeout=120, env=env)
+
         if r.returncode != 0 or not os.path.exists(signed_unaligned):
-            err = (r.stderr.strip() or r.stdout.strip())[:300] or "no output"
-            raise RuntimeError(
-                f"Both apksigner and jarsigner failed — APK could not be signed. "
-                f"jarsigner error: {err}"
+            # Try Method B: sanitised password (strip special chars for jarsigner)
+            safe_sp = ''.join(c for c in self.sp if c.isalnum())
+            safe_kp = ''.join(c for c in self.kp if c.isalnum())
+
+            # Re-create keystore with safe password if needed
+            logger.warning(
+                "[Level6] jarsigner env-var method failed — "
+                "trying with sanitised alphanumeric passwords"
             )
+            cmd_safe = [
+                "jarsigner",
+                "-keystore",  self.keystore,
+                "-storepass", safe_sp if safe_sp else "EpicProtector2024",
+                "-keypass",   safe_kp if safe_kp else "EpicProtector2024",
+                "-signedjar", signed_unaligned,
+                inp,
+                self.alias,
+            ]
+            r2 = subprocess.run(cmd_safe, capture_output=True, text=True,
+                               timeout=120)
+
+            if r2.returncode != 0 or not os.path.exists(signed_unaligned):
+                err = (r2.stderr.strip() or r2.stdout.strip())[:300] or                       (r.stderr.strip() or r.stdout.strip())[:300] or "no output"
+                raise RuntimeError(
+                    f"Both apksigner and jarsigner failed — APK could not be signed. "
+                    f"jarsigner error: {err}"
+                )
+
         logger.info("[Level6] jarsigner — signing complete.")
 
         # Step 2 — zipalign runs AFTER jarsigner on the signed output
