@@ -13986,7 +13986,8 @@ smali_safety_cache  = {}   # cached safety analysis results per user
 manual_keystore_ctx = {}   # keystore context shared across steps {keystore_path, alias, ks_pass, key_pass, sha256}
 
 # ── QUICK TEST PANEL SESSION STATE ────────────────────────────────────────────
-quick_test_selected = {}   # {user_id: set()} — which steps are ON
+quick_test_selected   = {}   # {user_id: set()} — which steps are ON
+quick_test_result_msg = {}   # {user_id: message_id} — Results message to delete on Back
 
 # ── ADMIN KEYBOARD ───────────────────────────────────────────────────────────
 def admin_kb():
@@ -15168,6 +15169,15 @@ async def button_handler(update, context):
                   pending_base_apk, smali_tree_workspace, smali_tree_path,
                   smali_selected_files, smali_scan_results]:
             d.pop(user.id, None)
+
+        # Delete the Quick Test Results message if it exists (separate from APK doc)
+        result_msg_id = quick_test_result_msg.pop(user.id, None)
+        if result_msg_id:
+            try:
+                await context.bot.delete_message(
+                    chat_id=user.id, message_id=result_msg_id)
+            except Exception:
+                pass
         # Try edit first (text msgs) — fallback send+delete for document msgs
         try:
             await query.edit_message_text(
@@ -15505,6 +15515,9 @@ async def button_handler(update, context):
             await status_msg.edit_text(
                 result_text.encode("ascii", "ignore").decode("ascii"))
 
+        # Remember this message so Back can delete it
+        quick_test_result_msg[user.id] = status_msg.message_id
+
         # ── Deliver APK ───────────────────────────────────────────────────
         if final_apk and os.path.exists(final_apk):
             size_mb = os.path.getsize(final_apk) / (1024 * 1024)
@@ -15545,8 +15558,7 @@ async def button_handler(update, context):
 
         # Clean up selection
         quick_test_selected.pop(user.id, None)
-
-    # ── BACK TO SESSION CHECKLIST (from smali tree) ───────────────────────────
+        quick_test_result_msg.pop(user.id, None)
     elif data == "mcp_session_back":
         smali_tree_path.pop(user.id, None)
         smali_selected_files.pop(user.id, None)
