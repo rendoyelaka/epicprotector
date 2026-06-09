@@ -15858,11 +15858,23 @@ manual_keystore_ctx = {}   # keystore context shared across steps {keystore_path
 quick_test_selected   = {}   # {user_id: set()} — which steps are ON
 quick_test_result_msg = {}   # {user_id: message_id} — Results message to delete on Back
 
+# ── STEP-BY-STEP TEST PANEL SESSION STATE ─────────────────────────────────────
+sbs_step_index    = {}   # {user_id: int}   — current step index in pipeline
+sbs_work_dir      = {}   # {user_id: str}   — job work directory
+sbs_apk_path      = {}   # {user_id: str}   — base APK path
+sbs_workspace     = {}   # {user_id: str}   — decoded workspace path
+sbs_current_apk   = {}   # {user_id: str}   — current APK path (updated after strip/rebuild)
+sbs_aes_key       = {}   # {user_id: bytes} — AES key for this session
+sbs_keystore_ctx  = {}   # {user_id: dict}  — keystore context
+sbs_done_steps    = {}   # {user_id: set}   — steps completed this session
+sbs_step_results  = {}   # {user_id: list}  — results of each step run
+sbs_test_log      = {}   # {user_id: list}  — list of {step, label, passed, note}
+
 # ── ADMIN KEYBOARD ───────────────────────────────────────────────────────────
 def admin_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛡️ Protect APK",              callback_data="admin_protect_apk")],
-        [InlineKeyboardButton("🧪 Quick Test Panel",          callback_data="quick_test_open")],
+        [InlineKeyboardButton("🧪 Step-by-Step Test",         callback_data="sbs_open")],
         [InlineKeyboardButton("🎛️ Manual Control Panel",     callback_data="admin_manual")],
         [InlineKeyboardButton("📊 Protection History",        callback_data="admin_history")],
         [InlineKeyboardButton("📦 Base APK",                  callback_data="admin_base_apk")],
@@ -17038,7 +17050,10 @@ async def button_handler(update, context):
                   manual_aes_key, manual_undo_backup, manual_job_start,
                   manual_done_steps, manual_session_log, manual_keystore_ctx,
                   pending_base_apk, smali_tree_workspace, smali_tree_path,
-                  smali_selected_files, smali_scan_results]:
+                  smali_selected_files, smali_scan_results,
+                  sbs_step_index, sbs_work_dir, sbs_apk_path, sbs_workspace,
+                  sbs_current_apk, sbs_aes_key, sbs_keystore_ctx,
+                  sbs_done_steps, sbs_step_results, sbs_test_log]:
             d.pop(user.id, None)
 
         # Delete the Quick Test Results message if it exists (separate from APK doc)
@@ -17745,7 +17760,499 @@ async def button_handler(update, context):
         # Clean up selection
         quick_test_selected.pop(user.id, None)
         quick_test_result_msg.pop(user.id, None)
-    elif data == "mcp_session_back":
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ── STEP-BY-STEP TEST PANEL ───────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── OPEN — initialise session and show first step ─────────────────────────
+    elif data == "sbs_open":
+        if not is_admin(user.id): return
+
+        config  = _get_base_apk_config()
+        file_id = config.get("base_apk_file_id")
+        if not file_id:
+            await query.edit_message_text(
+                "🧪 *Step-by-Step Test*\n\n"
+                "❌ No Base APK stored yet.\n\n"
+                "Go to 📦 Base APK → Upload Base APK first.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+
+        apk_name   = config.get("base_apk_filename", "base.apk")
+        status_msg = await query.edit_message_text(
+            f"🧪 *Step-by-Step Test*\n\n"
+            f"📦 `{apk_name}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📥 Loading APK...",
+            parse_mode="Markdown")
+
+        try:
+            apk_path = BaseApkStorageEngine.get_local_path(config)
+            if not apk_path:
+                await status_msg.edit_text(
+                    f"🧪 *Step-by-Step Test*\n\n"
+                    f"📥 Downloading APK...\n⏳ Please wait...",
+                    parse_mode="Markdown")
+                apk_path = await BaseApkStorageEngine.download_base_apk(
+                    context.bot, config)
+            if not apk_path:
+                await status_msg.edit_text(
+                    "❌ Failed to load APK.\nGo to 📦 Base APK and re-upload.",
+                    parse_mode="Markdown", reply_markup=back_a())
+                return
+        except Exception as e:
+            await status_msg.edit_text(
+                f"❌ APK load error: `{str(e)[:100]}`",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+
+        # Initialise fresh session
+        job_id = f"sbs_{int(time.time())}"
+        work_dir = os.path.join(WORK_DIR, job_id)
+        os.makedirs(work_dir, exist_ok=True)
+
+        sbs_step_index[user.id]   = 0
+        sbs_work_dir[user.id]     = work_dir
+        sbs_apk_path[user.id]     = apk_path
+        sbs_workspace[user.id]    = None
+        sbs_current_apk[user.id]  = apk_path
+        sbs_aes_key[user.id]      = AESKeyManager.generate()
+        sbs_keystore_ctx[user.id] = {}
+        sbs_done_steps[user.id]   = set()
+        sbs_step_results[user.id] = []
+        sbs_test_log[user.id]     = []
+
+        engine = ManualControlEngine(CryptoEngine(), work_dir)
+        pipeline = engine.PIPELINE_ORDER
+        total    = len(pipeline)
+        step_idx = 0
+        op_key   = pipeline[step_idx]
+        label    = engine.STEP_LABELS.get(op_key, op_key)
+
+        await status_msg.edit_text(
+            f"🧪 *Step-by-Step Test*\n\n"
+            f"📦 `{apk_name}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Step *{step_idx+1}/{total}*\n\n"
+            f"▶️ *{label}*\n\n"
+            f"Tap *▶️ Run This Step* to run it and get APK.\n"
+            f"Tap *⏭️ Skip* to skip this step.\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📋 Progress: 0/{total} done",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"▶️ Run Step {step_idx+1}: {label}",
+                    callback_data="sbs_run")],
+                [InlineKeyboardButton(
+                    "⏭️ Skip This Step",
+                    callback_data="sbs_skip")],
+                [InlineKeyboardButton(
+                    "📋 View Test Report",
+                    callback_data="sbs_report")],
+                [InlineKeyboardButton(
+                    "⬅️ Back to Menu",
+                    callback_data="back_admin")],
+            ]))
+        return
+
+    # ── RUN CURRENT STEP ──────────────────────────────────────────────────────
+    elif data == "sbs_run":
+        if not is_admin(user.id): return
+
+        step_idx  = sbs_step_index.get(user.id, 0)
+        work_dir  = sbs_work_dir.get(user.id)
+        apk_path  = sbs_apk_path.get(user.id)
+        config    = _get_base_apk_config()
+        apk_name  = config.get("base_apk_filename", "base.apk")
+
+        if not work_dir or not apk_path:
+            await query.edit_message_text(
+                "❌ Session expired. Tap Step-by-Step Test to restart.",
+                parse_mode="Markdown", reply_markup=back_a())
+            return
+
+        engine   = ManualControlEngine(CryptoEngine(), work_dir)
+        pipeline = engine.PIPELINE_ORDER
+        total    = len(pipeline)
+
+        if step_idx >= total:
+            await query.answer("✅ All steps complete.", show_alert=True)
+            return
+
+        op_key   = pipeline[step_idx]
+        label    = engine.STEP_LABELS.get(op_key, op_key)
+        aes_key  = sbs_aes_key.get(user.id, AESKeyManager.generate())
+        keystore_ctx   = sbs_keystore_ctx.get(user.id, {})
+        current_apk    = sbs_current_apk.get(user.id, apk_path)
+        current_ws     = sbs_workspace.get(user.id)
+        done_steps     = sbs_done_steps.get(user.id, set())
+        step_results   = sbs_step_results.get(user.id, [])
+
+        status_msg = await query.edit_message_text(
+            f"🧪 *Step-by-Step Test*\n\n"
+            f"📦 `{apk_name}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Step *{step_idx+1}/{total}*\n"
+            f"▶️ *{label}*\n"
+            f"⏳ Running...",
+            parse_mode="Markdown")
+
+        # Run step in executor
+        tools   = ToolInstaller()
+        scanner = ComplianceScannerEngine()
+
+        loop = asyncio.get_event_loop()
+        _op = op_key; _apk = current_apk; _ws = current_ws
+        _kctx = keystore_ctx; _done = set(done_steps)
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: engine.run_operation(
+                    _op, _apk, _ws,
+                    work_dir, aes_key, tools, scanner,
+                    rebuilt_apk_override=_apk,
+                    keystore_ctx=_kctx,
+                    completed_ops=_done))
+        except Exception as e:
+            result = {"op": op_key, "status": f"❌ {str(e)[:200]}"}
+
+        result["op"] = op_key
+
+        # Update state
+        if op_key == "decode_workspace" and result.get("workspace"):
+            sbs_workspace[user.id] = result["workspace"]
+            current_ws = result["workspace"]
+        if op_key == "strip_signature":
+            stripped = os.path.join(work_dir, "input_stripped.apk")
+            if os.path.exists(stripped):
+                sbs_current_apk[user.id] = stripped
+                current_apk = stripped
+        if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
+            sbs_current_apk[user.id] = result["rebuilt_apk"]
+            current_apk = result["rebuilt_apk"]
+        if op_key == "signing_lineage" and result.get("output_apk"):
+            sbs_current_apk[user.id] = result["output_apk"]
+            current_apk = result["output_apk"]
+        if op_key == "sign_apk" and result.get("final_apk"):
+            sbs_current_apk[user.id] = result["final_apk"]
+            current_apk = result["final_apk"]
+
+        step_ok = "❌" not in result.get("status", "")
+        if step_ok:
+            done_steps.add(op_key)
+            sbs_done_steps[user.id] = done_steps
+
+        step_results.append(result)
+        sbs_step_results[user.id] = step_results
+
+        status_icon = "✅" if step_ok else "❌"
+        status_short = result.get("status", "")[:120]
+
+        # Find final APK to deliver
+        final_apk = None
+        for r in reversed(step_results):
+            for key in ["final_apk", "output_apk"]:
+                if r.get(key) and os.path.exists(r[key]):
+                    final_apk = r[key]
+                    break
+            if final_apk:
+                break
+
+        # Also check work_dir for EPIC_PROTECTED.apk
+        ep_path = os.path.join(work_dir, "EPIC_PROTECTED.apk")
+        if not final_apk and os.path.exists(ep_path):
+            final_apk = ep_path
+
+        # Determine next step
+        next_idx = step_idx + 1
+        sbs_step_index[user.id] = next_idx
+        has_next = next_idx < total
+
+        next_label = engine.STEP_LABELS.get(
+            pipeline[next_idx], pipeline[next_idx]) if has_next else "—"
+
+        # Build result message
+        result_lines = [
+            f"🧪 *Step-by-Step Test*\n",
+            f"📦 `{apk_name}`",
+            f"━━━━━━━━━━━━━━━━━━━━━",
+            f"Step *{step_idx+1}/{total}* — *{label}*",
+            f"{status_icon} {status_short}",
+            f"━━━━━━━━━━━━━━━━━━━━━",
+            f"📋 Done: {len(done_steps)}/{total}",
+        ]
+        if has_next:
+            result_lines.append(f"⏭️ Next: *{next_label}*")
+
+        # Build keyboard
+        kb_rows = []
+
+        # Deliver APK button if available
+        if final_apk and os.path.exists(final_apk):
+            kb_rows.append([InlineKeyboardButton(
+                "📲 Get APK & Test",
+                callback_data="sbs_get_apk")])
+
+        if has_next:
+            kb_rows.append([InlineKeyboardButton(
+                f"▶️ Run Step {next_idx+1}: {next_label}",
+                callback_data="sbs_run")])
+            kb_rows.append([InlineKeyboardButton(
+                "⏭️ Skip Next Step",
+                callback_data="sbs_skip")])
+        else:
+            kb_rows.append([InlineKeyboardButton(
+                "🏁 All Steps Done — View Report",
+                callback_data="sbs_report")])
+
+        kb_rows.append([InlineKeyboardButton(
+            "📋 View Test Report",
+            callback_data="sbs_report")])
+        kb_rows.append([InlineKeyboardButton(
+            "🔄 Restart from Beginning",
+            callback_data="sbs_open")])
+        kb_rows.append([InlineKeyboardButton(
+            "⬅️ Back to Menu",
+            callback_data="back_admin")])
+
+        await status_msg.edit_text(
+            "\n".join(result_lines),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb_rows))
+
+        # Deliver APK automatically after signing steps
+        if final_apk and os.path.exists(final_apk) and \
+                op_key in {"sign_apk", "signing_lineage", "protection_score"}:
+            size_mb = os.path.getsize(final_apk) / (1024 * 1024)
+            with open(final_apk, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=user.id,
+                    document=f,
+                    filename=f"SBS_STEP{step_idx+1}_{op_key}.apk",
+                    caption=(
+                        f"🧪 *Step {step_idx+1}: {label}*\n"
+                        f"📦 {size_mb:.2f} MB\n"
+                        f"{status_icon} {status_short[:80]}\n\n"
+                        f"Install on device and test.\n"
+                        f"Come back and tap next step when ready."
+                    ),
+                    parse_mode="Markdown")
+        return
+
+    # ── SKIP CURRENT STEP ─────────────────────────────────────────────────────
+    elif data == "sbs_skip":
+        if not is_admin(user.id): return
+
+        step_idx  = sbs_step_index.get(user.id, 0)
+        work_dir  = sbs_work_dir.get(user.id, WORK_DIR)
+        config    = _get_base_apk_config()
+        apk_name  = config.get("base_apk_filename", "base.apk")
+        engine    = ManualControlEngine(CryptoEngine(), work_dir)
+        pipeline  = engine.PIPELINE_ORDER
+        total     = len(pipeline)
+
+        if step_idx >= total:
+            await query.answer("✅ All steps complete.", show_alert=True)
+            return
+
+        skipped_label = engine.STEP_LABELS.get(
+            pipeline[step_idx], pipeline[step_idx])
+
+        # Log skip
+        test_log = sbs_test_log.get(user.id, [])
+        test_log.append({
+            "step":   pipeline[step_idx],
+            "label":  skipped_label,
+            "passed": None,
+            "note":   "Skipped",
+        })
+        sbs_test_log[user.id] = test_log
+
+        # Advance to next step
+        next_idx = step_idx + 1
+        sbs_step_index[user.id] = next_idx
+        has_next  = next_idx < total
+        done_steps = sbs_done_steps.get(user.id, set())
+
+        if has_next:
+            next_op    = pipeline[next_idx]
+            next_label = engine.STEP_LABELS.get(next_op, next_op)
+            await query.edit_message_text(
+                f"🧪 *Step-by-Step Test*\n\n"
+                f"📦 `{apk_name}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏭️ *Skipped:* {skipped_label}\n\n"
+                f"Step *{next_idx+1}/{total}*\n\n"
+                f"▶️ *{next_label}*\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📋 Done: {len(done_steps)}/{total}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        f"▶️ Run Step {next_idx+1}: {next_label}",
+                        callback_data="sbs_run")],
+                    [InlineKeyboardButton(
+                        "⏭️ Skip This Step",
+                        callback_data="sbs_skip")],
+                    [InlineKeyboardButton(
+                        "📋 View Test Report",
+                        callback_data="sbs_report")],
+                    [InlineKeyboardButton(
+                        "🔄 Restart from Beginning",
+                        callback_data="sbs_open")],
+                    [InlineKeyboardButton(
+                        "⬅️ Back to Menu",
+                        callback_data="back_admin")],
+                ]))
+        else:
+            await query.edit_message_text(
+                f"🧪 *Step-by-Step Test*\n\n"
+                f"✅ All {total} steps processed.\n\n"
+                f"Tap *View Test Report* to see results.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        "📋 View Test Report",
+                        callback_data="sbs_report")],
+                    [InlineKeyboardButton(
+                        "🔄 Restart from Beginning",
+                        callback_data="sbs_open")],
+                    [InlineKeyboardButton(
+                        "⬅️ Back to Menu",
+                        callback_data="back_admin")],
+                ]))
+        return
+
+    # ── GET APK (manual tap) ──────────────────────────────────────────────────
+    elif data == "sbs_get_apk":
+        if not is_admin(user.id): return
+
+        work_dir     = sbs_work_dir.get(user.id, WORK_DIR)
+        step_results = sbs_step_results.get(user.id, [])
+        config       = _get_base_apk_config()
+        apk_name     = config.get("base_apk_filename", "base.apk")
+        step_idx     = sbs_step_index.get(user.id, 1)
+
+        final_apk = None
+        for r in reversed(step_results):
+            for key in ["final_apk", "output_apk"]:
+                if r.get(key) and os.path.exists(r[key]):
+                    final_apk = r[key]
+                    break
+            if final_apk:
+                break
+        ep_path = os.path.join(work_dir, "EPIC_PROTECTED.apk")
+        if not final_apk and os.path.exists(ep_path):
+            final_apk = ep_path
+        rebuilt = os.path.join(work_dir, "rebuilt.apk")
+        if not final_apk and os.path.exists(rebuilt):
+            final_apk = rebuilt
+
+        if not final_apk:
+            await query.answer(
+                "⚠️ No APK available yet. Run a signing step first.",
+                show_alert=True)
+            return
+
+        size_mb = os.path.getsize(final_apk) / (1024 * 1024)
+        with open(final_apk, "rb") as f:
+            await context.bot.send_document(
+                chat_id=user.id,
+                document=f,
+                filename=f"SBS_STEP{step_idx}_{apk_name}",
+                caption=(
+                    f"🧪 *Step-by-Step Test APK*\n"
+                    f"📦 {size_mb:.2f} MB\n\n"
+                    f"Install on device and test.\n"
+                    f"Come back and continue when ready."
+                ),
+                parse_mode="Markdown")
+        await query.answer("📲 APK sent!", show_alert=False)
+        return
+
+    # ── TEST REPORT ───────────────────────────────────────────────────────────
+    elif data == "sbs_report":
+        if not is_admin(user.id): return
+
+        step_results = sbs_step_results.get(user.id, [])
+        done_steps   = sbs_done_steps.get(user.id, set())
+        step_idx     = sbs_step_index.get(user.id, 0)
+        work_dir     = sbs_work_dir.get(user.id, WORK_DIR)
+        config       = _get_base_apk_config()
+        apk_name     = config.get("base_apk_filename", "base.apk")
+        engine       = ManualControlEngine(CryptoEngine(), work_dir)
+        pipeline     = engine.PIPELINE_ORDER
+        total        = len(pipeline)
+
+        if not step_results:
+            await query.answer(
+                "⚠️ No steps run yet.", show_alert=True)
+            return
+
+        score_r = ProtectionScoreEngine.calculate(list(done_steps))
+
+        lines = [
+            "📋 *Step-by-Step Test Report*\n",
+            f"📦 `{apk_name}`",
+            f"━━━━━━━━━━━━━━━━━━━━━",
+            f"Progress: {step_idx}/{total} steps processed",
+            f"Completed: {len(done_steps)} steps",
+            f"📊 Score: *{score_r['score']}/100 — {score_r['grade']}*",
+            f"━━━━━━━━━━━━━━━━━━━━━",
+        ]
+
+        for r in step_results:
+            op    = r.get("op", "")
+            lbl   = engine.STEP_LABELS.get(op, op)
+            st    = r.get("status", "")
+            if "❌" in st:
+                icon = "❌"
+            elif "⚠️" in st:
+                icon = "⚠️"
+            elif r.get("skipped"):
+                icon = "⏭️"
+            else:
+                icon = "✅"
+            lines.append(f"{icon} {lbl}")
+            if "❌" in st:
+                lines.append(f"   _{st[:80]}_")
+
+        lines += [
+            "━━━━━━━━━━━━━━━━━━━━━",
+            f"Steps remaining: {total - step_idx}",
+        ]
+
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:4000] + "\n_...truncated_"
+
+        has_more = step_idx < total
+        kb_rows = []
+        if has_more:
+            next_op    = pipeline[step_idx] if step_idx < total else None
+            next_label = engine.STEP_LABELS.get(next_op, next_op) if next_op else ""
+            kb_rows.append([InlineKeyboardButton(
+                f"▶️ Continue — Step {step_idx+1}: {next_label}",
+                callback_data="sbs_run")])
+        kb_rows.append([InlineKeyboardButton(
+            "🔄 Restart from Beginning",
+            callback_data="sbs_open")])
+        kb_rows.append([InlineKeyboardButton(
+            "⬅️ Back to Menu",
+            callback_data="back_admin")])
+
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb_rows))
+        return
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ── END STEP-BY-STEP TEST PANEL ───────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+
         smali_tree_path.pop(user.id, None)
         smali_selected_files.pop(user.id, None)
         smali_scan_results.pop(user.id, None)
