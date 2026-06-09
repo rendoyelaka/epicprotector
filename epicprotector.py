@@ -159,6 +159,17 @@ class ToolInstaller:
             "default-jdk zipalign apksigner wget unzip curl libsmali-java",
             check=True
         )
+        # Try to upgrade apksigner to a version that supports V3 lineage
+        # apksigner from apt is often old — try installing newer via sdkmanager
+        # If sdkmanager not available — the graceful fallback in SigningLineageEngine
+        # handles the unsupported option error and signs with standard v1+v2+v3
+        try:
+            # Check apksigner version
+            r = self._run("apksigner version")
+            version_str = r.stdout.strip() if r.returncode == 0 else ""
+            logger.info(f"[ToolInstaller] apksigner version: {version_str}")
+        except Exception:
+            pass
         # NOTE: We do NOT copy smali.jar to TOOLS_DIR.
         # /usr/share/java/smali.jar is a LIBRARY jar (no Main-Class manifest).
         # Running it with java -jar fails with "no main manifest attribute".
@@ -15166,7 +15177,7 @@ class SigningLineageEngine:
         """
         Create V3 signing lineage file linking child cert to master root.
         Uses apksigner rotate command.
-        Returns True on success, False on failure.
+        Returns True on success, False on failure or unsupported version.
         """
         apksigner = self._find_apksigner()
         cmd = [
@@ -15190,11 +15201,21 @@ class SigningLineageEngine:
                 f"master_root → child cert linked — {lineage_path}"
             )
             return True
-        logger.warning(
-            f"[SigningLineage] apksigner rotate failed (rc={r.returncode}) — "
-            f"stderr: {r.stderr.strip()[:200]} — "
-            f"proceeding without lineage (child cert only)"
-        )
+        # Detect unsupported apksigner version — rotate requires apksigner 30.0+
+        err = (r.stderr + r.stdout).lower()
+        if "unsupported option" in err or "unrecognized" in err or \
+           "invalid option" in err or "unknown" in err or \
+           "rotate" in err:
+            logger.warning(
+                "[SigningLineage] apksigner rotate not supported on this "
+                "version — lineage chain skipped — will sign without lineage"
+            )
+        else:
+            logger.warning(
+                f"[SigningLineage] apksigner rotate failed (rc={r.returncode}) — "
+                f"stderr: {r.stderr.strip()[:200]} — "
+                f"proceeding without lineage (child cert only)"
+            )
         return False
 
     def sign_with_lineage(
@@ -15206,10 +15227,13 @@ class SigningLineageEngine:
     ) -> str:
         """
         Sign APK with child cert + V3 lineage chain embedded.
+        Falls back to standard v1+v2+v3 signing if lineage flag
+        is not supported by the installed apksigner version.
         Returns output APK path on success.
         """
         apksigner = self._find_apksigner()
-        cmd = [
+
+        base_cmd = [
             apksigner, "sign",
             "--ks",               child_meta["keystore_path"],
             "--ks-key-alias",     child_meta["alias"],
@@ -15220,27 +15244,58 @@ class SigningLineageEngine:
             "--v2-signing-enabled", "true",
             "--v3-signing-enabled", "true",
         ]
-        # Attach lineage if it was built successfully
+
+        # ── Attempt 1 — with lineage file (requires apksigner 30.0+) ─────────
         if lineage_path and os.path.exists(lineage_path):
-            cmd += ["--v3-signing-lineage-file", lineage_path]
-            logger.info("[SigningLineage] Signing with V3 lineage chain attached")
+            cmd_with_lineage = base_cmd + [
+                "--v3-signing-lineage-file", lineage_path,
+                "--out", out_path, apk_path,
+            ]
+            r = subprocess.run(
+                cmd_with_lineage, capture_output=True, text=True, timeout=120)
+            if r.returncode == 0 and os.path.exists(out_path):
+                logger.info(
+                    "[SigningLineage] APK signed with V3 lineage chain attached")
+                return out_path
+            # Check if failure is due to unsupported flag
+            err = (r.stderr + r.stdout).lower()
+            if "unsupported option" in err or "unrecognized option" in err or \
+               "invalid option" in err or "unknown option" in err:
+                logger.warning(
+                    "[SigningLineage] --v3-signing-lineage-file not supported "
+                    "by installed apksigner — falling back to standard v1+v2+v3 signing"
+                )
+            else:
+                logger.warning(
+                    f"[SigningLineage] Lineage signing failed (rc={r.returncode}) — "
+                    f"stderr: {r.stderr.strip()[:200]} — "
+                    f"falling back to standard signing"
+                )
         else:
             logger.warning(
-                "[SigningLineage] Signing without lineage — "
-                "child cert only (no master root chain)"
-            )
-        cmd += ["--out", out_path, apk_path]
+                "[SigningLineage] No lineage file — using standard v1+v2+v3 signing")
 
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if r.returncode == 0 and os.path.exists(out_path):
+        # ── Attempt 2 — standard v1+v2+v3 signing without lineage ────────────
+        # Clean up any partial output from attempt 1
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+
+        cmd_standard = base_cmd + ["--out", out_path, apk_path]
+        r2 = subprocess.run(
+            cmd_standard, capture_output=True, text=True, timeout=120)
+        if r2.returncode == 0 and os.path.exists(out_path):
             logger.info(
-                f"[SigningLineage] APK signed with lineage — output: {out_path}"
-            )
+                "[SigningLineage] APK signed with standard v1+v2+v3 "
+                "(lineage not available on this apksigner version)")
             return out_path
+
         raise RuntimeError(
-            f"[SigningLineage] Signing with lineage failed (rc={r.returncode}) — "
-            f"stdout: {r.stdout.strip()[:200]} "
-            f"stderr: {r.stderr.strip()[:200]}"
+            f"[SigningLineage] All signing attempts failed — "
+            f"stdout: {r2.stdout.strip()[:200]} "
+            f"stderr: {r2.stderr.strip()[:200]}"
         )
 
     def apply(self, apk_path: str, keystore_ctx: dict) -> dict:
