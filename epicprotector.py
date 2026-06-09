@@ -17921,11 +17921,15 @@ async def button_handler(update, context):
             "signing_lineage", "zipalign", "sign_apk", "protection_score",
         }
 
-        is_workspace_step = op_key in WORKSPACE_STEPS
-        is_sign_step      = op_key in SIGN_STEPS
+        # ── Steps that trigger auto rebuild + sign ───────────────────────────
+        AUTO_BUILD_STEPS = WORKSPACE_STEPS - {
+            "preflight_validation", "compliance_scan",
+            "aes_key_management", "strip_signature", "decode_workspace",
+        }
+        is_auto_build_step = op_key in AUTO_BUILD_STEPS
 
         # ── Show running status ───────────────────────────────────────────────
-        if is_workspace_step:
+        if is_auto_build_step:
             running_text = (
                 f"🧪 *Step-by-Step Test*\n\n"
                 f"📦 `{apk_name}`\n"
@@ -18020,10 +18024,8 @@ async def button_handler(update, context):
         if not final_apk and os.path.exists(ep_path):
             final_apk = ep_path
 
-        if step_ok and is_workspace_step and current_ws and \
-                os.path.isdir(current_ws) and \
-                op_key not in {"preflight_validation", "compliance_scan",
-                               "aes_key_management"}:
+        if step_ok and is_auto_build_step and current_ws and \
+                os.path.isdir(current_ws):
 
             # Show rebuilding status
             try:
@@ -18172,7 +18174,7 @@ async def button_handler(update, context):
             f"{status_icon} {status_short}",
         ]
 
-        if is_workspace_step and step_ok:
+        if is_auto_build_step and step_ok:
             if final_apk and os.path.exists(final_apk):
                 result_lines.append(f"🔨 Rebuild ✅  ✍️ Signed ✅")
                 result_lines.append(f"📲 *APK ready — install and test*")
