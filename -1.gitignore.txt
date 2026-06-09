@@ -1,0 +1,45 @@
+# ══════════════════════════════════════════════════════════════════
+# EPIC PROTECTOR — Git Ignore
+# Elite Master Hybrid Edition — 24-Step Pipeline
+# ══════════════════════════════════════════════════════════════════
+
+# ── Master Root Certificate — NEVER commit private keys ────────
+# The master_root/ folder contains your private signing keystore.
+# It is persisted via GitHub API (GH_PAT secret) — not via git.
+# Committing it exposes your private key to anyone with repo access.
+master_root/
+
+# ── Protection Output Files — never commit these ───────────────
+integrity_manifest.json
+safe_rename_map.json
+proguard-epic-hardened.pro
+clients.json
+bot_log.txt
+
+# ── Asset Compiler Temporary Files ─────────────────────────────
+*.abp.tmp
+*.dexenc.tmp
+
+# ── Job Work Directories ───────────────────────────────────────
+*_PROTECTED/
+apk_extracted/
+undo_*/
+epic_protector/
+epic_tools/
+
+# ── Signing Artifacts — never commit these ─────────────────────
+*.jks
+*.keystore
+*.p12
+signing_lineage.bin
+
+# ── Python ─────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+
+# ── OS ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
