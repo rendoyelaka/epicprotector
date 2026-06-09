@@ -12182,9 +12182,23 @@ class ManualControlEngine:
                         f"✅ Validation passed"
                         + (f" — {warn} warning(s)" if warn else " — clean APK"))
                 else:
-                    crit = r.get("info", {}).get("critical_count", 0)
+                    crit        = r.get("info", {}).get("critical_count", 0)
+                    issues      = r.get("issues", [])
+                    crit_issues = [i for i in issues if i.get("severity") == "critical"]
+                    # Build detailed status showing each critical issue
+                    detail_lines = []
+                    for ci in crit_issues:
+                        code    = ci.get("code", "")
+                        msg     = ci.get("message", "")
+                        fixable = " — auto-fixable by manifest_hardening" \
+                                  if ci.get("fixable") else ""
+                        detail_lines.append(f"🔴 {code}: {msg}{fixable}")
+                    detail = " | ".join(detail_lines) if detail_lines else \
+                             "See issue details below"
                     result["status"] = (
-                        f"❌ Validation failed — {crit} critical issue(s) found")
+                        f"❌ Validation failed — {crit} critical issue(s): "
+                        f"{detail[:300]}"
+                    )
 
             elif op_key == "strip_signature":
                 stripper = SignatureStripper()
