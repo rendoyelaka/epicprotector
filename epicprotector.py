@@ -17881,29 +17881,64 @@ async def button_handler(update, context):
             await query.answer("✅ All steps complete.", show_alert=True)
             return
 
-        op_key   = pipeline[step_idx]
-        label    = engine.STEP_LABELS.get(op_key, op_key)
-        aes_key  = sbs_aes_key.get(user.id, AESKeyManager.generate())
+        op_key         = pipeline[step_idx]
+        label          = engine.STEP_LABELS.get(op_key, op_key)
+        aes_key        = sbs_aes_key.get(user.id, AESKeyManager.generate())
         keystore_ctx   = sbs_keystore_ctx.get(user.id, {})
         current_apk    = sbs_current_apk.get(user.id, apk_path)
         current_ws     = sbs_workspace.get(user.id)
         done_steps     = sbs_done_steps.get(user.id, set())
         step_results   = sbs_step_results.get(user.id, [])
 
-        status_msg = await query.edit_message_text(
-            f"🧪 *Step-by-Step Test*\n\n"
-            f"📦 `{apk_name}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Step *{step_idx+1}/{total}*\n"
-            f"▶️ *{label}*\n"
-            f"⏳ Running...",
-            parse_mode="Markdown")
+        # ── Steps that operate on workspace (before rebuild) ──────────────────
+        WORKSPACE_STEPS = {
+            "preflight_validation", "strip_signature", "decode_workspace",
+            "compliance_scan", "manifest_hardening", "install_source_attribution",
+            "proguard_hardening", "obfuscation", "safe_rename", "encryption",
+            "security_guard", "tamper_detection", "dex_repackaging",
+            "native_methods_obfuscation", "dex_sourcefile_strip",
+            "resource_normalisation", "metadata_stripping", "apk_size_optimizer",
+            "aes_key_management",
+        }
+        # Steps that are part of the sign/deliver flow
+        SIGN_STEPS = {
+            "rebuild_apk", "pseudo_encryption", "integrity_manifest",
+            "certificate_aging", "keystore_generation", "unique_fingerprint",
+            "signing_lineage", "zipalign", "sign_apk", "protection_score",
+        }
 
-        # Run step in executor
+        is_workspace_step = op_key in WORKSPACE_STEPS
+        is_sign_step      = op_key in SIGN_STEPS
+
+        # ── Show running status ───────────────────────────────────────────────
+        if is_workspace_step:
+            running_text = (
+                f"🧪 *Step-by-Step Test*\n\n"
+                f"📦 `{apk_name}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Step *{step_idx+1}/{total}*\n"
+                f"▶️ *{label}*\n"
+                f"⏳ Running step...\n\n"
+                f"_After this step — auto rebuild + sign → APK delivered_"
+            )
+        else:
+            running_text = (
+                f"🧪 *Step-by-Step Test*\n\n"
+                f"📦 `{apk_name}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Step *{step_idx+1}/{total}*\n"
+                f"▶️ *{label}*\n"
+                f"⏳ Running..."
+            )
+
+        status_msg = await query.edit_message_text(
+            running_text, parse_mode="Markdown")
+
         tools   = ToolInstaller()
         scanner = ComplianceScannerEngine()
+        loop    = asyncio.get_event_loop()
 
-        loop = asyncio.get_event_loop()
+        # ── Run the selected step ─────────────────────────────────────────────
         _op = op_key; _apk = current_apk; _ws = current_ws
         _kctx = keystore_ctx; _done = set(done_steps)
         try:
@@ -17920,7 +17955,7 @@ async def button_handler(update, context):
 
         result["op"] = op_key
 
-        # Update state
+        # Update workspace state
         if op_key == "decode_workspace" and result.get("workspace"):
             sbs_workspace[user.id] = result["workspace"]
             current_ws = result["workspace"]
@@ -17939,7 +17974,10 @@ async def button_handler(update, context):
             sbs_current_apk[user.id] = result["final_apk"]
             current_apk = result["final_apk"]
 
-        step_ok = "❌" not in result.get("status", "")
+        step_ok      = "❌" not in result.get("status", "")
+        status_icon  = "✅" if step_ok else "❌"
+        status_short = result.get("status", "")[:100]
+
         if step_ok:
             done_steps.add(op_key)
             sbs_done_steps[user.id] = done_steps
@@ -17947,11 +17985,16 @@ async def button_handler(update, context):
         step_results.append(result)
         sbs_step_results[user.id] = step_results
 
-        status_icon = "✅" if step_ok else "❌"
-        status_short = result.get("status", "")[:120]
+        # ── OPTION B — Auto rebuild + sign after every workspace step ─────────
+        # Only auto-rebuild if:
+        #   1. Step ran successfully
+        #   2. Step is a workspace step (not already a sign step)
+        #   3. Workspace exists (decode_workspace must have run)
+        final_apk     = None
+        auto_apk_name = None
+        auto_status   = ""
 
-        # Find final APK to deliver
-        final_apk = None
+        # Always check for existing signed APK first
         for r in reversed(step_results):
             for key in ["final_apk", "output_apk"]:
                 if r.get(key) and os.path.exists(r[key]):
@@ -17959,42 +18002,185 @@ async def button_handler(update, context):
                     break
             if final_apk:
                 break
-
-        # Also check work_dir for EPIC_PROTECTED.apk
         ep_path = os.path.join(work_dir, "EPIC_PROTECTED.apk")
         if not final_apk and os.path.exists(ep_path):
             final_apk = ep_path
 
-        # Determine next step
-        next_idx = step_idx + 1
-        sbs_step_index[user.id] = next_idx
-        has_next = next_idx < total
+        if step_ok and is_workspace_step and current_ws and \
+                os.path.isdir(current_ws) and \
+                op_key not in {"preflight_validation", "compliance_scan",
+                               "aes_key_management"}:
 
+            # Show rebuilding status
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=status_msg.message_id,
+                    text=(
+                        f"🧪 *Step-by-Step Test*\n\n"
+                        f"📦 `{apk_name}`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Step *{step_idx+1}/{total}* — *{label}*\n"
+                        f"{status_icon} {status_short}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"🔨 Auto-rebuilding APK...\n"
+                        f"⏳ Please wait..."
+                    ),
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+
+            # ── Auto rebuild ──────────────────────────────────────────────────
+            _ws2 = current_ws; _apk2 = current_apk
+            _kctx2 = keystore_ctx; _done2 = set(done_steps)
+            try:
+                rebuild_result = await loop.run_in_executor(
+                    None,
+                    lambda: engine.run_operation(
+                        "rebuild_apk", _apk2, _ws2,
+                        work_dir, aes_key, tools, scanner,
+                        rebuilt_apk_override=_apk2,
+                        keystore_ctx=_kctx2,
+                        completed_ops=_done2))
+                if rebuild_result.get("rebuilt_apk") and \
+                        os.path.exists(rebuild_result["rebuilt_apk"]):
+                    current_apk = rebuild_result["rebuilt_apk"]
+                    sbs_current_apk[user.id] = current_apk
+                    done_steps.add("rebuild_apk")
+            except Exception as re:
+                auto_status = f"⚠️ Rebuild failed: {str(re)[:80]}"
+                rebuild_result = {}
+
+            # ── Show signing status ───────────────────────────────────────────
+            if not auto_status:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=status_msg.message_id,
+                        text=(
+                            f"🧪 *Step-by-Step Test*\n\n"
+                            f"📦 `{apk_name}`\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"Step *{step_idx+1}/{total}* — *{label}*\n"
+                            f"{status_icon} {status_short}\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"🔨 Rebuild ✅\n"
+                            f"✍️ Auto-signing APK...\n"
+                            f"⏳ Please wait..."
+                        ),
+                        parse_mode="Markdown")
+                except Exception:
+                    pass
+
+                # ── Auto sign ─────────────────────────────────────────────────
+                # Use certificate_aging + signing_lineage for GPP optimised APK
+                # First generate aged cert
+                _apk3 = current_apk; _kctx3 = keystore_ctx; _done3 = set(done_steps)
+                try:
+                    aging_result = await loop.run_in_executor(
+                        None,
+                        lambda: engine.run_operation(
+                            "certificate_aging", _apk3, current_ws,
+                            work_dir, aes_key, tools, scanner,
+                            rebuilt_apk_override=_apk3,
+                            keystore_ctx=_kctx3,
+                            completed_ops=_done3))
+                    done_steps.add("certificate_aging")
+                except Exception:
+                    aging_result = {}
+
+                # Then sign with lineage
+                _apk4 = current_apk; _kctx4 = keystore_ctx; _done4 = set(done_steps)
+                try:
+                    sign_result = await loop.run_in_executor(
+                        None,
+                        lambda: engine.run_operation(
+                            "signing_lineage", _apk4, current_ws,
+                            work_dir, aes_key, tools, scanner,
+                            rebuilt_apk_override=_apk4,
+                            keystore_ctx=_kctx4,
+                            completed_ops=_done4))
+
+                    signed_apk = sign_result.get("output_apk") or \
+                                 sign_result.get("final_apk")
+                    if signed_apk and os.path.exists(signed_apk):
+                        final_apk = signed_apk
+                        sbs_current_apk[user.id] = signed_apk
+                        done_steps.add("signing_lineage")
+                        auto_apk_name = (
+                            f"STEP{step_idx+1:02d}_{op_key}.apk"
+                        )
+                    else:
+                        # Fallback to standard sign_apk
+                        _apk5 = current_apk; _kctx5 = keystore_ctx
+                        _done5 = set(done_steps)
+                        sign_result2 = await loop.run_in_executor(
+                            None,
+                            lambda: engine.run_operation(
+                                "sign_apk", _apk5, current_ws,
+                                work_dir, aes_key, tools, scanner,
+                                rebuilt_apk_override=_apk5,
+                                keystore_ctx=_kctx5,
+                                completed_ops=_done5))
+                        signed_apk2 = sign_result2.get("final_apk") or \
+                                      sign_result2.get("output_apk")
+                        if signed_apk2 and os.path.exists(signed_apk2):
+                            final_apk = signed_apk2
+                            sbs_current_apk[user.id] = signed_apk2
+                            done_steps.add("sign_apk")
+                            auto_apk_name = (
+                                f"STEP{step_idx+1:02d}_{op_key}.apk"
+                            )
+                except Exception as se:
+                    auto_status = f"⚠️ Sign failed: {str(se)[:80]}"
+
+            # Check EPIC_PROTECTED.apk as final fallback
+            ep2 = os.path.join(work_dir, "EPIC_PROTECTED.apk")
+            if not final_apk and os.path.exists(ep2):
+                final_apk = ep2
+                auto_apk_name = f"STEP{step_idx+1:02d}_{op_key}.apk"
+
+            sbs_done_steps[user.id] = done_steps
+
+        # ── Determine next step ───────────────────────────────────────────────
+        next_idx   = step_idx + 1
+        sbs_step_index[user.id] = next_idx
+        has_next   = next_idx < total
         next_label = engine.STEP_LABELS.get(
             pipeline[next_idx], pipeline[next_idx]) if has_next else "—"
 
-        # Build result message
+        # ── Build result message ──────────────────────────────────────────────
         result_lines = [
             f"🧪 *Step-by-Step Test*\n",
             f"📦 `{apk_name}`",
             f"━━━━━━━━━━━━━━━━━━━━━",
             f"Step *{step_idx+1}/{total}* — *{label}*",
             f"{status_icon} {status_short}",
+        ]
+
+        if is_workspace_step and step_ok:
+            if final_apk and os.path.exists(final_apk):
+                result_lines.append(f"🔨 Rebuild ✅  ✍️ Signed ✅")
+                result_lines.append(f"📲 *APK ready — install and test*")
+            elif auto_status:
+                result_lines.append(f"⚠️ {auto_status}")
+            else:
+                result_lines.append(
+                    f"⚠️ APK not produced — workspace may need decode first")
+
+        result_lines += [
             f"━━━━━━━━━━━━━━━━━━━━━",
             f"📋 Done: {len(done_steps)}/{total}",
         ]
         if has_next:
             result_lines.append(f"⏭️ Next: *{next_label}*")
 
-        # Build keyboard
+        # ── Build keyboard ────────────────────────────────────────────────────
         kb_rows = []
-
-        # Deliver APK button if available
         if final_apk and os.path.exists(final_apk):
             kb_rows.append([InlineKeyboardButton(
                 "📲 Get APK & Test",
                 callback_data="sbs_get_apk")])
-
         if has_next:
             kb_rows.append([InlineKeyboardButton(
                 f"▶️ Run Step {next_idx+1}: {next_label}",
@@ -18006,33 +18192,51 @@ async def button_handler(update, context):
             kb_rows.append([InlineKeyboardButton(
                 "🏁 All Steps Done — View Report",
                 callback_data="sbs_report")])
-
         kb_rows.append([InlineKeyboardButton(
-            "📋 View Test Report",
-            callback_data="sbs_report")])
+            "📋 View Test Report", callback_data="sbs_report")])
         kb_rows.append([InlineKeyboardButton(
-            "🔄 Restart from Beginning",
-            callback_data="sbs_open")])
+            "🔄 Restart from Beginning", callback_data="sbs_open")])
         kb_rows.append([InlineKeyboardButton(
-            "⬅️ Back to Menu",
-            callback_data="back_admin")])
+            "⬅️ Back to Menu", callback_data="back_admin")])
 
         await status_msg.edit_text(
             "\n".join(result_lines),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb_rows))
 
-        # Deliver APK automatically after signing steps
-        if final_apk and os.path.exists(final_apk) and \
+        # ── Auto-deliver signed APK ───────────────────────────────────────────
+        if final_apk and os.path.exists(final_apk) and auto_apk_name:
+            size_mb = os.path.getsize(final_apk) / (1024 * 1024)
+            fname   = auto_apk_name or f"STEP{step_idx+1:02d}_{op_key}.apk"
+            with open(final_apk, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=user.id,
+                    document=f,
+                    filename=fname,
+                    caption=(
+                        f"🧪 *Step {step_idx+1}/{total}: {label}*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"{status_icon} Step: {status_short[:60]}\n"
+                        f"🔨 Rebuilt ✅  ✍️ Signed ✅\n"
+                        f"📦 {size_mb:.2f} MB\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📲 Install on device and test.\n"
+                        f"Come back and tap next step when ready.\n\n"
+                        f"_Contains: all steps 1–{step_idx+1} applied_"
+                    ),
+                    parse_mode="Markdown")
+
+        # Auto-deliver for sign/lineage steps as well
+        elif final_apk and os.path.exists(final_apk) and is_sign_step and \
                 op_key in {"sign_apk", "signing_lineage", "protection_score"}:
             size_mb = os.path.getsize(final_apk) / (1024 * 1024)
             with open(final_apk, "rb") as f:
                 await context.bot.send_document(
                     chat_id=user.id,
                     document=f,
-                    filename=f"SBS_STEP{step_idx+1}_{op_key}.apk",
+                    filename=f"STEP{step_idx+1:02d}_{op_key}.apk",
                     caption=(
-                        f"🧪 *Step {step_idx+1}: {label}*\n"
+                        f"🧪 *Step {step_idx+1}/{total}: {label}*\n"
                         f"📦 {size_mb:.2f} MB\n"
                         f"{status_icon} {status_short[:80]}\n\n"
                         f"Install on device and test.\n"
