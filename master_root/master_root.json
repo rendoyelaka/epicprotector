@@ -1,0 +1,12 @@
+{
+  "keystore_path": "/home/runner/work/EpicProtector/EpicProtector/epic_tools/master_root/master_root.jks",
+  "alias": "epicroot",
+  "ks_pass": "MR_EsjNmQsDGpRAHZIgGMs8I2ys",
+  "key_pass": "MR_EsjNmQsDGpRAHZIgGMs8I2ys",
+  "cn": "Epic Software Solutions",
+  "org": "Epic Software Solutions Ltd",
+  "country": "GB",
+  "validity_days": 10950,
+  "keysize": 4096,
+  "created": "2026-06-09 07:59:50"
+}
