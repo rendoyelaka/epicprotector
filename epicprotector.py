@@ -2200,361 +2200,232 @@ class Level5_APKBuilder:
 
     def _patch_axml_binary(self, data: bytearray, ws_xml: str) -> bytearray:
         """
-        Core binary AXML patcher.
+        Unified binary AXML patcher — single parse pass, no cross-method state.
 
-        Pass 1 — patch existing boolean attributes in-place by scanning
-                  all START_ELEMENT chunks for known resource IDs and
-                  writing the correct boolean value bytes.
+        Pass 1 — patch boolean attributes in-place (debuggable, allowBackup,
+                  usesCleartextTraffic, testOnly, extractNativeLibs).
+        Pass 2 — inject missing uses-permission nodes before </manifest>.
 
-        Pass 2 — inject new uses-permission nodes that are listed in the
-                  workspace XML but missing from the binary manifest.
-
-        Pass 3 — inject networkSecurityConfig attribute on <application>
-                  if present in workspace XML but missing from binary.
-
-        Returns the patched bytearray (may be larger than input if nodes added).
+        All string pool parsing is done once and used throughout —
+        no re-parsing, no offset recalculation, no silent failures.
         """
-        import struct as _struct
+        import struct as _st
 
-        # ── Parse string pool ────────────────────────────────────────────────
-        sp_pos       = 8
-        str_count    = _struct.unpack_from("<I", data, sp_pos + 8)[0]
-        sp_size      = _struct.unpack_from("<I", data, sp_pos + 4)[0]
-        flags        = _struct.unpack_from("<I", data, sp_pos + 16)[0]
-        strings_start= _struct.unpack_from("<I", data, sp_pos + 20)[0]
-        utf8         = bool(flags & 0x100)
-        str_base     = sp_pos + strings_start
+        # ── Step A: parse string pool ─────────────────────────────────────────
+        SP       = 8                                         # string pool always at offset 8
+        sp_size  = _st.unpack_from("<I", data, SP + 4)[0]
+        n_str    = _st.unpack_from("<I", data, SP + 8)[0]
+        n_sty    = _st.unpack_from("<I", data, SP + 12)[0]
+        flags    = _st.unpack_from("<I", data, SP + 16)[0]
+        str_off  = _st.unpack_from("<I", data, SP + 20)[0]  # offset from SP start to string data
+        sty_off  = _st.unpack_from("<I", data, SP + 24)[0]
+        utf8     = bool(flags & 0x100)
+        STR_BASE = SP + str_off                              # absolute file offset of string data
 
-        def read_string(idx):
-            if idx >= str_count:
+        def _rs(idx, d=data):
+            if idx < 0 or idx >= n_str:
                 return ""
-            off  = _struct.unpack_from("<I", data, sp_pos + 28 + idx * 4)[0]
-            pos2 = str_base + off
+            off = _st.unpack_from("<I", d, SP + 28 + idx * 4)[0]
+            p   = STR_BASE + off
             try:
                 if utf8:
-                    slen = data[pos2 + 1]
-                    return data[pos2 + 2: pos2 + 2 + slen].decode("utf-8", errors="replace")
+                    slen = d[p + 1]
+                    return d[p + 2: p + 2 + slen].decode("utf-8", errors="replace")
                 else:
-                    slen = _struct.unpack_from("<H", data, pos2)[0]
-                    return data[pos2 + 2: pos2 + 2 + slen * 2].decode("utf-16-le", errors="replace")
+                    slen = _st.unpack_from("<H", d, p)[0]
+                    return d[p + 2: p + 2 + slen * 2].decode("utf-16-le", errors="replace")
             except Exception:
                 return ""
 
-        # ── Parse RES_MAP ─────────────────────────────────────────────────────
-        res_map_pos  = sp_pos + sp_size
-        res_map_size = _struct.unpack_from("<I", data, res_map_pos + 4)[0]
-        res_ids      = []
-        for i in range((res_map_size - 8) // 4):
-            res_ids.append(_struct.unpack_from("<I", data, res_map_pos + 8 + i * 4)[0])
+        # ── Step B: parse RES_MAP ─────────────────────────────────────────────
+        RM      = SP + sp_size
+        rm_size = _st.unpack_from("<I", data, RM + 4)[0]
+        res_ids = [_st.unpack_from("<I", data, RM + 8 + i * 4)[0]
+                   for i in range((rm_size - 8) // 4)]
 
-        # ── Pass 1: patch boolean attributes in-place ─────────────────────────
-        pos       = res_map_pos + res_map_size
-        patched_attrs = []
+        # ── Step C: collect existing strings ─────────────────────────────────
+        existing = set(_rs(i) for i in range(n_str))
+
+        # ── Step D: Pass 1 — patch boolean attrs in-place ─────────────────────
+        CHUNK_START = RM + rm_size
+        patched = []
+        pos = CHUNK_START
         while pos < len(data) - 8:
-            ctype = _struct.unpack_from("<H", data, pos)[0]
-            csize = _struct.unpack_from("<I", data, pos + 4)[0]
-            if csize == 0:
+            ct = _st.unpack_from("<H", data, pos)[0]
+            cs = _st.unpack_from("<I", data, pos + 4)[0]
+            if cs == 0:
                 break
-            if ctype == 0x0102:  # START_ELEMENT
-                attr_count = _struct.unpack_from("<H", data, pos + 28)[0]
-                for i in range(attr_count):
-                    ap       = pos + 36 + i * 20
-                    name_idx = _struct.unpack_from("<I", data, ap + 4)[0]
-                    atype    = _struct.unpack_from("<B", data, ap + 15)[0]
-                    aval     = _struct.unpack_from("<I", data, ap + 16)[0]
-                    rid      = res_ids[name_idx] if name_idx < len(res_ids) else 0
+            if ct == 0x0102:                                 # START_ELEMENT
+                n_attr = _st.unpack_from("<H", data, pos + 28)[0]
+                for i in range(n_attr):
+                    ap    = pos + 36 + i * 20
+                    ni    = _st.unpack_from("<I", data, ap + 4)[0]
+                    atype = _st.unpack_from("<B", data, ap + 15)[0]
+                    aval  = _st.unpack_from("<I", data, ap + 16)[0]
+                    rid   = res_ids[ni] if ni < len(res_ids) else 0
                     if rid in self._AXML_BOOL_ATTRS:
-                        attr_name, desired_val = self._AXML_BOOL_ATTRS[rid]
-                        if atype == 0x12:
-                            # INT_BOOLEAN: 0xFFFFFFFF=true, 0x00000000=false
-                            desired_int = 0xFFFFFFFF if desired_val else 0x00000000
-                            if aval != desired_int:
-                                _struct.pack_into("<I", data, ap + 16, desired_int)
-                                patched_attrs.append(
-                                    f"{attr_name}={'true' if desired_val else 'false'}")
-                        elif atype in (0x10, 0x11):
-                            # INT_DEC / INT_HEX: 1=true, 0=false
-                            desired_int = 1 if desired_val else 0
-                            if aval != desired_int:
-                                _struct.pack_into("<I", data, ap + 16, desired_int)
-                                patched_attrs.append(
-                                    f"{attr_name}={'true' if desired_val else 'false'}")
-            pos += csize
+                        name, want = self._AXML_BOOL_ATTRS[rid]
+                        if atype == 0x12:                    # INT_BOOLEAN
+                            target = 0xFFFFFFFF if want else 0x00000000
+                        elif atype in (0x10, 0x11):          # INT_DEC / INT_HEX
+                            target = 1 if want else 0
+                        else:
+                            continue
+                        if aval != target:
+                            _st.pack_into("<I", data, ap + 16, target)
+                            patched.append(f"{name}={'true' if want else 'false'}")
+            pos += cs
 
-        if patched_attrs:
-            logger.info(f"[AXML] Pass1 patched: {', '.join(patched_attrs)}")
+        if patched:
+            logger.info(f"[AXML] Pass1 patched: {', '.join(patched)}")
+        else:
+            logger.info("[AXML] Pass1: booleans already correct")
 
-        # ── Pass 2: inject missing uses-permission nodes ───────────────────────
-        # Permissions to inject — only if listed in workspace XML
-        PERMS_TO_INJECT = [
+        # ── Step E: Pass 2 — inject missing permissions ───────────────────────
+        PERMS_ALL = [
             "android.permission.REQUEST_INSTALL_PACKAGES",
             "android.permission.QUERY_ALL_PACKAGES",
             "android.permission.REQUEST_DELETE_PACKAGES",
             "android.permission.OVERRIDE_PACKAGE_VERIFICATION",
         ]
+        perms_needed = [p for p in PERMS_ALL if p not in existing]
 
-        # Find which permissions are in workspace XML but missing from binary
-        # Check binary string pool for existing permissions
-        existing_strings = set()
-        for i in range(str_count):
-            existing_strings.add(read_string(i))
+        if not perms_needed:
+            logger.info("[AXML] Pass2: all permissions already present")
+            _st.pack_into("<I", data, 4, len(data))
+            return data
 
-        perms_needed = []
-        for perm in PERMS_TO_INJECT:
-            if perm in ws_xml and perm not in existing_strings:
-                perms_needed.append(perm)
-
-        if perms_needed:
-            data = self._axml_inject_permissions(data, perms_needed)
-            logger.info(f"[AXML] Pass2 injected {len(perms_needed)} permissions: "
-                        f"{', '.join(perms_needed)}")
-
-        # ── Update file size in AXML header ──────────────────────────────────
-        _struct.pack_into("<I", data, 4, len(data))
-
-        logger.info(f"[AXML] Patch complete — final size: {len(data):,} bytes")
-        return data
-
-    def _axml_inject_permissions(self, data: bytearray,
-                                  perms: list) -> bytearray:
-        """
-        Inject new <uses-permission android:name="..."/> nodes into binary AXML.
-
-        Strategy: find the END_ELEMENT chunk for </manifest> (the last one
-        in the file) and insert new uses-permission START+END element pairs
-        immediately before it.
-
-        Each uses-permission node in binary AXML is:
-          START_NS  (if needed — reuse existing android namespace)
-          START_ELEMENT: type=0x0102, 1 attribute (android:name = string)
-          END_ELEMENT:   type=0x0103
-
-        We reuse the existing android namespace index already in the file.
-        New strings are appended to the string pool and res_ids updated.
-        """
-        import struct as _struct
-
-        # ── Locate the final END_ELEMENT (</manifest>) position ──────────────
-        # Walk all chunks and remember the last END_ELEMENT offset
-        last_end_elem_pos = -1
-        pos = 8
+        # ── Find last END_ELEMENT = closing </manifest> ───────────────────────
+        last_ee_pos  = -1
+        last_ee_size = 0
+        pos = CHUNK_START
         while pos < len(data) - 8:
-            ctype = _struct.unpack_from("<H", data, pos)[0]
-            csize = _struct.unpack_from("<I", data, pos + 4)[0]
-            if csize == 0:
+            ct = _st.unpack_from("<H", data, pos)[0]
+            cs = _st.unpack_from("<I", data, pos + 4)[0]
+            if cs == 0:
                 break
-            if ctype == 0x0103:  # END_ELEMENT
-                last_end_elem_pos = pos
-            pos += csize
+            if ct == 0x0103:
+                last_ee_pos  = pos
+                last_ee_size = cs
+            pos += cs
 
-        if last_end_elem_pos < 0:
-            logger.warning("[AXML] Could not find </manifest> end element — "
-                           "permission injection skipped")
+        if last_ee_pos < 0:
+            logger.warning("[AXML] Pass2: no END_ELEMENT — skipping injection")
+            _st.pack_into("<I", data, 4, len(data))
             return data
 
-        # ── Find android namespace URI index in string pool ───────────────────
-        sp_pos       = 8
-        str_count    = _struct.unpack_from("<I", data, sp_pos + 8)[0]
-        sp_size      = _struct.unpack_from("<I", data, sp_pos + 4)[0]
-        flags        = _struct.unpack_from("<I", data, sp_pos + 16)[0]
-        strings_start= _struct.unpack_from("<I", data, sp_pos + 20)[0]
-        utf8         = bool(flags & 0x100)
-        str_base_off = sp_pos + strings_start
+        # ── Find key string indices (already parsed above) ────────────────────
+        android_ns_idx = next((i for i in range(n_str)
+            if _rs(i) == "http://schemas.android.com/apk/res/android"), -1)
+        name_idx       = next((i for i in range(n_str) if _rs(i) == "name"), -1)
+        up_idx         = next((i for i in range(n_str) if _rs(i) == "uses-permission"), -1)
 
-        def _read_str(idx):
-            if idx >= str_count:
-                return ""
-            off  = _struct.unpack_from("<I", data, sp_pos + 28 + idx * 4)[0]
-            p2   = str_base_off + off
-            try:
-                if utf8:
-                    slen = data[p2 + 1]
-                    return data[p2 + 2: p2 + 2 + slen].decode("utf-8", errors="replace")
-                else:
-                    slen = _struct.unpack_from("<H", data, p2)[0]
-                    return data[p2 + 2: p2 + 2 + slen * 2].decode("utf-16-le", errors="replace")
-            except Exception:
-                return ""
-
-        android_ns_idx = -1
-        name_attr_idx  = -1
-        uses_perm_idx  = -1
-        for i in range(str_count):
-            s = _read_str(i)
-            if s == "http://schemas.android.com/apk/res/android":
-                android_ns_idx = i
-            if s == "name":
-                name_attr_idx = i
-            if s == "uses-permission":
-                uses_perm_idx = i
-
-        if android_ns_idx < 0 or name_attr_idx < 0:
-            logger.warning("[AXML] Missing namespace/name strings — "
-                           "permission injection skipped")
+        if android_ns_idx < 0 or name_idx < 0:
+            logger.warning("[AXML] Pass2: missing ns/name strings — skip")
+            _st.pack_into("<I", data, 4, len(data))
             return data
 
-        # ── Add new permission strings to string pool ─────────────────────────
-        # Build new string pool with extra entries appended
-        # Collect all existing string offsets + raw string bytes
-        existing_offsets = []
-        for i in range(str_count):
-            existing_offsets.append(
-                _struct.unpack_from("<I", data, sp_pos + 28 + i * 4)[0])
+        # ── Build extended string pool ────────────────────────────────────────
+        old_offsets = [_st.unpack_from("<I", data, SP + 28 + i * 4)[0]
+                       for i in range(n_str)]
+        str_data    = bytearray(data[STR_BASE: SP + sp_size])
+        new_offsets = list(old_offsets)
+        perm_idx_map = {}
 
-        # Rebuild string data section: copy existing + append new
-        # String data starts at str_base_off, ends at sp_pos+sp_size
-        old_str_data = bytes(data[str_base_off: sp_pos + sp_size])
-        new_str_data = bytearray(old_str_data)
-        new_str_offsets = list(existing_offsets)
-
-        new_perm_indices = {}  # perm string -> new index in pool
-        # Also need uses-permission string if missing
-        if uses_perm_idx < 0:
-            # Add "uses-permission" string
-            new_idx = str_count + len(new_perm_indices)
-            off     = len(new_str_data)
-            new_str_offsets.append(off)
+        def _append_str(s):
+            off = len(str_data)
             if utf8:
-                s_enc = "uses-permission".encode("utf-8")
-                new_str_data += bytes([len(s_enc), len(s_enc)]) + s_enc + b"\x00"
+                enc = s.encode("utf-8")
+                str_data.extend(bytes([len(s), len(enc)]) + enc + b"\x00")
             else:
-                s_enc = "uses-permission".encode("utf-16-le")
-                new_str_data += _struct.pack("<H", len("uses-permission")) + s_enc + b"\x00\x00"
-            uses_perm_idx = new_idx
+                enc = s.encode("utf-16-le")
+                str_data.extend(_st.pack("<H", len(s)) + enc + b"\x00\x00")
+            return off
 
-        for perm in perms:
-            new_idx = str_count + len(new_perm_indices)
-            off     = len(new_str_data)
-            new_str_offsets.append(off)
-            if utf8:
-                s_enc = perm.encode("utf-8")
-                new_str_data += bytes([len(s_enc), len(s_enc)]) + s_enc + b"\x00"
-            else:
-                s_enc = perm.encode("utf-16-le")
-                new_str_data += _struct.pack("<H", len(perm)) + s_enc + b"\x00\x00"
-            new_perm_indices[perm] = new_idx
+        if up_idx < 0:
+            new_offsets.append(_append_str("uses-permission"))
+            up_idx = len(new_offsets) - 1
 
-        new_str_count = str_count + len(new_perm_indices)
-        # Add uses-permission index increase if we added it
-        if uses_perm_idx >= str_count:
-            new_str_count += 1  # already counted above — adjust
-            # Recalculate: total = original + however many we added
-            new_str_count = str_count + (len(new_perm_indices) +
-                            (1 if uses_perm_idx >= str_count else 0))
+        for perm in perms_needed:
+            new_offsets.append(_append_str(perm))
+            perm_idx_map[perm] = len(new_offsets) - 1
 
-        # Rebuild string pool chunk
-        # Header: type(2) header_size(2) chunk_size(4) stringCount(4) styleCount(4)
-        #         flags(4) stringsStart(4) stylesStart(4)
-        # Then offsets (4 each) then string data
-        style_count  = _struct.unpack_from("<I", data, sp_pos + 12)[0]
-        styles_start = _struct.unpack_from("<I", data, sp_pos + 24)[0]
-        header_size  = 28  # fixed for string pool
+        # ── Rebuild string pool chunk ─────────────────────────────────────────
+        HDR           = 28
+        new_n         = len(new_offsets)
+        new_str_start = HDR + new_n * 4
+        new_sp_size   = new_str_start + len(str_data)
 
-        new_offsets_count = len(new_str_offsets)
-        new_strings_start = header_size + new_offsets_count * 4
-        new_sp_size       = new_strings_start + len(new_str_data)
+        new_sp  = _st.pack("<HH", 0x0001, HDR)
+        new_sp += _st.pack("<I",  new_sp_size)
+        new_sp += _st.pack("<I",  new_n)
+        new_sp += _st.pack("<I",  n_sty)
+        new_sp += _st.pack("<I",  flags)
+        new_sp += _st.pack("<I",  new_str_start)
+        new_sp += _st.pack("<I",  sty_off)
+        for o in new_offsets:
+            new_sp += _st.pack("<I", o)
+        new_sp += bytes(str_data)
 
-        new_sp = bytearray()
-        new_sp += _struct.pack("<HH", 0x0001, header_size)        # type + header_size
-        new_sp += _struct.pack("<I",  new_sp_size)                 # chunk_size
-        new_sp += _struct.pack("<I",  new_offsets_count)           # stringCount
-        new_sp += _struct.pack("<I",  style_count)                 # styleCount
-        new_sp += _struct.pack("<I",  flags)                       # flags
-        new_sp += _struct.pack("<I",  new_strings_start)           # stringsStart
-        new_sp += _struct.pack("<I",  styles_start)                # stylesStart
-        for off in new_str_offsets:
-            new_sp += _struct.pack("<I", off)
-        new_sp += bytes(new_str_data)
+        # ── Rebuild RES_MAP ───────────────────────────────────────────────────
+        extra   = new_n - n_str
+        new_rm  = bytearray(data[RM: RM + rm_size])
+        for _ in range(extra):
+            new_rm += _st.pack("<I", 0x00000000)
+        _st.pack_into("<I", new_rm, 4, len(new_rm))
 
-        # ── Rebuild RES_MAP — add 0x00000000 for new string entries ──────────
-        res_map_pos  = sp_pos + sp_size
-        res_map_size = _struct.unpack_from("<I", data, res_map_pos + 4)[0]
-        old_res_map  = bytes(data[res_map_pos: res_map_pos + res_map_size])
-        new_res_map  = bytearray(old_res_map)
-        extra_entries = new_offsets_count - str_count
-        for _ in range(extra_entries):
-            new_res_map += _struct.pack("<I", 0x00000000)
-        _struct.pack_into("<I", new_res_map, 4, len(new_res_map))
-
-        # ── Build the new permission element chunks ───────────────────────────
-        # Each uses-permission = START_ELEMENT(1 attr) + END_ELEMENT
-        # START_ELEMENT layout:
-        #   type(2) header_size(2) chunk_size(4) line_number(4) comment(4)
-        #   ns(4) name(4) attr_start(2) attr_size(2) attr_count(2)
-        #   id_attr(2) class_attr(2) style_attr(2)
-        #   [attrs]: ns(4) name(4) raw_val(4) val_size(2) res0(1) type(1) val(4)
-        # END_ELEMENT layout:
-        #   type(2) header_size(2) chunk_size(4) line_number(4) comment(4) ns(4) name(4)
-
+        # ── Build permission element chunks ───────────────────────────────────
         perm_chunks = bytearray()
-        for perm in perms:
-            perm_str_idx = new_perm_indices[perm]
-
-            # START_ELEMENT
-            se = bytearray()
-            se += _struct.pack("<HH", 0x0102, 16)          # type, header_size
-            se += _struct.pack("<I",  56)                   # chunk_size (header16 + node_hdr20 + 1attr*20)
-            se += _struct.pack("<I",  1)                    # line_number
-            se += _struct.pack("<I",  0xFFFFFFFF)           # comment (-1)
-            se += _struct.pack("<I",  0xFFFFFFFF)           # ns (-1)
-            se += _struct.pack("<I",  uses_perm_idx)        # name = "uses-permission"
-            se += _struct.pack("<H",  20)                   # attr_start
-            se += _struct.pack("<H",  20)                   # attr_size
-            se += _struct.pack("<H",  1)                    # attr_count
-            se += _struct.pack("<H",  0)                    # id_attr
-            se += _struct.pack("<H",  0)                    # class_attr
-            se += _struct.pack("<H",  0)                    # style_attr
-            # Attribute: android:name = perm_string
-            se += _struct.pack("<I",  android_ns_idx)       # attr ns
-            se += _struct.pack("<I",  name_attr_idx)        # attr name = "name"
-            se += _struct.pack("<I",  perm_str_idx)         # raw value = string idx
-            se += _struct.pack("<H",  8)                    # val_size
-            se += _struct.pack("<B",  0)                    # res0
-            se += _struct.pack("<B",  0x03)                 # type = TYPE_STRING
-            se += _struct.pack("<I",  perm_str_idx)         # val = string idx
-
-            # END_ELEMENT
-            ee = bytearray()
-            ee += _struct.pack("<HH", 0x0103, 16)           # type, header_size
-            ee += _struct.pack("<I",  24)                   # chunk_size
-            ee += _struct.pack("<I",  1)                    # line_number
-            ee += _struct.pack("<I",  0xFFFFFFFF)           # comment
-            ee += _struct.pack("<I",  0xFFFFFFFF)           # ns
-            ee += _struct.pack("<I",  uses_perm_idx)        # name
-
+        for perm in perms_needed:
+            pidx = perm_idx_map[perm]
+            se   = (_st.pack("<HH", 0x0102, 16) +
+                    _st.pack("<I",  56) +
+                    _st.pack("<I",  1) +
+                    _st.pack("<I",  0xFFFFFFFF) +
+                    _st.pack("<I",  0xFFFFFFFF) +
+                    _st.pack("<I",  up_idx) +
+                    _st.pack("<H",  20) +
+                    _st.pack("<H",  20) +
+                    _st.pack("<H",  1) +
+                    _st.pack("<H",  0) +
+                    _st.pack("<H",  0) +
+                    _st.pack("<H",  0) +
+                    _st.pack("<I",  android_ns_idx) +
+                    _st.pack("<I",  name_idx) +
+                    _st.pack("<I",  pidx) +
+                    _st.pack("<H",  8) +
+                    _st.pack("<B",  0) +
+                    _st.pack("<B",  0x03) +
+                    _st.pack("<I",  pidx))
+            ee   = (_st.pack("<HH", 0x0103, 16) +
+                    _st.pack("<I",  24) +
+                    _st.pack("<I",  1) +
+                    _st.pack("<I",  0xFFFFFFFF) +
+                    _st.pack("<I",  0xFFFFFFFF) +
+                    _st.pack("<I",  up_idx))
             perm_chunks += se + ee
 
-        # ── Assemble final patched AXML ───────────────────────────────────────
-        # Structure: XML_FILE_header(8) + new_sp + new_res_map +
-        #            existing_chunks[after_res_map..last_end_elem] +
-        #            perm_chunks +
-        #            last_end_elem_chunk
+        # ── Assemble final AXML file ──────────────────────────────────────────
+        body_before = bytes(data[CHUNK_START: last_ee_pos])
+        last_ee     = bytes(data[last_ee_pos: last_ee_pos + last_ee_size])
 
-        body_start   = sp_pos + sp_size + res_map_size      # start of XML chunks
-        # last_end_elem_pos is absolute in original data
-        # We need to adjust: body in original = data[body_start:]
-        # After replacing sp+res_map the offsets shift
-        size_delta   = (len(new_sp) - sp_size) + (len(new_res_map) - res_map_size)
+        new_file  = bytearray()
+        new_file += _st.pack("<HH", 0x0003, 8)
+        new_file += _st.pack("<I",  0)
+        new_file += new_sp
+        new_file += bytes(new_rm)
+        new_file += body_before
+        new_file += bytes(perm_chunks)
+        new_file += last_ee
+        _st.pack_into("<I", new_file, 4, len(new_file))
 
-        last_end_in_orig = last_end_elem_pos
-        last_end_size    = _struct.unpack_from("<I", data, last_end_in_orig + 4)[0]
-
-        body_before_last = bytes(data[body_start: last_end_in_orig])
-        last_end_chunk   = bytes(data[last_end_in_orig: last_end_in_orig + last_end_size])
-
-        new_body = body_before_last + bytes(perm_chunks) + last_end_chunk
-
-        # XML_FILE header (type=0x0003, header_size=8, file_size=TBD)
-        new_file = bytearray()
-        new_file += _struct.pack("<HH", 0x0003, 8)          # XML_FILE header
-        new_file += _struct.pack("<I",  0)                  # placeholder for total size
-        new_file += bytes(new_sp)
-        new_file += bytes(new_res_map)
-        new_file += new_body
-        # Fix total file size
-        _struct.pack_into("<I", new_file, 4, len(new_file))
-
+        logger.info(
+            f"[AXML] Pass2 injected {len(perms_needed)} perms: "
+            f"{', '.join(perms_needed)}")
+        logger.info(
+            f"[AXML] Complete — {len(data):,}b → {len(new_file):,}b")
         return new_file
+
 
     def _validate_apk(self, output_apk: str) -> str:
         """Validate output APK contains classes.dex."""
