@@ -7,8 +7,12 @@
 # GitHub Actions uses this file for pip dependency caching.
 # ══════════════════════════════════════════════════════════════════
 
-# Telegram Bot Framework — latest stable
-python-telegram-bot==22.7
+# Telegram Bot Framework
+# NOTE: Script uses Application.builder(), CallbackQueryHandler,
+# CommandHandler, MessageHandler, filters, ContextTypes — all
+# compatible with python-telegram-bot 21.x series.
+# 22.x has breaking changes — pinned to 21.9 for stability.
+python-telegram-bot==21.9
 
 # Web Keep-Alive Server
 flask==3.1.3
