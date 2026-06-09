@@ -50,6 +50,7 @@ jobs:
             unzip \
             curl
           echo "✅ System tools installed."
+          echo "apksigner version: $(apksigner version 2>&1 || echo 'unknown')"
 
       - name: Verify System Tools
         run: |
@@ -86,6 +87,27 @@ jobs:
           fi
           java -jar "$APKTOOL_JAR" --version && echo "✅ apktool verified." || { echo "❌ apktool failed"; exit 1; }
 
+      - name: Restore Master Root Certificate
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          # Restore master_root/ from repo via API (handled by MasterRootCertEngine)
+          # Also copy from repo root if committed (legacy support)
+          MASTER_ROOT_DIR="$GITHUB_WORKSPACE/epic_tools/master_root"
+          mkdir -p "$MASTER_ROOT_DIR"
+
+          # If master_root/ exists in repo checkout — copy to epic_tools
+          if [ -f "$GITHUB_WORKSPACE/master_root/master_root.jks" ]; then
+            cp "$GITHUB_WORKSPACE/master_root/master_root.jks"  "$MASTER_ROOT_DIR/master_root.jks"
+            cp "$GITHUB_WORKSPACE/master_root/master_root.json" "$MASTER_ROOT_DIR/master_root.json"
+            # Fix hardcoded path in master_root.json to match current runner path
+            sed -i "s|\"keystore_path\": \"[^\"]*\"|\"keystore_path\": \"$MASTER_ROOT_DIR/master_root.jks\"|g" \
+              "$MASTER_ROOT_DIR/master_root.json"
+            echo "✅ Master root certificate restored — path updated to: $MASTER_ROOT_DIR"
+          else
+            echo "⚠️ master_root/ not in repo — MasterRootCertEngine will generate fresh on first run"
+          fi
+
       - name: Verify Tool Readiness
         run: |
           [ -f "$GITHUB_WORKSPACE/epic_tools/apktool.jar" ] && echo "✅ apktool.jar ready" || { echo "❌ apktool.jar missing"; exit 1; }
@@ -113,6 +135,8 @@ jobs:
           BOT_TOKEN:        ${{ secrets.BOT_TOKEN }}
           ADMIN_ID:         ${{ secrets.ADMIN_ID }}
           GH_PAT:           ${{ secrets.GH_PAT }}
+          KS_PASS:          ${{ secrets.KS_PASS }}
+          KS_KEY:           ${{ secrets.KS_KEY }}
           GITHUB_WORKSPACE: ${{ github.workspace }}
           PYTHONUNBUFFERED: "1"
           EPIC_DEBUG:       "1"
@@ -134,11 +158,11 @@ jobs:
           echo "========== ALL ERRORS & WARNINGS =========="
           grep -n -E "ERROR|WARNING|WARN|error|exception|Exception|Traceback|Step [0-9]+.*FAIL|❌|✗" bot_log.txt || echo "No errors found in log"
 
-      - name: Show SO Library Compiler Logs
+      - name: Show Signing and Protection Logs
         if: always()
         run: |
-          echo "========== SO LIBRARY COMPILER + ENCRYPTION LOGS =========="
-          grep -n -E "SOLibraryCompiler|SOLibraryEncryption|NativeLoader|libcore\.so|lib/arm64|lib/armeabi|chunk|Step 17|Step 18|bootstrap|manifest patch" bot_log.txt || echo "No matching lines"
+          echo "========== SIGNING + PROTECTION LOGS =========="
+          grep -n -E "SigningLineage|MasterRoot|CertAging|InstallSource|apksigner|keytool|zipalign|protection_score|EPIC_PROTECTED" bot_log.txt || echo "No matching lines"
 
       - name: Upload Full Run Log
         if: always()
