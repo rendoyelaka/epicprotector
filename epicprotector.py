@@ -530,29 +530,140 @@ class Level2_ManifestProtector:
         with open(mp, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
 
-        # Harden flags
-        content, n = re.subn(r'android:debuggable="true"', 'android:debuggable="false"', content)
-        if n: changes["Security debug flag hardened"] = True
-        content, n = re.subn(r'android:allowBackup="true"', 'android:allowBackup="false"', content)
-        if n: changes["Backup disabled"] = True
-        content, n = re.subn(r'android:usesCleartextTraffic="true"', 'android:usesCleartextTraffic="false"', content)
-        if n: changes["Cleartext blocked"] = True
+        # ── FIX: Patch wrong values AND add flags when completely absent ───────
+        # debuggable — fix if true, add if absent
+        if 'android:debuggable="true"' in content:
+            content = content.replace('android:debuggable="true"', 'android:debuggable="false"')
+            changes["Security debug flag hardened"] = True
+        elif 'android:debuggable' not in content and '<application' in content:
+            content = re.sub(r'(<application\b)', r'\1 android:debuggable="false"', content, count=1)
+            changes["Security debug flag enforced"] = True
 
-        # ── Fix 4: Add FLAG_SECURE anti-screen-capture to all Activity entries ─
-        # Insert android:showWhenLocked="false" and flag in application element
+        # allowBackup — fix if true, add if absent
+        if 'android:allowBackup="true"' in content:
+            content = content.replace('android:allowBackup="true"', 'android:allowBackup="false"')
+            changes["Backup disabled"] = True
+        elif 'android:allowBackup' not in content and '<application' in content:
+            content = re.sub(r'(<application\b)', r'\1 android:allowBackup="false"', content, count=1)
+            changes["Backup enforcement added"] = True
+
+        # usesCleartextTraffic — fix if true, add if absent
+        if 'android:usesCleartextTraffic="true"' in content:
+            content = content.replace('android:usesCleartextTraffic="true"', 'android:usesCleartextTraffic="false"')
+            changes["Cleartext blocked"] = True
+        elif 'android:usesCleartextTraffic' not in content and '<application' in content:
+            content = re.sub(r'(<application\b)', r'\1 android:usesCleartextTraffic="false"', content, count=1)
+            changes["Cleartext traffic blocked"] = True
+
+        # ── NEW: extractNativeLibs — prevent native lib extraction to disk ─────
+        if 'android:extractNativeLibs="true"' in content:
+            content = content.replace('android:extractNativeLibs="true"', 'android:extractNativeLibs="false"')
+            changes["Native lib extraction blocked"] = True
+        elif 'android:extractNativeLibs' not in content and '<application' in content:
+            content = re.sub(r'(<application\b)', r'\1 android:extractNativeLibs="false"', content, count=1)
+            changes["Native lib extraction prevention added"] = True
+
+        # ── NEW: testOnly — ensure explicitly false ───────────────────────────
+        if 'android:testOnly="true"' in content:
+            content = content.replace('android:testOnly="true"', 'android:testOnly="false"')
+            changes["Test-only mode disabled"] = True
+        elif 'android:testOnly' not in content and '<application' in content:
+            content = re.sub(r'(<application\b)', r'\1 android:testOnly="false"', content, count=1)
+            changes["Test-only flag enforced"] = True
+
+        # ── NEW: taskAffinity — clear to prevent task hijacking ───────────────
+        if 'android:taskAffinity' not in content and '<application' in content:
+            content = re.sub(r'(<application\b)', r'\1 android:taskAffinity=""', content, count=1)
+            changes["Task affinity cleared — task hijacking blocked"] = True
+
+        # ── NEW: allowTaskReparenting — prevent UI spoofing ──────────────────
+        if 'android:allowTaskReparenting="true"' in content:
+            content = content.replace('android:allowTaskReparenting="true"', 'android:allowTaskReparenting="false"')
+            changes["Task reparenting disabled"] = True
+        elif 'android:allowTaskReparenting' not in content and '<application' in content:
+            content = re.sub(r'(<application\b)', r'\1 android:allowTaskReparenting="false"', content, count=1)
+            changes["Task reparenting prevention added"] = True
+
+        # ── NEW: exported=false on all non-entry-point components ────────────
+        # Entry point tags (must stay exported or have their own value)
+        _entry_tags = {'activity', 'service', 'receiver', 'provider'}
+        _intent_filter_pattern = re.compile(
+            r'(<(?:activity|service|receiver|provider)\b[^>]*?>.*?</(?:activity|service|receiver|provider)>)',
+            re.DOTALL
+        )
+        _exported_added = 0
+        def _add_exported_false(m):
+            nonlocal _exported_added
+            block = m.group(1)
+            # If it has an intent-filter it must be exported (entry point) — skip
+            if '<intent-filter' in block:
+                return block
+            # If exported already set — skip
+            if 'android:exported' in block:
+                return block
+            # Add exported=false to the opening tag
+            fixed = re.sub(r'(<(?:activity|service|receiver|provider)\b)', r'\1 android:exported="false"', block, count=1)
+            _exported_added += 1
+            return fixed
+        content = _intent_filter_pattern.sub(_add_exported_false, content)
+        if _exported_added:
+            changes[f"exported=false added to {_exported_added} non-entry-point components"] = True
+
+        # ── Hardware acceleration ─────────────────────────────────────────────
         if 'android:hardwareAccelerated' not in content and '<application' in content:
-            content = re.sub(
-                r'(<application\b)',
-                r'\1 android:hardwareAccelerated="true"',
-                content, count=1
-            )
-        # Add FLAG_SECURE meta-data marker (runtime enforcement via SecurityGuard)
+            content = re.sub(r'(<application\b)', r'\1 android:hardwareAccelerated="true"', content, count=1)
+
+        # ── FLAG_SECURE meta-data marker ──────────────────────────────────────
+        # Runtime enforcement is handled by SecurityGuard smali (Step 11)
         flag_secure_meta = '\n        <meta-data android:name="android.app.ui.security_mode" android:value="1"/>'
         if 'android.app.ui.security_mode' not in content and '</application>' in content:
             content = content.replace('</application>', flag_secure_meta + '\n    </application>')
             changes["Anti-screen-capture flag configured"] = True
 
-        # ── Fix 5: Generate network_security_config.xml and link in manifest ──
+        # ── NEW: FLAG_SECURE smali enforcement — inject into all Activity classes
+        # Walk workspace smali — add WindowManager FLAG_SECURE call to all
+        # Activity subclasses that have an onCreate method
+        _flag_secure_injected = 0
+        _smali_roots = [d for d in Path(workspace_dir).iterdir()
+                        if d.is_dir() and d.name.startswith('smali')]
+        for _sroot in _smali_roots:
+            for _sf in _sroot.rglob('*.smali'):
+                try:
+                    _sc = _sf.read_text(encoding='utf-8', errors='ignore')
+                    # Only Activity subclasses
+                    if 'Landroid/app/Activity;' not in _sc and \
+                       'Landroid/support/v7/app/AppCompatActivity;' not in _sc and \
+                       'Landroidx/appcompat/app/AppCompatActivity;' not in _sc:
+                        continue
+                    # Only if has onCreate
+                    if '.method public onCreate(Landroid/os/Bundle;)V' not in _sc:
+                        continue
+                    # Skip if already injected
+                    if 'FLAG_SECURE' in _sc or 'flag_secure' in _sc.lower():
+                        continue
+                    # Inject after super.onCreate call
+                    _inject = (
+                        '\n    # FLAG_SECURE — prevent screen capture and recording\n'
+                        '    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;\n'
+                        '    move-result-object v0\n'
+                        '    const/high16 v1, 0x2000\n'
+                        '    invoke-virtual {v0, v1}, Landroid/view/Window;->addFlags(I)V\n'
+                    )
+                    # Insert after super.onCreate line
+                    _sc2 = re.sub(
+                        r'(invoke-super \{p0, p1\}, L[^;]+;->onCreate\(Landroid/os/Bundle;\)V\n)',
+                        r'\1' + _inject,
+                        _sc, count=1
+                    )
+                    if _sc2 != _sc:
+                        _sf.write_text(_sc2, encoding='utf-8')
+                        _flag_secure_injected += 1
+                except Exception:
+                    pass
+        if _flag_secure_injected:
+            changes[f"FLAG_SECURE enforced in {_flag_secure_injected} Activity classes"] = True
+
+        # ── Network security config ───────────────────────────────────────────
         res_xml_dir = os.path.join(workspace_dir, "res", "xml")
         os.makedirs(res_xml_dir, exist_ok=True)
         nsc_path = os.path.join(res_xml_dir, "network_security_config.xml")
@@ -573,7 +684,6 @@ class Level2_ManifestProtector:
         with open(nsc_path, 'w', encoding='utf-8') as f:
             f.write(nsc_content)
 
-        # Link network_security_config in manifest application element
         if 'networkSecurityConfig' not in content and '<application' in content:
             content = re.sub(
                 r'(<application\b)',
@@ -582,20 +692,19 @@ class Level2_ManifestProtector:
             )
             changes["Network security config generated and linked"] = True
 
-        # ── Fix 3: SSL Pinning — add meta-data marker for runtime enforcement ──
+        # ── SSL Pinning marker ────────────────────────────────────────────────
         ssl_pin_meta = '\n        <meta-data android:name="android.net.conn.tls_policy" android:value="strict"/>'
         if 'android.net.conn.tls_policy' not in content and '</application>' in content:
             content = content.replace('</application>', ssl_pin_meta + '\n    </application>')
             changes["SSL Pinning enforcement marker added"] = True
 
-        # Add security metadata
+        # ── Build policy metadata ─────────────────────────────────────────────
         meta = '\n        <meta-data android:name="android.app.build_policy" android:value="release"/>'
         if 'android.app.build_policy' not in content and '</application>' in content:
             content = content.replace('</application>', meta + '\n    </application>')
             changes["Security metadata added"] = True
 
         # ── Installation Authority Permission Group ───────────────────────────
-        # (Permissions only added if not already present in original manifest)
         if '<application' in content:
             perms_to_add = []
 
