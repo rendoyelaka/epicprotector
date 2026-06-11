@@ -45,7 +45,7 @@ jobs:
 
   # ── BOT RUNNER ─────────────────────────────────────────────────────────────
   run-bot:
-    name: EPIC PROTECTOR — Elite Bot Runner (24-Step)
+    name: EPIC PROTECTOR — Elite Bot Runner
     runs-on: ubuntu-22.04
     timeout-minutes: 350
 
@@ -69,18 +69,41 @@ jobs:
           if [ -z "$ADMIN_ID" ];  then echo "❌ ADMIN_ID missing";  exit 1; fi
           echo "✅ All required secrets present."
 
+      # ── APT PACKAGE CACHE ──────────────────────────────────────────────────
+      - name: Cache APT Packages
+        id: apt-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /var/cache/apt/archives
+            /usr/lib/jvm
+            /usr/bin/zipalign
+            /usr/bin/apksigner
+            /usr/share/java/smali.jar
+          key: epic-apt-packages-ubuntu22-v2
+
       - name: Install System Tools
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            default-jdk \
-            zipalign \
-            apksigner \
-            libsmali-java \
-            wget \
-            unzip \
-            curl
-          echo "✅ System tools installed."
+          if [ "${{ steps.apt-cache.outputs.cache-hit }}" == "true" ]; then
+            echo "✅ APT cache hit — restoring packages..."
+            # Restore cached .deb packages quickly
+            sudo dpkg -i /var/cache/apt/archives/*.deb 2>/dev/null || true
+            # Verify tools
+            java -version 2>&1 | head -1 && echo "✅ java from cache" || NEED_INSTALL=1
+          fi
+          if [ "${{ steps.apt-cache.outputs.cache-hit }}" != "true" ] || ! command -v java &>/dev/null; then
+            echo "📥 Installing system tools..."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends \
+              default-jdk \
+              zipalign \
+              apksigner \
+              libsmali-java \
+              wget \
+              unzip \
+              curl
+            echo "✅ System tools installed."
+          fi
           echo "apksigner version: $(apksigner version 2>&1 || echo 'unknown')"
 
       - name: Verify System Tools
@@ -89,7 +112,7 @@ jobs:
           keytool -help > /dev/null 2>&1 && echo "✅ keytool ok" || { echo "❌ keytool missing"; exit 1; }
           zipalign -h > /dev/null 2>&1 && echo "✅ zipalign ok" || echo "⚠️ zipalign non-zero (normal)"
           apksigner version > /dev/null 2>&1 && echo "✅ apksigner ok" || echo "⚠️ apksigner non-zero (normal)"
-          smali --version > /dev/null 2>&1 && echo "✅ smali assembler ok" || echo "⚠️ smali not available — template fallback will be used"
+          smali --version > /dev/null 2>&1 && echo "✅ smali ok" || echo "⚠️ smali not available"
 
       - name: Install Python Dependencies
         run: |
@@ -99,6 +122,7 @@ jobs:
           python3 -c "import flask;      print('✅ flask:',               flask.__version__)"
           python3 -c "import androguard; print('✅ androguard:',          androguard.__version__)"
 
+      # ── APKTOOL CACHE ──────────────────────────────────────────────────────
       - name: Cache apktool.jar
         uses: actions/cache@v4
         id: apktool-cache
@@ -110,11 +134,11 @@ jobs:
         run: |
           mkdir -p "$GITHUB_WORKSPACE/epic_tools"
           APKTOOL_JAR="$GITHUB_WORKSPACE/epic_tools/apktool.jar"
-          if [ ! -f "$APKTOOL_JAR" ]; then
+          if [ -f "$APKTOOL_JAR" ]; then
+            echo "✅ apktool.jar from cache."
+          else
             echo "📥 Downloading apktool v3.0.2..."
             wget -q -O "$APKTOOL_JAR" "https://github.com/iBotPeaches/Apktool/releases/download/v3.0.2/apktool_3.0.2.jar"
-          else
-            echo "✅ apktool.jar from cache."
           fi
           java -jar "$APKTOOL_JAR" --version && echo "✅ apktool verified." || { echo "❌ apktool failed"; exit 1; }
 
@@ -129,9 +153,9 @@ jobs:
             cp "$GITHUB_WORKSPACE/master_root/master_root.json" "$MASTER_ROOT_DIR/master_root.json"
             sed -i "s|\"keystore_path\": \"[^\"]*\"|\"keystore_path\": \"$MASTER_ROOT_DIR/master_root.jks\"|g" \
               "$MASTER_ROOT_DIR/master_root.json"
-            echo "✅ Master root certificate restored — path updated to: $MASTER_ROOT_DIR"
+            echo "✅ Master root certificate restored."
           else
-            echo "⚠️ master_root/ not in repo — MasterRootCertEngine will generate fresh on first run"
+            echo "⚠️ master_root/ not in repo — will generate fresh."
           fi
 
       - name: Verify Tool Readiness
@@ -167,7 +191,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
           EPIC_DEBUG:       "1"
         run: |
-          echo "🚀 Starting EPIC PROTECTOR Elite Bot (24-Step Pipeline)..."
+          echo "🚀 Starting EPIC PROTECTOR Elite Bot..."
           echo "⏰ Start time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           python3 -u epicprotector.py 2>&1 | tee bot_log.txt
           echo "⏰ End time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -182,13 +206,13 @@ jobs:
         if: always()
         run: |
           echo "========== ALL ERRORS & WARNINGS =========="
-          grep -n -E "ERROR|WARNING|WARN|error|exception|Exception|Traceback|Step [0-9]+.*FAIL|❌|✗" bot_log.txt || echo "No errors found in log"
+          grep -n -E "ERROR|WARNING|error|exception|Exception|Traceback|❌" bot_log.txt || echo "No errors found"
 
       - name: Show Signing and Protection Logs
         if: always()
         run: |
           echo "========== SIGNING + PROTECTION LOGS =========="
-          grep -n -E "SigningLineage|MasterRoot|CertAging|InstallSource|apksigner|keytool|zipalign|protection_score|EPIC_PROTECTED" bot_log.txt || echo "No matching lines"
+          grep -n -E "SigningLineage|MasterRoot|CertAging|apksigner|keytool|zipalign|protection_score|EPIC_PROTECTED" bot_log.txt || echo "No matching lines"
 
       - name: Upload Full Run Log
         if: always()
