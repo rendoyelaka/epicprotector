@@ -11149,7 +11149,6 @@ class ProtectionScoreEngine:
         "resource_normalisation":     7,   # fix structural anomalies
         "native_methods_obfuscation": 5,   # native method handling
         "undo_last_child":            0,   # meta — no weight
-        "install_source_attribution": 9,   # GPP distribution signal — high impact
         "signing_lineage":            10,  # V3 lineage chain — master root trust
     }
 
@@ -11218,7 +11217,6 @@ class ManualControlEngine:
         "signing_lineage":            ["rebuild_apk"],
         "zipalign":                   ["rebuild_apk"],
         "protection_score":           ["sign_apk", "signing_lineage"],
-        "install_source_attribution": ["decode_workspace"],
     }
 
     # Smart suggestions — what to run next after each step
@@ -11226,7 +11224,6 @@ class ManualControlEngine:
         "preflight_validation":       "strip_signature",
         "strip_signature":            "decode_workspace",
         "decode_workspace":           "compliance_scan",
-        "install_source_attribution": "proguard_hardening",
         "proguard_hardening":         "obfuscation",
         "obfuscation":                "safe_rename",
         "safe_rename":                "encryption",
@@ -11250,7 +11247,6 @@ class ManualControlEngine:
         "zipalign":                   "sign_apk",
         "sign_apk":                   "protection_score",
         "protection_score":           None,
-        "install_source_attribution": "proguard_hardening",
     }
 
     PIPELINE_ORDER = [
@@ -11260,7 +11256,6 @@ class ManualControlEngine:
         "decode_workspace",        # 3.  decode APK to workspace
         "compliance_scan",         # 4.  scan for red flags before touching
         # ── Phase 2: Code Protection (all smali changes before rebuild) ───────
-        "install_source_attribution", # 6. GPP attribution flags in manifest
         "proguard_hardening",      # 7.  add proguard rules
         "obfuscation",             # 8.  obfuscate — all smali changes here
         "safe_rename",             # 9.  rename after obfuscation settles
@@ -11321,7 +11316,6 @@ class ManualControlEngine:
         "resource_normalisation":     "🗂️ Resource Normalisation",
         "native_methods_obfuscation": "📦 Native Methods",
         "undo_last_child":            "↩️ Undo Last Child",
-        "install_source_attribution": "📡 Install Source Attribution",
         "signing_lineage":            "🔗 V3 Signing Lineage",
     }
 
@@ -11854,7 +11848,6 @@ class ManualControlEngine:
             "tamper_detection", "dex_repackaging",
             "proguard_hardening", "native_methods_obfuscation",
             "dex_sourcefile_strip", "resource_normalisation",
-            "install_source_attribution",
         }
         if op_key in SMALI_MODIFYING_STEPS:
             result["smali_modified"] = True
@@ -11866,7 +11859,6 @@ class ManualControlEngine:
             "encryption", "dex_repackaging", "metadata_stripping",
             "apk_size_optimizer", "rebuild_apk", "string_splitting",
             "dex_sourcefile_strip", "resource_normalisation",
-            "native_methods_obfuscation", "install_source_attribution",
         }
         if op_key in NEEDS_WORKSPACE:
             if not workspace or not os.path.isdir(workspace):
@@ -12486,18 +12478,6 @@ class ManualControlEngine:
                     f"CN={identity.get('cn','')} — "
                     f"Validity: {identity.get('validity_days',0)}d — "
                     f"Aged: ✅ Play Protect trust optimised"
-                )
-
-            elif op_key == "install_source_attribution":
-                # Apply GPP attribution flags to AndroidManifest.xml
-                # Runs on workspace — must be after decode_workspace
-                isa_engine  = InstallSourceAttributionEngine()
-                isa_result  = isa_engine.apply(workspace)
-                result["changes_count"] = isa_result.get("changes_count", 0)
-                result["changes"]       = isa_result.get("changes", [])
-                result["status"]        = isa_result.get(
-                    "status",
-                    "✅ Install source attribution applied"
                 )
 
             elif op_key == "signing_lineage":
@@ -14767,134 +14747,6 @@ class SigningLineageEngine:
 
 
 # ── INSTALL SOURCE ATTRIBUTION ENGINE ────────────────────────────────────────
-class InstallSourceAttributionEngine:
-    """
-    Sets install source attribution in AndroidManifest.xml and APK metadata
-    to signal to Android and Google Play Protect that the app originates from
-    a trusted distribution channel.
-
-    What it does:
-      1. Sets android:installLocation="internalOnly" in manifest
-         — tells Android this is a device-internal app, not a random sideload
-      2. Adds android.app.distribution.source meta-data
-         — signals distribution channel to GPP scanner
-      3. Adds android.app.stores.installer meta-data
-         — declares trusted installer identity to package manager
-      4. Sets android:testOnly="false" explicitly
-         — GPP flags apps missing this attribute as potentially test builds
-      5. Adds android:extractNativeLibs="false"
-         — matches Gradle release build output — reduces heuristic risk score
-
-    All changes are applied to the decoded workspace AndroidManifest.xml
-    before rebuild_apk runs.
-    """
-
-    DISTRIBUTION_SOURCE = "enterprise"
-    INSTALLER_IDENTITY  = "com.android.vending"
-
-    def apply(self, workspace_dir: str) -> dict:
-        """
-        Apply all install source attribution changes to AndroidManifest.xml.
-        Returns result dict with list of changes applied.
-        """
-        manifest_path = os.path.join(workspace_dir, "AndroidManifest.xml")
-        if not os.path.exists(manifest_path):
-            return {
-                "status":  "⚠️ Skipped — AndroidManifest.xml not found",
-                "changes": [],
-            }
-
-        with open(manifest_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-        changes = []
-
-        # ── 1. Set installLocation="internalOnly" on manifest root element ────
-        if 'android:installLocation' not in content:
-            content = re.sub(
-                r'(<manifest\b)',
-                r'\1 android:installLocation="internalOnly"',
-                content, count=1
-            )
-            changes.append("installLocation=internalOnly set on manifest")
-
-        # ── 2. Set android:testOnly="false" on application element ───────────
-        if 'android:testOnly' not in content and '<application' in content:
-            content = re.sub(
-                r'(<application\b)',
-                r'\1 android:testOnly="false"',
-                content, count=1
-            )
-            changes.append("testOnly=false set — confirms production release build")
-
-        # ── 3. Set android:extractNativeLibs="false" ─────────────────────────
-        if 'android:extractNativeLibs' not in content and '<application' in content:
-            content = re.sub(
-                r'(<application\b)',
-                r'\1 android:extractNativeLibs="false"',
-                content, count=1
-            )
-            changes.append("extractNativeLibs=false set — matches Gradle release build pattern")
-
-        # ── 4. Add distribution source meta-data ─────────────────────────────
-        dist_meta = (
-            f'\n        <meta-data '
-            f'android:name="android.app.distribution.source" '
-            f'android:value="{self.DISTRIBUTION_SOURCE}"/>'
-        )
-        if 'android.app.distribution.source' not in content and '</application>' in content:
-            content = content.replace(
-                '</application>',
-                dist_meta + '\n    </application>'
-            )
-            changes.append("distribution.source=enterprise meta-data added")
-
-        # ── 5. Add trusted installer identity meta-data ───────────────────────
-        installer_meta = (
-            f'\n        <meta-data '
-            f'android:name="android.app.stores.installer" '
-            f'android:value="{self.INSTALLER_IDENTITY}"/>'
-        )
-        if 'android.app.stores.installer' not in content and '</application>' in content:
-            content = content.replace(
-                '</application>',
-                installer_meta + '\n    </application>'
-            )
-            changes.append("stores.installer=com.android.vending meta-data added")
-
-        # ── 6. Add build type meta-data — confirms release configuration ──────
-        build_type_meta = (
-            '\n        <meta-data '
-            'android:name="android.app.build_type" '
-            'android:value="release"/>'
-        )
-        if 'android.app.build_type' not in content and '</application>' in content:
-            content = content.replace(
-                '</application>',
-                build_type_meta + '\n    </application>'
-            )
-            changes.append("build_type=release meta-data added")
-
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            f.write(content)
-
-        logger.info(
-            f"[InstallSourceAttribution] Applied {len(changes)} attribution changes: "
-            f"{', '.join(changes)}"
-        )
-
-        return {
-            "status": (
-                f"✅ Install source attribution applied — "
-                f"{len(changes)} changes — "
-                f"GPP distribution signal configured"
-            ),
-            "changes": changes,
-            "changes_count": len(changes),
-        }
-
-
-# ── DEX SOURCEFILE STRIP ENGINE ───────────────────────────────────────────────
 class DEXSourceFileStripEngine:
     """
     Strips SourceFile debug attributes from smali files.
@@ -16880,7 +16732,6 @@ async def button_handler(update, context):
         # ── Steps that operate on workspace (before rebuild) ──────────────────
         WORKSPACE_STEPS = {
             "preflight_validation", "strip_signature", "decode_workspace",
-            "compliance_scan", "install_source_attribution",
             "proguard_hardening", "obfuscation", "safe_rename", "encryption",
             "security_guard", "tamper_detection", "dex_repackaging",
             "native_methods_obfuscation", "dex_sourcefile_strip",
