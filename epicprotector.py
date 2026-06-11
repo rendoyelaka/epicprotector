@@ -10929,57 +10929,6 @@ class ProGuardHardener:
         }
 
 
-# ── DEX REPACKAGER ────────────────────────────────────────────────────────────
-class DEXRepackager:
-    """
-    Repackages DEX files after all smali operations are complete.
-    Reorders class entries, normalizes DEX header fields,
-    making the DEX structure non-standard to resist decompilation.
-    """
-
-    def apply(self, workspace: str, tools: "ToolInstaller") -> dict:
-        smali_dirs = [
-            d for d in Path(workspace).iterdir()
-            if d.is_dir() and d.name.startswith("smali")
-        ]
-
-        if not smali_dirs:
-            return {"status": "⚠️ No smali directories found", "dex_count": 0}
-
-        repackaged = 0
-        work_dir   = os.path.dirname(workspace)
-
-        for smali_dir in smali_dirs:
-            try:
-                # Count smali files — reorder by shuffling class order
-                smali_files = list(smali_dir.rglob("*.smali"))
-                if not smali_files:
-                    continue
-
-                # Add a repackaging marker comment to each smali file
-                # This causes apktool to rebuild DEX in shuffled order
-                marker = f"\n# EPIC-REPACK-{random.randint(100000, 999999)}\n"
-                for sf in random.sample(smali_files, min(len(smali_files), 50)):
-                    try:
-                        with open(sf, "a") as f:
-                            f.write(marker)
-                    except Exception:
-                        continue
-
-                repackaged += 1
-
-            except Exception:
-                continue
-
-        return {
-            "dex_count":    repackaged,
-            "smali_dirs":   len(smali_dirs),
-            "status":       "✅ DEX repackaging markers applied",
-        }
-
-
-
-
 # ── MULTIDEX SPLIT ENCRYPTION ENGINE ─────────────────────────────────────────
 class MultiDexEncryptionEngine:
     """
@@ -11389,182 +11338,6 @@ class PseudoEncryptionEngine:
         return entries_done
 
 
-# ── ZIP HEADER PROTECTION ENGINE ─────────────────────────────────────────────
-class ZIPHeaderProtectionEngine:
-    """
-    ZIP Header Protection — Manifest Entry Compression Field Hardening.
-
-    Patches the compression method field in the ZIP local file header
-    and central directory header of the AndroidManifest.xml entry only.
-
-    Before patch: 08 00  (method 8 — standard Deflate)
-    After  patch: FC 41  (method 16892 — non-standard, unknown to reverse tools)
-
-    Effect:
-      - apktool, jadx, dex2jar and standard ZIP extractors fail to decode
-        the manifest entry — they encounter an unknown compression method
-        and abort or skip the entry.
-      - Android OS installer reads the manifest correctly because it uses
-        its own internal ZIP parser which handles non-standard method fields
-        in the local header without crashing — APK installs and runs normally.
-      - Only AndroidManifest.xml entry is patched — all other entries
-        (classes.dex, resources.arsc, res/, assets/, META-INF/) are
-        left completely untouched — no content is modified anywhere.
-
-    Pipeline position: AFTER pseudo_encryption, BEFORE integrity_manifest.
-    Operates on rebuilt.apk — AFTER rebuild_apk boundary.
-    Must run BEFORE zipalign and sign_apk — signature must cover patched bytes.
-    """
-
-    # Non-standard compression method value — unknown to standard tools
-    # 16892 decimal = 0x41FC = bytes FC 41 (little-endian in ZIP header)
-    PROTECTION_METHOD = 16892
-
-    # Target entry — only this entry is patched
-    TARGET_ENTRY = "AndroidManifest.xml"
-
-    def apply(self, apk_path: str) -> dict:
-        """
-        Patch AndroidManifest.xml ZIP header compression field to
-        non-standard method 16892 in both local and central directory headers.
-        Returns result dict with status.
-        """
-        if not apk_path or not os.path.exists(apk_path):
-            return {
-                "status":         "❌ ZIP header protection failed — APK not found",
-                "headers_patched": 0,
-            }
-
-        try:
-            patched = self._patch_zip_headers(apk_path)
-            if patched > 0:
-                return {
-                    "status": (
-                        f"✅ ZIP header protection applied — "
-                        f"AndroidManifest.xml compression field set to "
-                        f"method 16892 — "
-                        f"{patched} header(s) patched — "
-                        f"reverse tools blocked"
-                    ),
-                    "headers_patched": patched,
-                }
-            else:
-                return {
-                    "status": (
-                        "⚠️ ZIP header protection — "
-                        "AndroidManifest.xml entry not found in APK"
-                    ),
-                    "headers_patched": 0,
-                }
-        except Exception as e:
-            return {
-                "status":          f"❌ ZIP header protection failed — {e}",
-                "headers_patched": 0,
-            }
-
-    def _patch_zip_headers(self, apk_path: str) -> int:
-        """
-        Read APK as raw bytes.
-        Scan for ZIP local file headers (PK\\x03\\x04) and central directory
-        headers (PK\\x01\\x02) that reference AndroidManifest.xml.
-        Patch compression method field (2 bytes, little-endian) to 16892.
-        Write patched bytes back to file in-place.
-        Returns count of headers patched.
-        """
-        target_name    = self.TARGET_ENTRY.encode("utf-8")
-        target_method  = struct.pack("<H", self.PROTECTION_METHOD)
-        patched_count  = 0
-
-        with open(apk_path, "rb") as f:
-            data = bytearray(f.read())
-
-        i = 0
-        while i < len(data) - 4:
-
-            # ── Local File Header — signature PK\x03\x04 ─────────────────────
-            # Structure:
-            #   offset  0: signature        4 bytes  (PK\x03\x04)
-            #   offset  4: version needed   2 bytes
-            #   offset  6: general purpose  2 bytes
-            #   offset  8: compression      2 bytes  ← patch here
-            #   offset 10: mod time         2 bytes
-            #   offset 12: mod date         2 bytes
-            #   offset 14: crc-32           4 bytes
-            #   offset 18: compressed size  4 bytes
-            #   offset 22: uncompressed sz  4 bytes
-            #   offset 26: filename length  2 bytes
-            #   offset 28: extra length     2 bytes
-            #   offset 30: filename         (filename_length bytes)
-            if data[i:i+4] == b"PK\x03\x04":
-                if i + 30 <= len(data):
-                    fname_len  = struct.unpack_from("<H", data, i + 26)[0]
-                    extra_len  = struct.unpack_from("<H", data, i + 28)[0]
-                    fname_end  = i + 30 + fname_len
-                    if fname_end <= len(data):
-                        fname = data[i + 30: fname_end]
-                        if fname == target_name:
-                            # Patch compression method at offset +8
-                            data[i + 8: i + 10] = target_method
-                            patched_count += 1
-                            logger.info(
-                                f"[ZIPHeaderProtection] Local header patched "
-                                f"@ offset {i:#010x} — "
-                                f"AndroidManifest.xml → method 16892"
-                            )
-                i += 1
-                continue
-
-            # ── Central Directory Header — signature PK\x01\x02 ──────────────
-            # Structure:
-            #   offset  0: signature        4 bytes  (PK\x01\x02)
-            #   offset  4: version made     2 bytes
-            #   offset  6: version needed   2 bytes
-            #   offset  8: general purpose  2 bytes
-            #   offset 10: compression      2 bytes  ← patch here
-            #   offset 12: mod time         2 bytes
-            #   offset 14: mod date         2 bytes
-            #   offset 16: crc-32           4 bytes
-            #   offset 20: compressed size  4 bytes
-            #   offset 24: uncompressed sz  4 bytes
-            #   offset 28: filename length  2 bytes
-            #   offset 30: extra length     2 bytes
-            #   offset 32: comment length   2 bytes
-            #   offset 34: disk number      2 bytes
-            #   offset 36: internal attr    2 bytes
-            #   offset 38: external attr    4 bytes
-            #   offset 42: local hdr offset 4 bytes
-            #   offset 46: filename         (filename_length bytes)
-            if data[i:i+4] == b"PK\x01\x02":
-                if i + 46 <= len(data):
-                    fname_len = struct.unpack_from("<H", data, i + 28)[0]
-                    fname_end = i + 46 + fname_len
-                    if fname_end <= len(data):
-                        fname = data[i + 46: fname_end]
-                        if fname == target_name:
-                            # Patch compression method at offset +10
-                            data[i + 10: i + 12] = target_method
-                            patched_count += 1
-                            logger.info(
-                                f"[ZIPHeaderProtection] Central directory patched "
-                                f"@ offset {i:#010x} — "
-                                f"AndroidManifest.xml → method 16892"
-                            )
-                i += 1
-                continue
-
-            i += 1
-
-        if patched_count > 0:
-            with open(apk_path, "wb") as f:
-                f.write(data)
-            logger.info(
-                f"[ZIPHeaderProtection] Complete — "
-                f"{patched_count} header(s) patched in {apk_path}"
-            )
-
-        return patched_count
-
-
 # ── APK SIZE OPTIMIZER ────────────────────────────────────────────────────────
 class APKSizeOptimizer:
     """
@@ -11682,7 +11455,6 @@ class ProtectionScoreEngine:
         "undo_last_child":            0,   # meta — no weight
         "install_source_attribution": 9,   # GPP distribution signal — high impact
         "signing_lineage":            10,  # V3 lineage chain — master root trust
-        "zip_header_protection":      8,   # manifest ZIP header hardening — tool blocking
     }
 
     GRADE_TABLE = [
@@ -11715,6 +11487,7 @@ class ProtectionScoreEngine:
 
 
 # ── NEW MANUAL CONTROL ENGINE — 22-STEP SELECTIVE SYSTEM ─────────────────────
+
 class ManualControlEngine:
     """
     Elite Manual Control Panel — 24-Step Selective Operation System.
@@ -11751,7 +11524,6 @@ class ManualControlEngine:
         "zipalign":                   ["rebuild_apk"],
         "protection_score":           ["sign_apk", "signing_lineage"],
         "install_source_attribution": ["decode_workspace"],
-        "zip_header_protection":      ["rebuild_apk", "pseudo_encryption"],
     }
 
     # Smart suggestions — what to run next after each step
@@ -11776,8 +11548,7 @@ class ManualControlEngine:
         "apk_size_optimizer":         "aes_key_management",
         "aes_key_management":         "rebuild_apk",
         "rebuild_apk":                "pseudo_encryption",
-        "pseudo_encryption":          "zip_header_protection",
-        "zip_header_protection":      "integrity_manifest",
+        "pseudo_encryption":          "integrity_manifest",
         "integrity_manifest":         "certificate_aging",
         "certificate_aging":          "unique_fingerprint",
         "keystore_generation":        "unique_fingerprint",
@@ -11815,8 +11586,7 @@ class ManualControlEngine:
         # ── Phase 4: Build ────────────────────────────────────────────────────
         "rebuild_apk",             # 20. rebuild — all changes baked in
         "pseudo_encryption",       # 21. normalise ZIP timestamps + clear flags
-        "zip_header_protection",   # 22. patch manifest ZIP header → method 16892
-        "integrity_manifest",      # 23. hash final APK state — correct hashes
+        "integrity_manifest",      # 22. hash final APK state — correct hashes
         # ── Phase 5: Sign with Coherent Identity + GPP Lineage ───────────────
         # Path A — GPP optimised: certificate_aging → unique_fingerprint → signing_lineage
         # Path B — Standard:      keystore_generation → unique_fingerprint → zipalign → sign_apk
@@ -11862,7 +11632,6 @@ class ManualControlEngine:
         "undo_last_child":            "↩️ Undo Last Child",
         "install_source_attribution": "📡 Install Source Attribution",
         "signing_lineage":            "🔗 V3 Signing Lineage",
-        "zip_header_protection":      "🛡️ ZIP Header Protection",
     }
 
     # ── PRESET PROFILES ───────────────────────────────────────────────────────
@@ -11902,8 +11671,7 @@ class ManualControlEngine:
             "aes_key_management",            # 19. AES key display
             "rebuild_apk",                   # 20. rebuild — all changes baked in
             "pseudo_encryption",             # 21. normalise ZIP timestamps
-            "zip_header_protection",         # 22. patch manifest ZIP header → method 16892
-            "integrity_manifest",            # 23. hash final APK state
+            "integrity_manifest",            # 22. hash final APK state
             "certificate_aging",             # 23. aged certificate — GPP trust
             "unique_fingerprint",            # 24. confirm identity
             "signing_lineage",               # 25. V3 master root lineage
@@ -12036,7 +11804,6 @@ class ManualControlEngine:
             "aes_key_management",
             "rebuild_apk",
             "pseudo_encryption",
-            "zip_header_protection",       # manifest ZIP header → method 16892
             "integrity_manifest",
             "certificate_aging",           # aged certificate for Play Protect
             "unique_fingerprint",
@@ -12066,7 +11833,6 @@ class ManualControlEngine:
             "aes_key_management",
             "rebuild_apk",
             "pseudo_encryption",
-            "zip_header_protection",       # manifest ZIP header → method 16892
             "integrity_manifest",
             "certificate_aging",
             "unique_fingerprint",
@@ -12580,68 +12346,6 @@ class ManualControlEngine:
 
         return result
 
-    def build_selection_keyboard(self, selected: set) -> "InlineKeyboardMarkup":
-        """
-        Builds the single unified 24-step checkbox keyboard.
-        Selected ops show ☑️, unselected show ☐.
-        All steps in one box — no separation.
-        """
-        rows = []
-        for op in self.PIPELINE_ORDER:
-            label   = self.STEP_LABELS[op]
-            tick    = "☑️" if op in selected else "☐"
-            display = f"{tick} {label}"
-            rows.append([InlineKeyboardButton(
-                display, callback_data=f"mcp_toggle_{op}"
-            )])
-
-        # Select All / Clear All row
-        rows.append([
-            InlineKeyboardButton("☑️ Select All", callback_data="mcp_select_all"),
-            InlineKeyboardButton("☐ Clear All",   callback_data="mcp_clear_all"),
-        ])
-        # Apply Selected
-        rows.append([InlineKeyboardButton("✅ Apply Selected", callback_data="mcp_apply")])
-        # Back
-        rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back_admin")])
-
-        return InlineKeyboardMarkup(rows)
-
-    def build_preset_keyboard(self) -> "InlineKeyboardMarkup":
-        """Preset keyboard — all presets + custom steps option."""
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton(
-                "⚡ Quick Sign (strip + rebuild + sign)",
-                callback_data="mcp_preset_quick_sign")],
-            [InlineKeyboardButton(
-                "🛡️ Full Protection (all steps + GPP optimised)",
-                callback_data="mcp_preset_full_protection")],
-            [InlineKeyboardButton(
-                "📋 Phase 1 — Setup (baseline APK)",
-                callback_data="mcp_preset_phase_1_setup")],
-            [InlineKeyboardButton(
-                "🛡️ Phase 2 — Code Protection",
-                callback_data="mcp_preset_phase_2_code_protection")],
-            [InlineKeyboardButton(
-                "🧹 Phase 3 — Cleanup",
-                callback_data="mcp_preset_phase_3_cleanup")],
-            [InlineKeyboardButton(
-                "🔨 Phase 4 — Build + Integrity",
-                callback_data="mcp_preset_phase_4_build")],
-            [InlineKeyboardButton(
-                "🔬 Phase 5 — AV-Clean + Play Protect",
-                callback_data="mcp_preset_phase_5_av_clean")],
-            [InlineKeyboardButton(
-                "🏆 Phase 6 — Complete (all steps)",
-                callback_data="mcp_preset_phase_6_complete")],
-            [InlineKeyboardButton(
-                "🎛️ Custom Steps — Select Manually",
-                callback_data="mcp_custom_steps")],
-            [InlineKeyboardButton(
-                "⬅️ Back",
-                callback_data="back_admin")],
-        ])
-
     def run_operation(self, op_key: str, apk_path: str,
                       workspace: str, work_dir: str,
                       aes_key: bytes, tools: "ToolInstaller",
@@ -13041,26 +12745,6 @@ class ManualControlEngine:
                 result["zip_entries"] = pe_result.get("zip_entries", 0)
                 result["dex_patched"] = pe_result.get("dex_patched", 0)
                 result["status"]      = pe_result.get("status", "❌ Pseudo Encryption failed")
-
-            elif op_key == "zip_header_protection":
-                # Operates on rebuilt.apk — AFTER pseudo_encryption
-                # BEFORE integrity_manifest, zipalign, sign_apk
-                # Patches ONLY AndroidManifest.xml ZIP entry header
-                # Sets compression method field to 16892 (FC 41)
-                # All other entries left completely untouched
-                zhp_apk = os.path.join(work_dir, "rebuilt.apk")
-                if not os.path.exists(zhp_apk):
-                    for found in list(Path(work_dir).rglob("rebuilt.apk")):
-                        zhp_apk = str(found)
-                        break
-                if not os.path.exists(zhp_apk) and rebuilt_apk_override:
-                    zhp_apk = rebuilt_apk_override
-                zhp_engine = ZIPHeaderProtectionEngine()
-                zhp_result = zhp_engine.apply(zhp_apk)
-                result["headers_patched"] = zhp_result.get("headers_patched", 0)
-                result["status"]          = zhp_result.get(
-                    "status", "❌ ZIP header protection failed"
-                )
 
             elif op_key == "integrity_manifest":
                 guardian = IntegrityGuardian(work_dir)
@@ -13514,6 +13198,7 @@ class ManualControlEngine:
         lines.append("━━━━━━━━━━━━━━━━━━━━━")
 
         return "\n".join(lines)
+
 
 
 class ComplianceScannerEngine:
@@ -13993,348 +13678,6 @@ class ComplianceScannerEngine:
             f"Total findings: *{len(findings)}*\n\n"
             f"Select an action below:"
         )
-
-
-# ── MASTER PROTECTION ENGINE ──────────────────────────────────────────────────
-class MasterProtectionEngine:
-    """
-    CORRECT PIPELINE ORDER — prevents broken/non-installable APK:
-
-      1. Build Workspace            → application classes + res + XML (workspace folder)
-      2. Manifest hardening         → edit XML in workspace folder
-      3. Security Guard Integration → integrate guard call into workspace
-      4. Security compliance layer  → security fields in application classes
-      5. BUILD                      → apktool build → valid APK with binary manifest,
-                                       correct DEX path, resources.arsc intact
-      6. Sign & zipalign            → final installable APK
-
-    Resource encryption (res/ folder) is intentionally EXCLUDED —
-    Android reads resources directly; encrypting them without a custom
-    runtime loader makes the app crash on launch.
-    """
-
-    def __init__(self):
-        self.tools     = ToolInstaller()
-        self.crypto    = CryptoEngine()
-        self.integrity = IntegrityGuardian(WORK_DIR)
-
-    def protect(self, apk_path) -> dict:
-        job_id   = f"job_{int(time.time())}"
-        work_dir = os.path.join(WORK_DIR, job_id)
-        os.makedirs(work_dir, exist_ok=True)
-        results  = {}
-
-        def mark(k, v):
-            results[k] = v
-            logger.info(f"[{job_id}] {k}: {v}")
-
-        try:
-            # ── Tools ────────────────────────────────────────────────────────
-            mark("⚙️ Tools", "Installing...")
-            self.tools.install_all()
-
-            # ── AES key ──────────────────────────────────────────────────────
-            aes_key = CryptoEngine.generate_key()
-            mark("🔑 AES-256 Key", "✅ Generated (in-memory)")
-
-            # ── STRIP existing signature before any processing ────────────────
-            mark("🧹 Signature Removal", "⏳ Scanning...")
-            stripper     = SignatureStripper()
-            strip_detect = stripper.detect(apk_path)
-            if strip_detect["total_found"] > 0:
-                stripped_apk = os.path.join(work_dir, "input_stripped.apk")
-                strip_result = stripper.strip(apk_path, stripped_apk)
-                apk_path     = stripped_apk
-                mark("🧹 Signature Removal",
-                     f"✅ {len(strip_result['stripped_files'])} artifacts removed")
-            else:
-                mark("🧹 Signature Removal", "✅ No existing signature found — clean")
-
-            # ── LEVEL 1 — Decode ─────────────────────────────────────────────
-            mark("Level 1 — Workspace Build", "⏳ Running...")
-            l1 = Level1_WorkspaceBuilder(self.tools, work_dir)
-            workspace = l1.build_workspace(apk_path)
-            mark("Level 1 — Workspace Build", "✅ Done")
-
-            # ── LEVEL 2 — Manifest ───────────────────────────────────────────
-            mark("Level 2 — Manifest", "⏳ Running...")
-            l2 = Level2_ManifestProtector(work_dir)
-            man_changes = l2.protect(workspace)
-            mark("Level 2 — Manifest", f"✅ {len(man_changes)} changes")
-
-            # ── INSTALL SOURCE ATTRIBUTION — GPP distribution signal ──────────
-            mark("📡 Install Source Attribution", "⏳ Running...")
-            isa_engine  = InstallSourceAttributionEngine()
-            isa_result  = isa_engine.apply(workspace)
-            mark("📡 Install Source Attribution",
-                 f"✅ {isa_result.get('changes_count', 0)} GPP attribution signals applied")
-            mark("Level 3 — Security Guard Integration", "⏳ Running...")
-            l3 = Level3_SecurityGuardIntegrator(self.crypto, work_dir)
-            guard_path       = l3.save_guard_java(aes_key)
-            guard_integrated = l3.integrate_security_guard(workspace, aes_key)
-            mark("Level 3 — Security Guard Integration",
-                 f"✅ {guard_integrated} wired — Guard class placed in smali")
-
-            # ── LEVEL 4 — Security Compliance Layer ──────────────────────────
-            mark("Level 4 — Security Compliance Layer", "⏳ Running...")
-            l4 = Level4_SecurityCompliance(self.crypto, work_dir)
-            security_fields = l4.add_security_fields(workspace)
-            mark("Level 4 — Security Compliance Layer",
-                 f"✅ {security_fields} security fields added")
-
-            # ── STRING SPLITTING — sensitive strings fragmented ───────────────
-            mark("🔀 String Splitting", "⏳ Running...")
-            splitter    = StringSplitterEngine()
-            split_count = splitter.apply(workspace)
-            mark("🔀 String Splitting",
-                 f"✅ {split_count} sensitive strings split into runtime-only fragments")
-
-            # ── METADATA STRIPPING — tool fingerprints removed ────────────────
-            mark("🧹 Metadata Stripping", "⏳ Running...")
-            meta_stripper  = MetadataStripper()
-            meta_result    = meta_stripper.apply(workspace)
-            mark("🧹 Metadata Stripping",
-                 f"✅ {meta_result['total']} metadata items removed")
-
-            # ── TAMPER DETECTION — build-time hashes embedded ─────────────────
-            mark("🔐 Tamper Detection", "⏳ Computing build-time hashes...")
-            tamper_engine = TamperDetectionEngine()
-            build_hashes  = tamper_engine.compute_build_hashes(workspace)
-            embedded      = tamper_engine.embed_hashes_in_guard(
-                workspace, build_hashes, aes_key)
-            mark("🔐 Tamper Detection",
-                 "✅ Build-time hashes embedded — runtime tamper detection active"
-                 if embedded else
-                 "⚠️ Tamper detection advisory — guard not found for embedding")
-
-            # ── LEVEL 5 — BUILD ───────────────────────────────────────────────
-            mark("Level 5 — APK Build", "⏳ Running... (this may take 1-3 min)")
-            l5 = Level5_APKBuilder(self.tools, work_dir)
-            rebuilt = l5.rebuild(workspace)
-            mark("Level 5 — APK Build", "✅ Valid APK produced")
-
-            # ── Integrity snapshot ────────────────────────────────────────────
-            int_manifest = self.integrity.generate(workspace)
-            self.integrity.save(int_manifest)
-            mark("🔒 Integrity Manifest", f"✅ {len(int_manifest)} files hashed")
-
-            # ── LEVEL 6 — Sign & Align with GPP Optimised Lineage ────────────
-            mark("Level 6 — Sign & Align", "⏳ Generating GPP optimised identity...")
-            keystore_ctx    = {}
-            lineage_engine  = SigningLineageEngine(work_dir)
-            sign_result     = lineage_engine.apply(rebuilt, keystore_ctx)
-
-            final_apk = sign_result["output_apk"]
-            identity  = sign_result["identity"]
-
-            mark("Level 6 — Sign & Align",    "✅ Signed with V3 lineage chain")
-            mark("🆔 Identity CN",             f"✅ {identity.get('cn','')}")
-            mark("🏢 Organization",            f"✅ {identity.get('org','')}")
-            mark("🌍 Country",                 f"✅ {identity.get('country','')}")
-            mark("📅 Validity",                f"✅ {identity.get('validity_days',0)} days")
-            mark("🔑 Signing Method",          f"✅ {sign_result.get('signing_method','')}")
-            mark("🔗 Lineage Chain",           f"✅ {'Attached' if sign_result.get('lineage_built') else 'Child cert only'}")
-            mark("🏛️ Master Root CN",          f"✅ {sign_result.get('master_root_cn','')}")
-            if sign_result.get("fingerprint"):
-                mark("🔏 SHA-256 Fingerprint", f"✅ {sign_result['fingerprint'][:40]}...")
-            mark("🔐 Keystore",                "✅ Securely destroyed after signing")
-
-            # ── POST-PROTECTION VERIFICATION ─────────────────────────────────
-            mark("🔬 Post-Protection Verification", "⏳ Running...")
-            verifier     = PostProtectionVerifier()
-            verification = verifier.run(final_apk)
-            results["VERIFICATION"] = verification
-            if verification.get("overall_passed"):
-                mark("🔬 Post-Protection Verification", "✅ APK verified — clean and installable")
-            else:
-                mark("🔬 Post-Protection Verification", "⚠️ Verification issues found — check report")
-
-            results["OUTPUT_APK"]  = final_apk
-            results["GUARD_JAVA"]  = guard_path
-            results["SUCCESS"]     = True
-
-        except Exception as e:
-            results["ERROR"]   = str(e)
-            results["SUCCESS"] = False
-            logger.error(f"[{job_id}] Protection failed: {e}", exc_info=True)
-            job_history.append({
-                "apk_name":  os.path.basename(apk_path) if 'apk_path' in dir() else "unknown",
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "success":   False,
-                "summary":   f"Failed: {str(e)[:80]}",
-            })
-        finally:
-            workspace_dir = os.path.join(work_dir, "workspace")
-            if os.path.exists(workspace_dir):
-                shutil.rmtree(workspace_dir, ignore_errors=True)
-            # Remove all intermediate APKs except the final one
-            for f in Path(work_dir).glob("*.apk"):
-                if f.name != "EPIC_PROTECTED.apk":
-                    try: f.unlink()
-                    except: pass
-
-        return results
-
-    def protect_phase1_decode(self, apk_path: str) -> dict:
-        """
-        Phase 1 of compliance-integrated protection pipeline.
-        Decodes APK and runs compliance scan.
-        Returns workspace path, job dir, findings, and aes_key for phase 2.
-        Called BEFORE compliance review — pauses here for admin approval.
-        """
-        job_id   = f"job_{int(time.time())}"
-        work_dir = os.path.join(WORK_DIR, job_id)
-        os.makedirs(work_dir, exist_ok=True)
-
-        # Install tools
-        self.tools.install_all()
-
-        # Generate AES key — stored in session for phase 2
-        aes_key = CryptoEngine.generate_key()
-
-        # Strip existing signature
-        stripper     = SignatureStripper()
-        strip_detect = stripper.detect(apk_path)
-        if strip_detect["total_found"] > 0:
-            stripped_apk = os.path.join(work_dir, "input_stripped.apk")
-            stripper.strip(apk_path, stripped_apk)
-            apk_path = stripped_apk
-
-        # Level 1 — Decode
-        l1        = Level1_WorkspaceBuilder(self.tools, work_dir)
-        workspace = l1.build_workspace(apk_path)
-
-        # Run compliance scan
-        scanner  = ComplianceScannerEngine()
-        findings = scanner.scan_workspace(workspace)
-
-        return {
-            "workspace":  workspace,
-            "work_dir":   work_dir,
-            "findings":   findings,
-            "aes_key":    aes_key,
-            "apk_path":   apk_path,
-            "scanner":    scanner,
-        }
-
-    def protect_phase2_complete(self, workspace: str, work_dir: str,
-                                aes_key: bytes) -> dict:
-        """
-        Phase 2 of compliance-integrated protection pipeline.
-        Runs Levels 2-6 after compliance review is complete.
-        Called AFTER admin has reviewed and approved all compliance findings.
-        """
-        results = {}
-
-        def mark(k, v):
-            results[k] = v
-            logger.info(f"[Phase2] {k}: {v}")
-
-        try:
-            # ── LEVEL 2 — Manifest ───────────────────────────────────────────
-            mark("Level 2 — Manifest", "⏳ Running...")
-            l2 = Level2_ManifestProtector(work_dir)
-            man_changes = l2.protect(workspace)
-            mark("Level 2 — Manifest", f"✅ {len(man_changes)} changes")
-
-            # ── LEVEL 3 — Security Guard Integration ─────────────────────────
-            mark("Level 3 — Security Guard Integration", "⏳ Running...")
-            l3 = Level3_SecurityGuardIntegrator(self.crypto, work_dir)
-            guard_path       = l3.save_guard_java(aes_key)
-            guard_integrated = l3.integrate_security_guard(workspace, aes_key)
-            mark("Level 3 — Security Guard Integration",
-                 f"✅ {guard_integrated} wired — Guard class placed in smali")
-
-            # ── LEVEL 4 — Security Compliance Layer ──────────────────────────
-            mark("Level 4 — Security Compliance Layer", "⏳ Running...")
-            l4 = Level4_SecurityCompliance(self.crypto, work_dir)
-            security_fields = l4.add_security_fields(workspace)
-            mark("Level 4 — Security Compliance Layer",
-                 f"✅ {security_fields} security fields added")
-
-            # ── STRING SPLITTING — sensitive strings fragmented ───────────────
-            mark("🔀 String Splitting", "⏳ Running...")
-            splitter_p2    = StringSplitterEngine()
-            split_count_p2 = splitter_p2.apply(workspace)
-            mark("🔀 String Splitting",
-                 f"✅ {split_count_p2} sensitive strings split into runtime-only fragments")
-
-            # ── METADATA STRIPPING — tool fingerprints removed ────────────────
-            mark("🧹 Metadata Stripping", "⏳ Running...")
-            meta_stripper_p2 = MetadataStripper()
-            meta_result_p2   = meta_stripper_p2.apply(workspace)
-            mark("🧹 Metadata Stripping",
-                 f"✅ {meta_result_p2['total']} metadata items removed")
-
-            # ── TAMPER DETECTION — build-time hashes embedded ─────────────────
-            mark("🔐 Tamper Detection", "⏳ Computing build-time hashes...")
-            tamper_p2    = TamperDetectionEngine()
-            hashes_p2    = tamper_p2.compute_build_hashes(workspace)
-            embedded_p2  = tamper_p2.embed_hashes_in_guard(
-                workspace, hashes_p2, aes_key)
-            mark("🔐 Tamper Detection",
-                 "✅ Build-time hashes embedded — runtime tamper detection active"
-                 if embedded_p2 else
-                 "⚠️ Tamper detection advisory — guard not found for embedding")
-
-            # ── LEVEL 5 — BUILD ───────────────────────────────────────────────
-            mark("Level 5 — APK Build", "⏳ Running... (this may take 1-3 min)")
-            l5 = Level5_APKBuilder(self.tools, work_dir)
-            rebuilt = l5.rebuild(workspace)
-            mark("Level 5 — APK Build", "✅ Valid APK produced")
-
-            # ── Integrity snapshot ────────────────────────────────────────────
-            int_manifest = self.integrity.generate(workspace)
-            self.integrity.save(int_manifest)
-            mark("🔒 Integrity Manifest", f"✅ {len(int_manifest)} files hashed")
-
-            # ── LEVEL 6 — Sign & Align ────────────────────────────────────────
-            mark("Level 6 — Sign & Align", "⏳ Generating fresh identity...")
-            l6          = Level6_Signer(work_dir)
-            sign_result = l6.prepare(rebuilt)
-            final_apk   = sign_result["output_apk"]
-            identity    = sign_result["identity"]
-
-            mark("Level 6 — Sign & Align",    "✅ Signed & zipaligned")
-            mark("🆔 Identity CN",             f"✅ {identity['cn']}")
-            mark("🏢 Organization",            f"✅ {identity['org']}")
-            mark("🌍 Location",
-                 f"✅ {identity['city']}, {identity['state']}, {identity['country']}")
-            mark("📅 Validity",                f"✅ {identity['validity_days']} days")
-            mark("🔑 Signing Method",          f"✅ {sign_result['signing_method']}")
-            if sign_result.get("fingerprint"):
-                mark("🔏 SHA-256 Fingerprint",
-                     f"✅ {sign_result['fingerprint'][:40]}...")
-            mark("🔐 Keystore", "✅ Securely destroyed after signing")
-
-            # ── POST-PROTECTION VERIFICATION ─────────────────────────────────
-            mark("🔬 Post-Protection Verification", "⏳ Running...")
-            verifier     = PostProtectionVerifier()
-            verification = verifier.run(final_apk)
-            results["VERIFICATION"] = verification
-            if verification.get("overall_passed"):
-                mark("🔬 Post-Protection Verification", "✅ APK verified — clean and installable")
-            else:
-                mark("🔬 Post-Protection Verification", "⚠️ Verification issues found — check report")
-
-            results["OUTPUT_APK"] = final_apk
-            results["GUARD_JAVA"] = guard_path
-            results["SUCCESS"]    = True
-
-        except Exception as e:
-            results["ERROR"]   = str(e)
-            results["SUCCESS"] = False
-            logger.error(f"[Phase2] Protection failed: {e}", exc_info=True)
-        finally:
-            workspace_dir = os.path.join(work_dir, "workspace")
-            if os.path.exists(workspace_dir):
-                shutil.rmtree(workspace_dir, ignore_errors=True)
-            for f in Path(work_dir).glob("*.apk"):
-                if f.name != "EPIC_PROTECTED.apk":
-                    try: f.unlink()
-                    except: pass
-
-        return results
 
 
 # ── SAFETY ANALYSER ENGINE ───────────────────────────────────────────────────
@@ -16387,18 +15730,6 @@ def run_flask():
 def is_admin(uid): return uid == ADMIN_ID
 
 # ── SESSION STATE — MANUAL CONTROL PANEL ─────────────────────────────────────
-pending_manual      = {}   # tracks admin session mode
-manual_apk_path     = {}   # uploaded APK path
-manual_work_dir     = {}   # job working directory
-manual_workspace    = {}   # decoded workspace path
-manual_done_steps   = {}   # set of steps completed in current session
-manual_session_log  = {}   # list of (op_key, status, detail) per session
-manual_selected     = {}   # set of selected operation keys
-manual_aes_key      = {}   # AES key for this job session
-manual_undo_backup  = {}   # backup dir for undo last job
-manual_job_start    = {}   # job start timestamp
-phase2_paused       = {}   # True when Phase 2 is paused for inspection
-phase2_after_ops    = {}   # remaining ops to run after inspection
 # ── New tree browser session state ───────────────────────────────────────────
 res_tree_workspace  = {}   # workspace for res/ tree browser
 res_tree_path       = {}   # current path in res/ tree
@@ -16408,7 +15739,6 @@ arsc_workspace      = {}   # workspace for resources.arsc browser
 arsc_entries        = {}   # cached string entries for arsc browser
 session_reports     = {}   # SessionReportEngine per user
 smali_safety_cache  = {}   # cached safety analysis results per user
-manual_keystore_ctx = {}   # keystore context shared across steps {keystore_path, alias, ks_pass, key_pass, sha256}
 
 # ── QUICK TEST PANEL SESSION STATE ────────────────────────────────────────────
 quick_test_selected   = {}   # {user_id: set()} — which steps are ON
@@ -16429,9 +15759,7 @@ sbs_test_log      = {}   # {user_id: list}  — list of {step, label, passed, no
 # ── ADMIN KEYBOARD ───────────────────────────────────────────────────────────
 def admin_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛡️ Protect APK",              callback_data="admin_protect_apk")],
         [InlineKeyboardButton("🧪 Step-by-Step Test",         callback_data="sbs_open")],
-        [InlineKeyboardButton("🎛️ Manual Control Panel",     callback_data="admin_manual")],
         [InlineKeyboardButton("📊 Protection History",        callback_data="admin_history")],
         [InlineKeyboardButton("📦 Base APK",                  callback_data="admin_base_apk")],
     ])
@@ -16492,16 +15820,6 @@ async def start(update, context):
 
 
 # ── SESSION STATE — MANUAL CONTROL PANEL ─────────────────────────────────────
-# These dicts track per-admin session state for the manual control panel
-# pending_manual    — tracks admin session mode
-# manual_apk_path   — uploaded APK path
-# manual_workspace  — decoded workspace path
-# manual_work_dir   — job working directory
-# manual_selected   — set of selected operation keys
-# manual_aes_key    — AES key for this job session
-# manual_undo_backup— backup path for undo last job
-# manual_job_start  — job start timestamp
-
 
 # ── DELIVER PROTECTED APK HELPER ─────────────────────────────────────────────
 async def _deliver_protected_apk(update, context, status_msg, results, apk_name):
@@ -17409,102 +16727,6 @@ def _startup_self_check() -> dict:
 
 
 
-# ── SESSION CHECKLIST BUILDER ────────────────────────────────────────────────
-def _build_session_checklist_msg(user_id: int, apk_name: str,
-                                  engine: "ManualControlEngine") -> tuple:
-    """
-    Builds the persistent session checklist message and keyboard.
-    Returns (message_text, InlineKeyboardMarkup).
-
-    Features:
-    - Progress bar showing steps done vs total
-    - Session timer
-    - Done steps marked ✅ and shown but not re-selectable
-    - Selected steps shown with ☑️
-    - Available steps shown with ☐
-    - Smart suggestion for next step
-    - Dependency warnings on apply
-    - Finish & Deliver button
-    """
-    selected   = manual_selected.get(user_id, set())
-    done_steps = manual_done_steps.get(user_id, set())
-    start_time = manual_job_start.get(user_id, time.time())
-    session_log= manual_session_log.get(user_id, [])
-
-    elapsed = int(time.time() - start_time)
-    mins    = elapsed // 60
-    secs    = elapsed % 60
-
-    total_steps = len(engine.PIPELINE_ORDER)
-    done_count  = len(done_steps)
-    filled      = int((done_count / total_steps) * 10)
-    bar         = "█" * filled + "░" * (10 - filled)
-
-    # Smart suggestion
-    last_done   = session_log[-1][0] if session_log else None
-    suggestion  = engine.STEP_SUGGESTIONS.get(last_done) if last_done else None
-    suggestion_label = engine.STEP_LABELS.get(suggestion, "") if suggestion else ""
-
-    msg_lines = [
-        "🎛️ *Manual Control Panel — Session Active*\n",
-        f"📦 `{apk_name}`",
-        f"━━━━━━━━━━━━━━━━━━━━━",
-        f"📊 Progress: `{bar}` {done_count}/{total_steps} steps",
-        f"⏱️ Session: {mins}m {secs}s",
-    ]
-
-    if suggestion and suggestion not in done_steps:
-        msg_lines.append(
-            f"💡 Recommended next: *{suggestion_label}*")
-
-    if session_log:
-        msg_lines.append("━━━━━━━━━━━━━━━━━━━━━")
-        msg_lines.append("*Last results:*")
-        for op, status, _ in session_log[-3:]:
-            lbl = engine.STEP_LABELS.get(op, op)
-            msg_lines.append(f"  {status[:60]}")
-
-    msg_lines += [
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"✅ Selected: *{len(selected)}* — tap to toggle:",
-    ]
-
-    msg = "\n".join(msg_lines)
-
-    # Build keyboard
-    rows = []
-    for op in engine.PIPELINE_ORDER:
-        label = engine.STEP_LABELS.get(op, op)
-        if op in done_steps:
-            # Done — show as completed, not toggleable
-            display = f"✅ {label}"
-            rows.append([InlineKeyboardButton(
-                display, callback_data=f"mcp_done_{op}")])
-        elif op in selected:
-            display = f"☑️ {label}"
-            rows.append([InlineKeyboardButton(
-                display, callback_data=f"mcp_toggle_{op}")])
-        else:
-            display = f"☐ {label}"
-            rows.append([InlineKeyboardButton(
-                display, callback_data=f"mcp_toggle_{op}")])
-
-    rows.append([
-        InlineKeyboardButton("☑️ Select All",  callback_data="mcp_select_all"),
-        InlineKeyboardButton("☐ Clear All",    callback_data="mcp_clear_all"),
-    ])
-    rows.append([InlineKeyboardButton(
-        "✅ Apply Selected", callback_data="mcp_apply")])
-    rows.append([InlineKeyboardButton(
-        "🌲 Manual Smali Rename", callback_data="smali_tree_open")])
-    rows.append([InlineKeyboardButton(
-        "🏁 Finish & Deliver", callback_data="mcp_finish")])
-    rows.append([InlineKeyboardButton(
-        "⬅️ Back to Menu", callback_data="back_admin")])
-
-    return msg, InlineKeyboardMarkup(rows)
-
-
 # ── BUTTON HANDLER ────────────────────────────────────────────────────────────
 
 async def _rebuild_sign_deliver(query, context, user, label: str):
@@ -17512,9 +16734,9 @@ async def _rebuild_sign_deliver(query, context, user, label: str):
     After any manual change — rebuild, sign and deliver signed APK.
     Admin downloads and installs to test immediately.
     """
-    work_dir  = manual_work_dir.get(user.id)
-    workspace = manual_workspace.get(user.id)
-    aes_key   = manual_aes_key.get(user.id) or AESKeyManager.generate()
+    work_dir  = sbs_work_dir.get(user.id)
+    workspace = sbs_workspace.get(user.id)
+    aes_key   = sbs_aes_key.get(user.id) or AESKeyManager.generate()
 
     if not workspace or not os.path.exists(workspace):
         await context.bot.send_message(
@@ -17531,8 +16753,6 @@ async def _rebuild_sign_deliver(query, context, user, label: str):
     try:
         tools = ToolInstaller()
         tools.install_all()
-        engine = ManualControlEngine(CryptoEngine(), work_dir)
-
         # Step 1 — Rebuild APK
         rebuild_work_dir = os.path.dirname(workspace)
         apktool_yml = os.path.join(workspace, "apktool.yml")
@@ -17540,7 +16760,7 @@ async def _rebuild_sign_deliver(query, context, user, label: str):
             found = list(Path(work_dir).rglob("apktool.yml"))
             if found:
                 workspace = str(found[0].parent)
-                manual_workspace[user.id] = workspace
+                sbs_workspace[user.id] = workspace
                 rebuild_work_dir = os.path.dirname(workspace)
 
         l5      = Level5_APKBuilder(tools, rebuild_work_dir)
@@ -17601,10 +16821,7 @@ async def button_handler(update, context):
 
     # ── BACK TO ADMIN ─────────────────────────────────────────────────────────
     if data == "back_admin":
-        for d in [pending_manual, phase2_paused, phase2_after_ops, smali_safety_cache, manual_apk_path,
-                  manual_workspace, manual_work_dir, manual_selected,
-                  manual_aes_key, manual_undo_backup, manual_job_start,
-                  manual_done_steps, manual_session_log, manual_keystore_ctx,
+        for d in [smali_safety_cache,
                   pending_base_apk, smali_tree_workspace, smali_tree_path,
                   smali_selected_files, smali_scan_results,
                   sbs_step_index, sbs_work_dir, sbs_apk_path, sbs_workspace,
@@ -17637,267 +16854,6 @@ async def button_handler(update, context):
         return
 
     # ── PROTECT APK — DIRECT PROTECTION FLOW ─────────────────────────────────
-    elif data == "admin_protect_apk":
-        if not is_admin(user.id): return
-        config  = _get_base_apk_config()
-        file_id = config.get("base_apk_file_id")
-        if not file_id:
-            await query.edit_message_text(
-                "🛡️ *Protect APK*\n\n"
-                "❌ No Base APK stored yet.\n\n"
-                "Go to 📦 Base APK → Upload Base APK first.",
-                parse_mode="Markdown", reply_markup=back_a())
-            return
-        apk_name = config.get("base_apk_filename", "base.apk")
-        apk_size = config.get("base_apk_size_mb", 0)
-        await query.edit_message_text(
-            f"🛡️ *Protect APK*\n\n"
-            f"📦 `{apk_name}` ({apk_size} MB)\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Choose protection level:",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "🏆 Full Protection — GPP Optimised (recommended)",
-                    callback_data="protect_run_full_protection")],
-                [InlineKeyboardButton(
-                    "🔬 Phase 6 — Complete (all steps)",
-                    callback_data="protect_run_phase_6_complete")],
-                [InlineKeyboardButton(
-                    "🔬 Phase 5 — AV-Clean + Play Protect",
-                    callback_data="protect_run_phase_5_av_clean")],
-                [InlineKeyboardButton(
-                    "⚡ Quick Sign (fastest)",
-                    callback_data="protect_run_quick_sign")],
-                [InlineKeyboardButton(
-                    "🎛️ Custom Steps",
-                    callback_data="admin_manual")],
-                [InlineKeyboardButton(
-                    "⬅️ Back", callback_data="back_admin")],
-            ]))
-        return
-
-    # ── PROTECT RUN — DIRECT PRESET TRIGGER FROM PROTECT APK ─────────────────
-    elif data.startswith("protect_run_"):
-        if not is_admin(user.id): return
-        preset_key = data[len("protect_run_"):]
-        config     = _get_base_apk_config()
-        file_id    = config.get("base_apk_file_id")
-        apk_name   = config.get("base_apk_filename", "base.apk")
-
-        status_msg = await query.edit_message_text(
-            f"🛡️ *Protect APK*\n\n"
-            f"📦 `{apk_name}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📥 Loading APK...",
-            parse_mode="Markdown")
-
-        try:
-            apk_path = BaseApkStorageEngine.get_local_path(config)
-            if not apk_path:
-                await status_msg.edit_text(
-                    f"🛡️ *Protect APK*\n\n"
-                    f"📦 `{apk_name}`\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📥 Downloading APK...\n⏳ Please wait...",
-                    parse_mode="Markdown")
-                apk_path = await BaseApkStorageEngine.download_base_apk(
-                    context.bot, config)
-            if not apk_path:
-                await status_msg.edit_text(
-                    "❌ Failed to load APK. Check Base APK storage.",
-                    parse_mode="Markdown", reply_markup=back_a())
-                return
-
-            job_id   = f"protect_{int(time.time())}"
-            work_dir = os.path.join(WORK_DIR, job_id)
-            os.makedirs(work_dir, exist_ok=True)
-
-            manual_apk_path[user.id]     = apk_path
-            manual_work_dir[user.id]     = work_dir
-            manual_selected[user.id]     = set()
-            manual_aes_key[user.id]      = AESKeyManager.generate()
-            manual_job_start[user.id]    = time.time()
-            manual_done_steps[user.id]   = set()
-            manual_session_log[user.id]  = []
-            manual_keystore_ctx[user.id] = {}
-            pending_manual[user.id]      = "apk_ready"
-
-            engine      = ManualControlEngine(CryptoEngine(), work_dir)
-            ops         = engine.PRESETS.get(preset_key, [])
-            selected    = engine.enforce_auto_sign(set(ops))
-            ordered_ops = engine.enforce_pipeline_order(selected)
-
-            preset_labels = {
-                "full_protection":   "🛡️ Full Protection",
-                "phase_6_complete":  "🏆 Phase 6 — Complete",
-                "phase_5_av_clean":  "🔬 Phase 5 — AV-Clean",
-                "quick_sign":        "⚡ Quick Sign",
-            }
-            preset_label = preset_labels.get(preset_key, preset_key)
-            total_steps  = len(ordered_ops)
-
-            # ── Live step ticker ──────────────────────────────────────────────
-            aes_key      = manual_aes_key[user.id]
-            start_time   = manual_job_start[user.id]
-            done_steps   = set()
-            keystore_ctx = {}
-            job_results  = []
-            current_workspace = None
-            current_apk       = apk_path
-            tools   = ToolInstaller()
-            tools.install_all()
-            scanner = ComplianceScannerEngine()
-
-            completed_labels = []
-
-            for i, op_key in enumerate(ordered_ops):
-                label = engine.STEP_LABELS.get(op_key, op_key)
-
-                # Build live progress ticker
-                progress_lines = [
-                    f"🛡️ *{preset_label}*\n",
-                    f"📦 `{apk_name}`",
-                    f"━━━━━━━━━━━━━━━━━━━━━",
-                ]
-                # Show last 5 completed steps
-                for cl in completed_labels[-5:]:
-                    progress_lines.append(f"✅ {cl}")
-                progress_lines += [
-                    f"",
-                    f"⏳ *Step {i+1}/{total_steps}*",
-                    f"▶️ {label}...",
-                    f"━━━━━━━━━━━━━━━━━━━━━",
-                    f"⏱️ Running...",
-                ]
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=update.effective_chat.id,
-                        message_id=status_msg.message_id,
-                        text="\n".join(progress_lines),
-                        parse_mode="Markdown")
-                except Exception:
-                    pass
-
-                # Pre-update current_apk from rebuild_apk result
-                for prev_r in reversed(job_results):
-                    if prev_r.get("op") == "rebuild_apk" and prev_r.get("rebuilt_apk"):
-                        if os.path.exists(prev_r["rebuilt_apk"]):
-                            current_apk = prev_r["rebuilt_apk"]
-                        break
-
-                loop = asyncio.get_event_loop()
-                _op = op_key; _apk = current_apk; _ws = current_workspace
-                _kctx = keystore_ctx; _done = set(done_steps)
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: engine.run_operation(
-                        _op, _apk, _ws,
-                        work_dir, aes_key, tools, scanner,
-                        rebuilt_apk_override=_apk,
-                        keystore_ctx=_kctx,
-                        completed_ops=_done))
-
-                if op_key == "decode_workspace" and result.get("workspace"):
-                    current_workspace = result["workspace"]
-                    manual_workspace[user.id] = current_workspace
-                if op_key == "strip_signature":
-                    stripped = os.path.join(work_dir, "input_stripped.apk")
-                    if os.path.exists(stripped):
-                        current_apk = stripped
-                if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
-                    current_apk = result["rebuilt_apk"]
-                if op_key == "rebuild_apk" and result.get("workspace"):
-                    current_workspace = result["workspace"]
-                    manual_workspace[user.id] = current_workspace
-
-                status_ok = "❌" not in result.get("status", "")
-                if status_ok:
-                    done_steps.add(op_key)
-                    completed_labels.append(label)
-
-                job_results.append(result)
-
-            # ── Delivery ─────────────────────────────────────────────────────
-            manual_done_steps[user.id]   = done_steps
-            manual_keystore_ctx[user.id] = keystore_ctx
-
-            score_r = ProtectionScoreEngine.calculate(list(done_steps))
-            elapsed = int(time.time() - start_time)
-            mins, secs = elapsed // 60, elapsed % 60
-
-            final_apk = None
-            for fname in ["EPIC_PROTECTED.apk", "rebuilt.apk"]:
-                p = os.path.join(work_dir, fname)
-                if os.path.exists(p):
-                    final_apk = p
-                    break
-
-            summary_lines = [
-                f"✅ *{preset_label} — Complete*\n",
-                f"📦 `{apk_name}`",
-                f"━━━━━━━━━━━━━━━━━━━━━",
-                f"✅ Steps: {len(done_steps)}/{total_steps}",
-                f"⏱️ Time: {mins}m {secs}s",
-                f"📊 Score: *{score_r['score']}/100 — {score_r['grade']}*",
-                f"━━━━━━━━━━━━━━━━━━━━━",
-            ]
-            await status_msg.edit_text(
-                "\n".join(summary_lines),
-                parse_mode="Markdown")
-
-            if final_apk and os.path.exists(final_apk):
-                size_mb = os.path.getsize(final_apk) / (1024 * 1024)
-                with open(final_apk, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id=user.id,
-                        document=f,
-                        filename=f"EPIC_PROTECTED_{apk_name}",
-                        caption=(
-                            f"🛡️ *{preset_label} — Protected APK*\n"
-                            f"📦 {size_mb:.2f} MB\n"
-                            f"📊 Score: {score_r['score']}/100 — {score_r['grade']}"
-                        ),
-                        parse_mode="Markdown")
-                await context.bot.send_message(
-                    chat_id=user.id,
-                    text="✅ *Protection complete.* Install & test on device.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(
-                            "🛡️ Protect Again", callback_data="admin_protect_apk")],
-                        [InlineKeyboardButton(
-                            "⬅️ Back to Menu", callback_data="back_admin")],
-                    ]))
-
-                # Save to job history
-                job_history.append({
-                    "apk_name":  apk_name,
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "success":   True,
-                    "preset":    preset_label,
-                    "score":     score_r["score"],
-                    "grade":     score_r["grade"],
-                    "steps":     len(done_steps),
-                    "elapsed":   f"{mins}m {secs}s",
-                    "summary":   f"{preset_label} — {score_r['score']}/100 {score_r['grade']}",
-                })
-                if len(job_history) > MAX_SCORE_HISTORY:
-                    job_history.pop(0)
-            else:
-                await context.bot.send_message(
-                    chat_id=user.id,
-                    text="⚠️ No signed APK produced. Check steps.",
-                    reply_markup=back_a())
-
-        except Exception as e:
-            pending_manual.pop(user.id, None)
-            await status_msg.edit_text(
-                f"❌ *Protection failed:* `{str(e)[:200]}`",
-                parse_mode="Markdown", reply_markup=back_a())
-        return
-
-    # ── PROTECTION HISTORY ────────────────────────────────────────────────────
     elif data == "admin_history":
         if not is_admin(user.id): return
         if not job_history:
@@ -17907,8 +16863,6 @@ async def button_handler(update, context):
                 "Run a protection job first.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "🛡️ Protect APK", callback_data="admin_protect_apk")],
                     [InlineKeyboardButton(
                         "⬅️ Back", callback_data="back_admin")],
                 ]))
@@ -17944,8 +16898,6 @@ async def button_handler(update, context):
             text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "🛡️ Protect APK", callback_data="admin_protect_apk")],
                 [InlineKeyboardButton(
                     "⬅️ Back", callback_data="back_admin")],
             ]))
@@ -19014,1012 +17966,7 @@ async def button_handler(update, context):
     # ══════════════════════════════════════════════════════════════════════════
     # ── END STEP-BY-STEP TEST PANEL ───────────────────────────────────────────
     # ══════════════════════════════════════════════════════════════════════════
-
-        smali_tree_path.pop(user.id, None)
-        smali_selected_files.pop(user.id, None)
-        smali_scan_results.pop(user.id, None)
-        work_dir = manual_work_dir.get(user.id)
-        apk_path = manual_apk_path.get(user.id)
-        if work_dir and apk_path:
-            engine   = ManualControlEngine(CryptoEngine(), work_dir)
-            apk_name = os.path.basename(apk_path)
-            msg, kb  = _build_session_checklist_msg(user.id, apk_name, engine)
-            await query.edit_message_text(
-                msg, parse_mode="Markdown", reply_markup=kb)
-        else:
-            await query.edit_message_text(
-                "👑 *Admin Panel — EPIC PROTECTOR*\n\nChoose an action:",
-                parse_mode="Markdown", reply_markup=admin_kb())
-        return
-
     # ── QUICK PROTECT — one tap, full 22-step, auto Base APK ────────────────
-    elif data == "admin_manual":
-        if not is_admin(user.id): return
-        config  = _get_base_apk_config()
-        file_id = config.get("base_apk_file_id")
-        if not file_id:
-            await query.edit_message_text(
-                "🎛️ *Manual Control Panel*\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "❌ No Base APK stored yet.\n\n"
-                "Go to 📦 Base APK → Upload Base APK first.",
-                parse_mode="Markdown", reply_markup=back_a())
-            return
-        apk_name   = config.get("base_apk_filename", "base.apk")
-        status_msg = await query.edit_message_text(
-            "🎛️ *Manual Control Panel*\n\n"
-            f"📦 Base APK: `{apk_name}`\n"
-            "━━━━━━━━━━━━━━━━━━━━━\n"
-            "📥 Loading Base APK...",
-            parse_mode="Markdown")
-        try:
-            apk_path = BaseApkStorageEngine.get_local_path(config)
-            if not apk_path:
-                await status_msg.edit_text(
-                    "🎛️ *Manual Control Panel*\n\n"
-                    f"📦 `{apk_name}`\n"
-                    "━━━━━━━━━━━━━━━━━━━━━\n"
-                    "📥 Downloading Base APK...\n⏳ Please wait...",
-                    parse_mode="Markdown")
-                apk_path = await BaseApkStorageEngine.download_base_apk(context.bot, config)
-            if not apk_path:
-                await status_msg.edit_text(
-                    "❌ *Failed to load Base APK.*\n\nCheck Base APK storage.",
-                    parse_mode="Markdown", reply_markup=back_a())
-                return
-            job_id   = f"manual_{int(time.time())}"
-            work_dir = os.path.join(WORK_DIR, job_id)
-            os.makedirs(work_dir, exist_ok=True)
-            manual_apk_path[user.id]    = apk_path
-            manual_work_dir[user.id]    = work_dir
-            manual_selected[user.id]    = set()
-            manual_aes_key[user.id]     = AESKeyManager.generate()
-            manual_job_start[user.id]   = time.time()
-            manual_done_steps[user.id]  = set()
-            manual_session_log[user.id] = []
-            manual_keystore_ctx[user.id] = {}   # fresh keystore context per session
-            pending_manual[user.id]     = "apk_ready"
-            engine = ManualControlEngine(CryptoEngine(), work_dir)
-            await status_msg.edit_text(
-                f"🎛️ *Manual Control Panel*\n\n"
-                f"📦 `{apk_name}` loaded\n\n"
-                f"Select a phase to run:\n"
-                f"━━━━━━━━━━━━━━━━━━━━━",
-                parse_mode="Markdown",
-                reply_markup=engine.build_preset_keyboard())
-        except Exception as e:
-            pending_manual.pop(user.id, None)
-            await status_msg.edit_text(
-                f"❌ *Failed to load Base APK:* `{e}`",
-                parse_mode="Markdown", reply_markup=back_a())
-        return
-
-    # ── MANUAL — CUSTOM STEPS — Bridge from preset view to step selection ────
-    elif data == "mcp_custom_steps":
-        if not is_admin(user.id): return
-        engine   = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
-        apk_name = os.path.basename(manual_apk_path.get(user.id, "your.apk"))
-        selected = manual_selected.get(user.id, set())
-        done     = manual_done_steps.get(user.id, set())
-        msg, kb  = engine.build_manual_control_message(
-            selected, done, apk_name)
-        try:
-            await query.edit_message_text(
-                msg, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
-            await context.bot.send_message(
-                chat_id=user.id,
-                text=msg,
-                parse_mode="Markdown",
-                reply_markup=kb)
-        return
-
-    # ── MANUAL — SHOW PRESETS ─────────────────────────────────────────────────
-    elif data == "mcp_show_presets":
-        if not is_admin(user.id): return
-        engine   = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
-        apk_name = os.path.basename(manual_apk_path.get(user.id, "your.apk"))
-        text     = (
-            f"🎛️ *Manual Control Panel*\n\n"
-            f"📦 `{apk_name}` loaded\n\n"
-            f"Select a phase to run:\n"
-            f"━━━━━━━━━━━━━━━━━━━━━"
-        )
-        kb = engine.build_preset_keyboard()
-        # Use reply instead of edit — works on document messages too
-        try:
-            await query.edit_message_text(
-                text, parse_mode="Markdown", reply_markup=kb)
-        except Exception:
-            await context.bot.send_message(
-                chat_id=user.id,
-                text=text,
-                parse_mode="Markdown",
-                reply_markup=kb)
-
-    # ── MANUAL — PRE-FLIGHT VALIDATION RUN ───────────────────────────────────
-    elif data == "mcp_preflight_run":
-        if not is_admin(user.id): return
-
-        apk_path = manual_apk_path.get(user.id)
-        if not apk_path or not os.path.exists(apk_path):
-            await query.edit_message_text(
-                "❌ *No APK loaded.*\n\nReturn to Manual Control Panel and reload.",
-                parse_mode="Markdown", reply_markup=back_a())
-            return
-
-        apk_name = os.path.basename(apk_path)
-        status_msg = await query.edit_message_text(
-            f"🧪 *Pre-flight Validation*\n\n"
-            f"📄 `{apk_name}`\n\n"
-            f"⏳ Running deep validation...",
-            parse_mode="Markdown")
-
-        try:
-            validator = PreflightValidator()
-            result    = validator.validate(apk_path)
-            report    = validator.format_report_message(apk_path, result)
-
-            info          = result.get("info", {})
-            fixable_count = info.get("fixable_count", 0)
-            passed        = result.get("passed", False)
-
-            # Build action keyboard
-            kb_rows = []
-            if fixable_count > 0:
-                kb_rows.append([InlineKeyboardButton(
-                    f"🔧 Auto-fix {fixable_count} Issue(s)",
-                    callback_data="mcp_preflight_autofix")])
-            if passed:
-                kb_rows.append([InlineKeyboardButton(
-                    "📋 Continue to Pipeline",
-                    callback_data="mcp_show_presets")])
-            else:
-                kb_rows.append([InlineKeyboardButton(
-                    "⚠️ Continue Anyway (not recommended)",
-                    callback_data="mcp_show_presets")])
-            kb_rows.append([InlineKeyboardButton(
-                "🔄 Re-validate",
-                callback_data="mcp_preflight_run")])
-            kb_rows.append([InlineKeyboardButton(
-                "⬅️ Back to Panel",
-                callback_data="mcp_show_presets")])
-
-            await status_msg.edit_text(
-                report,
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(kb_rows))
-
-        except Exception as e:
-            await status_msg.edit_text(
-                f"❌ *Pre-flight Validation Error*\n\n`{e}`",
-                parse_mode="Markdown", reply_markup=back_a())
-        return
-
-    # ── MANUAL — PRE-FLIGHT AUTO-FIX ─────────────────────────────────────────
-    elif data == "mcp_preflight_autofix":
-        if not is_admin(user.id): return
-
-        apk_path = manual_apk_path.get(user.id)
-        work_dir = manual_work_dir.get(user.id)
-
-        if not apk_path or not os.path.exists(apk_path):
-            await query.edit_message_text(
-                "❌ *No APK loaded.*\n\nReturn to Manual Control Panel and reload.",
-                parse_mode="Markdown", reply_markup=back_a())
-            return
-
-        apk_name   = os.path.basename(apk_path)
-        status_msg = await query.edit_message_text(
-            f"🔧 *Auto-fix Running*\n\n"
-            f"📄 `{apk_name}`\n\n"
-            f"⏳ Applying fixes to manifest...",
-            parse_mode="Markdown")
-
-        try:
-            validator      = PreflightValidator()
-            val_result     = validator.validate(apk_path)
-            fix_result     = validator.auto_fix(apk_path, work_dir, val_result)
-
-            fixes_applied  = fix_result.get("fixes_applied", [])
-            fixes_failed   = fix_result.get("fixes_failed",  [])
-            workspace      = fix_result.get("workspace")
-
-            lines = []
-            lines.append("🔧 *Auto-fix Report*")
-            lines.append("━━━━━━━━━━━━━━━━━━━━━")
-            lines.append(f"📄 `{apk_name}`")
-            lines.append("")
-
-            if fixes_applied:
-                lines.append(f"*Fixes Applied — {len(fixes_applied)}*")
-                for f in fixes_applied:
-                    lines.append(f)
-            else:
-                lines.append("ℹ️ No direct manifest text fixes applied")
-
-            if fixes_failed:
-                lines.append("")
-                lines.append(f"*Notes — {len(fixes_failed)}*")
-                for f in fixes_failed:
-                    lines.append(f)
-
-            lines.append("")
-            lines.append("━━━━━━━━━━━━━━━━━━━━━")
-
-            # If workspace was produced, note that Manifest Hardening will finalise
-            if workspace and os.path.exists(workspace):
-                lines.append(
-                    "ℹ️ Decoded workspace available — "
-                    "Manifest Hardening step will apply full hardening during pipeline run.")
-            else:
-                lines.append(
-                    "ℹ️ For full manifest hardening run "
-                    "Step 05 — Manifest Hardening in the pipeline.")
-
-            lines.append("")
-            lines.append("▶ *Re-validate to confirm fixes, then continue to pipeline.*")
-
-            kb_rows = [
-                [InlineKeyboardButton(
-                    "🔄 Re-validate APK",
-                    callback_data="mcp_preflight_run")],
-                [InlineKeyboardButton(
-                    "📋 Continue to Pipeline",
-                    callback_data="mcp_show_presets")],
-                [InlineKeyboardButton(
-                    "⬅️ Back to Panel",
-                    callback_data="mcp_show_presets")],
-            ]
-
-            await status_msg.edit_text(
-                "\n".join(lines),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(kb_rows))
-
-        except Exception as e:
-            await status_msg.edit_text(
-                f"❌ *Auto-fix Error*\n\n`{e}`",
-                parse_mode="Markdown", reply_markup=back_a())
-        return
-
-    # ── MANUAL — PRESET APPLIED ───────────────────────────────────────────────
-    elif data == "mcp_noop":
-        await query.answer()  # silent — divider button tap
-        return
-
-    elif data.startswith("mcp_preset_"):
-        if not is_admin(user.id): return
-        preset_key = data[len("mcp_preset_"):]
-        engine     = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
-
-        # Phase presets run immediately — no checkbox box shown
-        PHASE_KEYS = {
-            'phase_1_setup', 'phase_2_code_protection', 'phase_3_cleanup',
-            'phase_4_build', 'phase_5_av_clean', 'phase_6_complete',
-            'quick_sign', 'full_protection',
-        }
-
-        if preset_key in PHASE_KEYS:
-            # Phase 2 — split into two halves with inspection pause
-            PHASE2_PAUSE_AFTER = {
-                "obfuscation", "safe_rename"
-            }
-            PHASE2_RESUME_FROM = [
-                "encryption", "security_guard", "tamper_detection",
-                "dex_repackaging", "rebuild_apk", "keystore_generation",
-                "unique_fingerprint", "zipalign", "sign_apk", "protection_score",
-            ]
-
-            # Run phase immediately
-            ops      = engine.PRESETS.get(preset_key, [])
-            selected = engine.enforce_auto_sign(set(ops))
-            manual_selected[user.id] = selected
-            apk_path = manual_apk_path.get(user.id)
-            work_dir = manual_work_dir.get(user.id)
-
-            if not apk_path or not os.path.exists(apk_path):
-                await query.edit_message_text(
-                    "❌ APK not found. Please restart Manual Control Panel.",
-                    reply_markup=back_a())
-                return
-
-            phase_labels = {
-                'phase_1_setup':            '📋 Phase 1 — Setup',
-                'phase_2_code_protection':  '🛡️ Phase 2 — Code Protection',
-                'phase_3_cleanup':          '🧹 Phase 3 — Cleanup',
-                'phase_4_build':            '🔨 Phase 4 — Build + Integrity',
-                'phase_5_av_clean':         '🔬 Phase 5 — AV-Clean + Play Protect',
-                'phase_6_complete':         '🏆 Phase 6 — Complete',
-                'quick_sign':               '⚡ Quick Sign',
-                'full_protection':          '🛡️ Full Protection',
-            }
-            phase_label = phase_labels.get(preset_key, preset_key)
-            apk_name    = os.path.basename(apk_path)
-            ordered_ops = engine.enforce_pipeline_order(selected)
-
-            status_msg = await query.edit_message_text(
-                f"🎛️ *{phase_label}*\n\n"
-                f"📦 `{apk_name}`\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"⏳ Running {len(ordered_ops)} operations...\n"
-                f"Please wait — APK will be delivered when complete.",
-                parse_mode="Markdown")
-
-            # Run the phase
-            aes_key     = manual_aes_key.get(user.id) or AESKeyManager.generate()
-            manual_aes_key[user.id]   = aes_key
-            start_time  = time.time()
-            done_steps  = manual_done_steps.get(user.id, set())
-
-            # Always clear signing steps from done_steps for each phase run.
-            # This ensures every phase produces a fresh signed installable APK.
-            # Signing steps must always re-run — never skipped between phases.
-            # These steps ALWAYS re-run on every phase.
-            # decode_workspace and strip_signature must always re-run
-            # so each phase starts with a fresh decoded workspace.
-            # Without this — Phase 2+ would use a stale or deleted workspace
-            # from /tmp/ causing all protection steps to silently fail.
-            ALWAYS_RERUN_STEPS = {
-                # Workspace setup — must always be fresh
-                "preflight_validation",
-                "strip_signature",
-                "decode_workspace",
-                "compliance_scan",
-                # Signing — must always produce fresh APK
-                "rebuild_apk",
-                "keystore_generation",
-                "unique_fingerprint",
-                "zipalign",
-                "sign_apk",
-                "protection_score",
-                "integrity_manifest",
-                "aes_key_management",
-            }
-            done_steps -= ALWAYS_RERUN_STEPS
-            # Also reset workspace so it is rebuilt fresh for this phase
-            manual_workspace[user.id] = None
-            current_workspace = None
-
-            tools       = ToolInstaller()
-            tools.install_all()
-            scanner     = ComplianceScannerEngine()
-            ops_to_run  = [op for op in ordered_ops if op not in done_steps]
-
-            job_results       = []
-            current_workspace = manual_workspace.get(user.id)
-            current_apk       = apk_path
-            keystore_ctx      = manual_keystore_ctx.get(user.id, {})
-
-            for i, op_key in enumerate(ops_to_run):
-                label = engine.STEP_LABELS.get(op_key, op_key)
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=update.effective_chat.id,
-                        message_id=status_msg.message_id,
-                        text=f"🎛️ *{phase_label}*\n\n"
-                             f"Step {i+1}/{len(ops_to_run)}: {label}\n"
-                             f"⏳ Processing...",
-                        parse_mode="Markdown")
-                except Exception:
-                    pass
-
-                # Pre-update current_apk from rebuild_apk result before
-                # post-rebuild steps receive the correct rebuilt APK path
-                for prev_r in reversed(job_results):
-                    if prev_r.get("op") == "rebuild_apk" and prev_r.get("rebuilt_apk"):
-                        if os.path.exists(prev_r["rebuilt_apk"]):
-                            current_apk = prev_r["rebuilt_apk"]
-                        break
-
-                loop = asyncio.get_event_loop()
-                _op2 = op_key; _apk2 = current_apk; _ws2 = current_workspace
-                _kctx2 = keystore_ctx; _done2 = set(done_steps)
-                result = await loop.run_in_executor(
-                    None,
-                    lambda: engine.run_operation(
-                        _op2, _apk2, _ws2,
-                        work_dir, aes_key, tools, scanner,
-                        rebuilt_apk_override=_apk2,
-                        keystore_ctx=_kctx2,
-                        completed_ops=_done2))
-
-                if op_key == "decode_workspace" and result.get("workspace"):
-                    current_workspace = result["workspace"]
-                    manual_workspace[user.id] = current_workspace
-                if op_key == "strip_signature":
-                    stripped = os.path.join(work_dir, "input_stripped.apk")
-                    if os.path.exists(stripped):
-                        current_apk = stripped
-                if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
-                    current_apk = result["rebuilt_apk"]
-                if op_key == "rebuild_apk" and result.get("workspace"):
-                    current_workspace = result["workspace"]
-                    manual_workspace[user.id] = current_workspace
-
-                if "❌" not in result.get("status", ""):
-                    done_steps.add(op_key)
-
-                job_results.append(result)
-
-                # ── Phase 2 Pause Point — after obfuscation + safe_rename ────
-                # Pause here so admin can inspect and manually rename
-                if (preset_key == "phase_2_code_protection" and
-                        op_key == "safe_rename" and
-                        "❌" not in result.get("status", "")):
-
-                    # Save remaining ops for after inspection
-                    remaining = [
-                        op for op in PHASE2_RESUME_FROM
-                        if op not in done_steps
-                    ]
-                    phase2_paused[user.id]    = True
-                    phase2_after_ops[user.id] = remaining
-                    manual_done_steps[user.id]   = done_steps
-                    manual_keystore_ctx[user.id] = keystore_ctx
-                    manual_workspace[user.id]    = current_workspace
-
-                    # Build partial summary
-                    partial_lines = [
-                        "⏸️ *Phase 2 — Paused for Inspection*\n",
-                        "━━━━━━━━━━━━━━━━━━━━━",
-                    ]
-                    for r in job_results:
-                        icon = "✅" if "❌" not in r.get("status","") else "❌"
-                        partial_lines.append(
-                            f"{icon} {r.get('label', r.get('op',''))}")
-                    partial_lines += [
-                        "━━━━━━━━━━━━━━━━━━━━━",
-                        "✅ Obfuscation complete",
-                        "✅ Safe rename complete",
-                        "",
-                        "🔍 *Inspect your renamed files now.*",
-                        "Use File Editor to view and manually",
-                        "rename any files to your preferred",
-                        "safe keyword names.",
-                        "",
-                        "When ready tap *▶️ Continue Phase 2*",
-                        "to run Encryption + Security Guard.",
-                    ]
-
-                    await status_msg.edit_text(
-                        "\n".join(partial_lines),
-                        parse_mode="Markdown",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton(
-                                "▶️ Continue Phase 2",
-                                callback_data="phase2_continue")],
-                            [InlineKeyboardButton(
-                                "🌲 Inspect smali/ Files",
-                                callback_data="smali_tree_open")],
-                            [InlineKeyboardButton(
-                                "📁 Inspect res/ Files",
-                                callback_data="res_tree_open")],
-                            [InlineKeyboardButton(
-                                "📄 Inspect AndroidManifest",
-                                callback_data="manifest_browse_open")],
-                            [InlineKeyboardButton(
-                                "📦 Inspect resources.arsc",
-                                callback_data="arsc_browse_open")],
-                            [InlineKeyboardButton(
-                                "🛡️ Safety Analysis",
-                                callback_data="safety_analyse"),
-                             InlineKeyboardButton(
-                                "🔬 AV Trigger Scan",
-                                callback_data="av_trigger_scan")],
-                            [InlineKeyboardButton(
-                                "👁️ Dry Run Preview",
-                                callback_data="dry_run_preview"),
-                             InlineKeyboardButton(
-                                "🔐 Permission Audit",
-                                callback_data="perm_audit")],
-                            [InlineKeyboardButton(
-                                "📋 Session Report",
-                                callback_data="session_report"),
-                             InlineKeyboardButton(
-                                "↩️ Undo Last Step",
-                                callback_data="mcp_undo")],
-                        ]))
-                    return
-                # ── End Phase 2 Pause ─────────────────────────────────────────
-
-            manual_done_steps[user.id]   = done_steps
-            manual_keystore_ctx[user.id] = keystore_ctx
-
-            # Build summary
-            applied    = [r["op"] for r in job_results if "❌" not in r.get("status","")]
-            scorer     = ProtectionScoreEngine()
-            score_r    = scorer.calculate(applied)
-            elapsed    = int(time.time() - start_time)
-            mins, secs = elapsed // 60, elapsed % 60
-
-            # Find final APK
-            final_apk = None
-            for r in reversed(job_results):
-                if r.get("final_apk") and os.path.exists(r["final_apk"]):
-                    final_apk = r["final_apk"]
-                    break
-
-            # Summary lines
-            lines = [
-                f"✅ *{phase_label} — Complete*\n",
-                "━━━━━━━━━━━━━━━━━━━━━",
-            ]
-            for r in job_results:
-                icon = "✅" if "❌" not in r.get("status","") else "❌"
-                lines.append(f"{icon} {r.get('label', r.get('op',''))}")
-            lines += [
-                "━━━━━━━━━━━━━━━━━━━━━",
-                f"🕐 Time: `{mins}m {secs}s`",
-                f"📊 Score: *{score_r['score']}/100 — {score_r['grade']}*",
-            ]
-
-            await status_msg.edit_text(
-                "\n".join(lines), parse_mode="Markdown")
-
-            if final_apk and os.path.exists(final_apk):
-                with open(final_apk, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id=user.id,
-                        document=f,
-                        filename=f"EPIC_{preset_key.upper()}.apk",
-                        caption=f"✅ *{phase_label} — Install & Test*\n\nInstall this APK on your device.",
-                        parse_mode="Markdown",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("🔄 Run Next Phase", callback_data="mcp_show_presets")],
-                            [InlineKeyboardButton("⬅️ Back to Menu",   callback_data="back_admin")],
-                        ]))
-            else:
-                await context.bot.send_message(
-                    chat_id=user.id,
-                    text="⚠️ No signed APK produced. Check summary above.",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⬅️ Back", callback_data="back_admin")],
-                    ]))
-            return
-
-        # Non-phase presets — custom only now
-        if preset_key == "custom":
-            manual_selected[user.id] = set()
-        else:
-            ops = engine.PRESETS.get(preset_key, [])
-            manual_selected[user.id] = set(ops)
-
-        apk_name = os.path.basename(manual_apk_path.get(user.id, "your.apk"))
-        selected = manual_selected.get(user.id, set())
-        count    = len(selected)
-
-        await query.edit_message_text(
-            f"🎛️ *Manual Control Panel*\n\n"
-            f"📁 APK: `{apk_name}`\n"
-            f"✅ Selected: {count} operations\n\n"
-            f"Tap any step to toggle ON/OFF:\n"
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode="Markdown",
-            reply_markup=engine.build_selection_keyboard(selected))
-
-    # ── MANUAL — TOGGLE SINGLE STEP ──────────────────────────────────────────
-    elif data.startswith("mcp_toggle_"):
-        if not is_admin(user.id): return
-        op_key   = data[len("mcp_toggle_"):]
-        selected = manual_selected.get(user.id, set())
-
-        if op_key in selected:
-            selected.discard(op_key)
-        else:
-            selected.add(op_key)
-        manual_selected[user.id] = selected
-
-        engine   = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
-        apk_name = os.path.basename(manual_apk_path.get(user.id, "your.apk"))
-        count    = len(selected)
-
-        await query.edit_message_text(
-            f"🎛️ *Manual Control Panel*\n\n"
-            f"📁 APK: `{apk_name}`\n"
-            f"✅ Selected: {count} operations\n\n"
-            f"Tap any step to toggle ON/OFF:\n"
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode="Markdown",
-            reply_markup=engine.build_selection_keyboard(selected))
-
-    # ── MANUAL — SELECT ALL ───────────────────────────────────────────────────
-    elif data == "mcp_select_all":
-        if not is_admin(user.id): return
-        engine   = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
-        selected = set(engine.PIPELINE_ORDER)
-        manual_selected[user.id] = selected
-        apk_name = os.path.basename(manual_apk_path.get(user.id, "your.apk"))
-
-        await query.edit_message_text(
-            f"🎛️ *Manual Control Panel*\n\n"
-            f"📁 APK: `{apk_name}`\n"
-            f"✅ Selected: {len(selected)} operations (ALL)\n\n"
-            f"Tap any step to toggle ON/OFF:\n"
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode="Markdown",
-            reply_markup=engine.build_selection_keyboard(selected))
-
-    # ── MANUAL — CLEAR ALL ────────────────────────────────────────────────────
-    elif data == "mcp_clear_all":
-        if not is_admin(user.id): return
-        engine   = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
-        selected = set()
-        manual_selected[user.id] = selected
-        apk_name = os.path.basename(manual_apk_path.get(user.id, "your.apk"))
-
-        await query.edit_message_text(
-            f"🎛️ *Manual Control Panel*\n\n"
-            f"📁 APK: `{apk_name}`\n"
-            f"✅ Selected: 0 operations\n\n"
-            f"Tap any step to toggle ON/OFF:\n"
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            parse_mode="Markdown",
-            reply_markup=engine.build_selection_keyboard(selected))
-
-    # ── MANUAL — APPLY SELECTED ───────────────────────────────────────────────
-    elif data == "mcp_apply":
-        if not is_admin(user.id): return
-        selected   = manual_selected.get(user.id, set())
-        done_steps = manual_done_steps.get(user.id, set())
-
-        if not selected:
-            await query.answer("⚠️ No operations selected.", show_alert=True)
-            return
-
-        apk_path  = manual_apk_path.get(user.id)
-        work_dir  = manual_work_dir.get(user.id)
-        workspace = manual_workspace.get(user.id)
-        apk_name  = os.path.basename(apk_path or "base.apk")
-
-        if not apk_path or not os.path.exists(apk_path):
-            await query.edit_message_text(
-                "❌ APK not found. Please restart Manual Control Panel.",
-                reply_markup=back_a())
-            return
-
-        engine      = ManualControlEngine(CryptoEngine(), work_dir)
-        # Auto-append signing — every output is always installable
-        selected    = engine.enforce_auto_sign(selected)
-        ordered_ops = engine.enforce_pipeline_order(selected)
-
-        # Skip already-done steps silently
-        ops_to_run = [op for op in ordered_ops if op not in done_steps]
-        skipped    = [op for op in ordered_ops if op in done_steps]
-
-        if not ops_to_run:
-            await query.answer(
-                "⚠️ All selected steps already done.", show_alert=True)
-            return
-
-        # ── Dependency check before running ──────────────────────────────────
-        # OR_DEPS — step passes if ANY ONE of the listed deps is satisfied
-        OR_DEPS = {
-            "unique_fingerprint": [
-                "keystore_generation",
-                "certificate_aging",
-                "signing_lineage",
-            ],
-            "protection_score": [
-                "sign_apk",
-                "signing_lineage",
-            ],
-        }
-        warnings = []
-        for op in ops_to_run:
-            # Check OR deps first — if op has OR deps, only one needs to be met
-            if op in OR_DEPS:
-                or_options = OR_DEPS[op]
-                or_met = any(
-                    d in done_steps or d in ops_to_run
-                    for d in or_options
-                )
-                if not or_met:
-                    dep_labels = [engine.STEP_LABELS.get(d, d) for d in or_options]
-                    warnings.append(
-                        f"⚠️ *{engine.STEP_LABELS.get(op,op)}* needs one of: "
-                        f"{', '.join(dep_labels)}"
-                    )
-            else:
-                # Standard AND deps — all must be satisfied
-                deps = engine.STEP_DEPENDENCIES.get(op, [])
-                missing_deps = [
-                    d for d in deps
-                    if d not in done_steps and d not in ops_to_run
-                ]
-                if missing_deps:
-                    dep_labels = [engine.STEP_LABELS.get(d, d) for d in missing_deps]
-                    warnings.append(
-                        f"⚠️ *{engine.STEP_LABELS.get(op,op)}* needs: "
-                        f"{', '.join(dep_labels)}"
-                    )
-
-        if warnings:
-            warn_text = "\n".join(warnings)
-            await query.answer(
-                "⚠️ Dependency warning — check message", show_alert=True)
-            await context.bot.send_message(
-                chat_id=user.id,
-                text=f"⚠️ *Dependency Warning*\n\n{warn_text}\n\n"
-                     f"Proceeding anyway — steps will be skipped if workspace missing.",
-                parse_mode="Markdown")
-
-        aes_key    = manual_aes_key.get(user.id) or AESKeyManager.generate()
-        manual_aes_key[user.id] = aes_key
-        start_time = manual_job_start.get(user.id, time.time())
-        session_log = manual_session_log.get(user.id, [])
-
-        status_msg = await query.edit_message_text(
-            f"🎛️ *Running {len(ops_to_run)} step(s)...*\n\n"
-            f"⏳ Please wait...",
-            parse_mode="Markdown")
-
-        tools   = ToolInstaller()
-        tools.install_all()
-        scanner = ComplianceScannerEngine()
-
-        # Save undo backup
-        if workspace and os.path.exists(workspace):
-            undo_dir = os.path.join(work_dir, f"undo_{int(time.time())}")
-            try:
-                shutil.copytree(workspace, undo_dir)
-                manual_undo_backup[user.id] = undo_dir
-            except Exception:
-                pass
-
-        current_workspace = workspace
-        current_apk       = apk_path
-        # Restore current_apk to rebuilt if available
-        rebuilt_path = os.path.join(work_dir, "rebuilt.apk")
-        if os.path.exists(rebuilt_path):
-            current_apk = rebuilt_path
-        stripped_path = os.path.join(work_dir, "input_stripped.apk")
-        if os.path.exists(stripped_path):
-            current_apk = stripped_path
-
-        batch_results = []
-
-        for i, op_key in enumerate(ops_to_run):
-            label = engine.STEP_LABELS.get(op_key, op_key)
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=update.effective_chat.id,
-                    message_id=status_msg.message_id,
-                    text=f"🎛️ *Step {i+1}/{len(ops_to_run)}*\n\n"
-                         f"▶️ {label}\n⏳ Processing...",
-                    parse_mode="Markdown")
-            except Exception:
-                pass
-
-            # Before calling run_operation — pre-update current_apk from
-            # previous step results so asset_compiler and dex_encryption
-            # receive the correct rebuilt APK path, not the stripped APK.
-            # rebuild_apk result is stored in batch_results — check last entry.
-            for prev_result in reversed(batch_results):
-                if prev_result.get("op") == "rebuild_apk" and prev_result.get("rebuilt_apk"):
-                    if os.path.exists(prev_result["rebuilt_apk"]):
-                        current_apk = prev_result["rebuilt_apk"]
-                    break
-
-            loop = asyncio.get_event_loop()
-            _op3 = op_key; _apk3 = current_apk; _ws3 = current_workspace
-            _kctx3 = manual_keystore_ctx.setdefault(user.id, {}); _done3 = set(done_steps)
-            result = await loop.run_in_executor(
-                None,
-                lambda: engine.run_operation(
-                    _op3, _apk3, _ws3,
-                    work_dir, aes_key, tools, scanner,
-                    rebuilt_apk_override=_apk3,
-                    keystore_ctx=_kctx3,
-                    completed_ops=_done3))
-
-            # Update state from results
-            if op_key == "decode_workspace" and result.get("workspace"):
-                current_workspace = result["workspace"]
-                manual_workspace[user.id] = current_workspace
-            if op_key == "strip_signature":
-                if os.path.exists(stripped_path):
-                    current_apk = stripped_path
-            if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
-                current_apk = result["rebuilt_apk"]
-            if op_key == "sign_apk" and result.get("final_apk"):
-                current_apk = result["final_apk"]
-
-            # Mark step as done
-            done_steps.add(op_key)
-            status_icon = "✅" if "❌" not in result.get("status","") and "⚠️" not in result.get("status","") else ("⚠️" if "⚠️" in result.get("status","") else "❌")
-            session_log.append((op_key, f"{status_icon} {label}", result.get("status","")))
-            batch_results.append(result)
-
-        # Save updated session state
-        manual_done_steps[user.id]  = done_steps
-        manual_session_log[user.id] = session_log
-        manual_selected[user.id]    = set()  # Clear selection after run
-
-        # Build step result message
-        result_lines = ["✅ *Step Results*\n", "━━━━━━━━━━━━━━━━━━━━━"]
-        final_apk = None
-        aes_key_display = None
-
-        for r in batch_results:
-            lbl    = engine.STEP_LABELS.get(r["op"], r["op"])
-            status = r.get("status", "")
-            icon   = "✅" if "❌" not in status and "⚠️" not in status else ("⚠️" if "⚠️" in status else "❌")
-            result_lines.append(f"{icon} *{lbl}*")
-            if r.get("aes_key_display"):
-                aes_key_display = r["aes_key_display"]
-                result_lines.append(f"🔑 AES Key: `{aes_key_display}`")
-                result_lines.append("⚠️ Save this key securely — not stored anywhere.")
-            if r.get("final_apk") and os.path.exists(r["final_apk"]):
-                final_apk = r["final_apk"]
-            # Show useful detail
-            for field in ["findings","changes","strings_encrypted","files_hashed",
-                          "renamed_classes","items_removed","removed_files"]:
-                if r.get(field) is not None:
-                    result_lines.append(f"   `{field}: {r[field]}`")
-            if r.get("status"):
-                _st = r['status'][:80].replace("_", r"\_").replace("*", r"\*").replace("`", r"\`")
-                result_lines.append(f"   _{_st}_")
-
-        # Calculate cumulative score
-        all_done   = list(done_steps)
-        scorer     = ProtectionScoreEngine()
-        score_r    = scorer.calculate(all_done)
-        result_lines += [
-            "━━━━━━━━━━━━━━━━━━━━━",
-            f"📊 Cumulative Score: *{score_r['score']}/100 — {score_r['grade']}*",
-        ]
-
-        # Suggestion for next step
-        last_op    = ops_to_run[-1] if ops_to_run else None
-        suggestion = engine.STEP_SUGGESTIONS.get(last_op) if last_op else None
-        if suggestion and suggestion not in done_steps:
-            sug_label = engine.STEP_LABELS.get(suggestion, "")
-            result_lines.append(f"💡 Recommended next: *{sug_label}*")
-
-        result_msg = "\n".join(result_lines)
-
-        # Send result then immediately show checklist again
-        await status_msg.edit_text(result_msg, parse_mode="Markdown")
-
-        # Deliver APK if signed — no reply_markup on document
-        if final_apk and os.path.exists(final_apk):
-            with open(final_apk, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=user.id,
-                    document=f,
-                    filename="EPIC_MANUAL_PROTECTED.apk",
-                    caption="✅ *Signed APK delivered — session still active.*",
-                    parse_mode="Markdown")
-
-        # Show checklist again — session continues
-        chk_msg, chk_kb = _build_session_checklist_msg(user.id, apk_name, engine)
-        await context.bot.send_message(
-            chat_id=user.id,
-            text=chk_msg,
-            parse_mode="Markdown",
-            reply_markup=chk_kb)
-
-    # ── FINISH & DELIVER — end session ────────────────────────────────────────
-    elif data == "mcp_finish":
-        if not is_admin(user.id): return
-        apk_path   = manual_apk_path.get(user.id)
-        work_dir   = manual_work_dir.get(user.id)
-        done_steps = manual_done_steps.get(user.id, set())
-        start_time = manual_job_start.get(user.id, time.time())
-        apk_name   = os.path.basename(apk_path or "base.apk")
-        engine     = ManualControlEngine(CryptoEngine(), work_dir or WORK_DIR)
-        aes_key    = manual_aes_key.get(user.id, b"")
-
-        # Find the best final APK
-        final_apk = None
-        for fname in ["EPIC_PROTECTED.apk", "rebuilt.apk"]:
-            p = os.path.join(work_dir or WORK_DIR, fname)
-            if os.path.exists(p):
-                final_apk = p
-                break
-
-        scorer  = ProtectionScoreEngine()
-        score_r = scorer.calculate(list(done_steps))
-        elapsed = int(time.time() - start_time)
-        mins    = elapsed // 60
-        secs    = elapsed % 60
-
-        summary_lines = [
-            "🏁 *Session Complete — Final Summary*\n",
-            "━━━━━━━━━━━━━━━━━━━━━",
-            f"📦 `{apk_name}`",
-            f"⏱️ Total time: {mins}m {secs}s",
-            f"✅ Steps completed: {len(done_steps)}/22",
-            "━━━━━━━━━━━━━━━━━━━━━",
-        ]
-        for op in engine.PIPELINE_ORDER:
-            if op in done_steps:
-                lbl = engine.STEP_LABELS.get(op, op)
-                summary_lines.append(f"✅ {lbl}")
-        summary_lines += [
-            "━━━━━━━━━━━━━━━━━━━━━",
-            f"📊 Final Score: *{score_r['score']}/100 — {score_r['grade']}*",
-        ]
-
-        summary_msg = "\n".join(summary_lines)
-        await query.edit_message_text(summary_msg, parse_mode="Markdown")
-
-        # Deliver APK if available
-        if final_apk and os.path.exists(final_apk):
-            size_mb = os.path.getsize(final_apk) / (1024*1024)
-            with open(final_apk, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=user.id,
-                    document=f,
-                    filename=f"EPIC_PROTECTED_{apk_name}",
-                    caption=f"🏁 *Final Protected APK*\n📦 {size_mb:.2f} MB\n"
-                            f"📊 Score: {score_r['score']}/100 — {score_r['grade']}",
-                    parse_mode="Markdown")
-            # Buttons on separate message — document captions do not
-            # reliably support inline keyboard callbacks in all Telegram clients
-            await context.bot.send_message(
-                chat_id=user.id,
-                text="✅ Session complete. What next?",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 New Session",    callback_data="admin_manual")],
-                    [InlineKeyboardButton("⬅️ Back to Menu",   callback_data="back_admin")],
-                ]))
-        else:
-            await context.bot.send_message(
-                chat_id=user.id,
-                text="⚠️ No signed APK produced in this session.\n\nWhat next?",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 New Session",    callback_data="admin_manual")],
-                    [InlineKeyboardButton("⬅️ Back to Menu",   callback_data="back_admin")],
-                ]))
-
-        # Clear session
-        for d in [manual_done_steps, manual_session_log]:
-            d.pop(user.id, None)
-
-    # ── MCP_DONE — tap on already-done step ───────────────────────────────────
-    elif data.startswith("mcp_done_"):
-        op_key = data[len("mcp_done_"):]
-        engine = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
-        label  = engine.STEP_LABELS.get(op_key, op_key)
-        await query.answer(f"✅ {label} already completed.", show_alert=False)
-
-    # ── MANUAL — UNDO LAST JOB ────────────────────────────────────────────────
-    elif data == "mcp_undo":
-        if not is_admin(user.id): return
-        undo_dir  = manual_undo_backup.get(user.id)
-        workspace = manual_workspace.get(user.id)
-
-        if not undo_dir or not os.path.exists(undo_dir):
-            await query.edit_message_text(
-                "❌ No undo backup available.",
-                reply_markup=back_a())
-            return
-        try:
-            if workspace and os.path.exists(workspace):
-                shutil.rmtree(workspace)
-            shutil.copytree(undo_dir, workspace)
-            manual_undo_backup.pop(user.id, None)
-            await query.edit_message_text(
-                "↩️ *Undo Complete!*\n\n"
-                "✅ Workspace restored to state before last job.\n\n"
-                "You can now select different operations.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Select Operations", callback_data="mcp_show_presets")],
-                    [InlineKeyboardButton("⬅️ Back to Menu",      callback_data="back_admin")],
-                ]))
-        except Exception as e:
-            await query.edit_message_text(
-                f"❌ *Undo Failed:* `{e}`",
-                parse_mode="Markdown", reply_markup=back_a())
-
-    # ── DETECTION SCAN ───────────────────────────────────────────────────────
     elif data == "admin_base_apk":
         if not is_admin(user.id): return
         config = _get_base_apk_config()
@@ -20111,10 +18058,10 @@ async def button_handler(update, context):
     elif data == "smali_tree_open":
         if not is_admin(user.id): return
 
-        # Check workspace from smali_tree_workspace first, then manual_workspace
+        # Check workspace from smali_tree_workspace first, then sbs_workspace
         workspace = smali_tree_workspace.get(user.id)
         if not workspace or not os.path.exists(workspace):
-            workspace = manual_workspace.get(user.id)
+            workspace = sbs_workspace.get(user.id)
 
         if not workspace or not os.path.exists(workspace):
             await query.edit_message_text(
@@ -20126,12 +18073,10 @@ async def button_handler(update, context):
                 "your APK before browsing smali files.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "📋 Run Phase 1 First",
-                        callback_data="mcp_preset_phase_1_setup")],
+
                     [InlineKeyboardButton(
                         "⬅️ Back",
-                        callback_data="phase2_back_from_inspect")],
+                        callback_data="back_admin")],
                 ]))
             return
 
@@ -20148,12 +18093,10 @@ async def button_handler(update, context):
                 "Run Phase 1 to decode your APK first.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "📋 Run Phase 1 First",
-                        callback_data="mcp_preset_phase_1_setup")],
+
                     [InlineKeyboardButton(
                         "⬅️ Back",
-                        callback_data="phase2_back_from_inspect")],
+                        callback_data="back_admin")],
                 ]))
             return
 
@@ -20190,7 +18133,7 @@ async def button_handler(update, context):
             rows.append([InlineKeyboardButton(
                 f"📁 {root}", callback_data=f"smali_nav:{root}")])
         rows.append([InlineKeyboardButton(
-            "⬅️ Back", callback_data="phase2_back_from_inspect")])
+            "⬅️ Back", callback_data="back_admin")])
 
         await query.edit_message_text(
             f"🌲 *Smali Tree Browser*\n\n"
@@ -20210,9 +18153,9 @@ async def button_handler(update, context):
         if not is_admin(user.id): return
         workspace = smali_tree_workspace.get(user.id)
 
-        # Fallback — try manual_workspace if smali_tree_workspace not set
+        # Fallback — try sbs_workspace if smali_tree_workspace not set
         if not workspace or not os.path.exists(workspace):
-            workspace = manual_workspace.get(user.id)
+            workspace = sbs_workspace.get(user.id)
             if workspace and os.path.exists(workspace):
                 smali_tree_workspace[user.id] = workspace
             else:
@@ -20705,14 +18648,14 @@ async def button_handler(update, context):
                 [InlineKeyboardButton(
                     "🌲 Back to Tree", callback_data="smali_tree_open")],
                 [InlineKeyboardButton(
-                    "🔙 Back to Panel", callback_data="phase2_back_from_inspect")],
+                    "🔙 Back to Panel", callback_data="back_admin")],
             ]))
 
 
     # ── SAFETY ANALYSIS ───────────────────────────────────────────────────────
     elif data == "safety_analyse":
         if not is_admin(user.id): return
-        workspace = manual_workspace.get(user.id)
+        workspace = sbs_workspace.get(user.id)
         if not workspace or not os.path.exists(workspace):
             await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
             return
@@ -20726,7 +18669,7 @@ async def button_handler(update, context):
                 result["report"],
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="back_admin")],
                 ]))
         except Exception as e:
             await query.edit_message_text(
@@ -20736,7 +18679,7 @@ async def button_handler(update, context):
     # ── AV TRIGGER SCAN ───────────────────────────────────────────────────────
     elif data == "av_trigger_scan":
         if not is_admin(user.id): return
-        workspace = manual_workspace.get(user.id)
+        workspace = sbs_workspace.get(user.id)
         if not workspace or not os.path.exists(workspace):
             await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
             return
@@ -20746,8 +18689,8 @@ async def button_handler(update, context):
         try:
             scanner = AVTriggerScannerEngine()
             result  = scanner.scan(workspace)
-            aes_key = manual_aes_key.get(user.id) or AESKeyManager.generate()
-            rows = [[InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")]]
+            aes_key = sbs_aes_key.get(user.id) or AESKeyManager.generate()
+            rows = [[InlineKeyboardButton("🔙 Back", callback_data="back_admin")]]
             if result["critical"]:
                 rows.insert(0, [InlineKeyboardButton(
                     f"🔧 Auto-fix {len(result['critical'])} Critical",
@@ -20763,8 +18706,8 @@ async def button_handler(update, context):
 
     elif data == "av_autofix":
         if not is_admin(user.id): return
-        workspace = manual_workspace.get(user.id)
-        aes_key   = manual_aes_key.get(user.id) or AESKeyManager.generate()
+        workspace = sbs_workspace.get(user.id)
+        aes_key   = sbs_aes_key.get(user.id) or AESKeyManager.generate()
         if not workspace:
             await query.answer("⚠️ No workspace.", show_alert=True)
             return
@@ -20782,7 +18725,7 @@ async def button_handler(update, context):
                 f"All critical strings encrypted — no longer visible to scanners.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="back_admin")],
                 ]))
         except Exception as e:
             await query.edit_message_text(
@@ -20792,7 +18735,7 @@ async def button_handler(update, context):
     # ── DRY RUN PREVIEW ───────────────────────────────────────────────────────
     elif data == "dry_run_preview":
         if not is_admin(user.id): return
-        workspace = manual_workspace.get(user.id)
+        workspace = sbs_workspace.get(user.id)
         if not workspace or not os.path.exists(workspace):
             await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
             return
@@ -20810,8 +18753,8 @@ async def button_handler(update, context):
                 preview["report"],
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Proceed with Apply", callback_data="phase2_back_from_inspect")],
-                    [InlineKeyboardButton("❌ Cancel", callback_data="phase2_back_from_inspect")],
+                    [InlineKeyboardButton("✅ Proceed with Apply", callback_data="back_admin")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="back_admin")],
                 ]))
         except Exception as e:
             await query.edit_message_text(
@@ -20821,7 +18764,7 @@ async def button_handler(update, context):
     # ── PERMISSION AUDITOR ────────────────────────────────────────────────────
     elif data == "perm_audit":
         if not is_admin(user.id): return
-        workspace = manual_workspace.get(user.id)
+        workspace = sbs_workspace.get(user.id)
         if not workspace or not os.path.exists(workspace):
             await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
             return
@@ -20832,7 +18775,7 @@ async def button_handler(update, context):
                 result["report"],
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="back_admin")],
                 ]))
         except Exception as e:
             await query.edit_message_text(
@@ -20848,20 +18791,20 @@ async def button_handler(update, context):
                 "📋 *Session Report*\n\nNo manual changes recorded yet.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="back_admin")],
                 ]))
             return
         await query.edit_message_text(
             rep.generate_report(),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
+                [InlineKeyboardButton("🔙 Back", callback_data="back_admin")],
             ]))
 
     # ── RES/ TREE BROWSER — Open root ────────────────────────────────────────
     elif data == "res_tree_open":
         if not is_admin(user.id): return
-        workspace = manual_workspace.get(user.id)
+        workspace = sbs_workspace.get(user.id)
         if not workspace or not os.path.exists(workspace):
             await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
             return
@@ -20876,7 +18819,7 @@ async def button_handler(update, context):
         for root in roots:
             rows.append([InlineKeyboardButton(
                 f"📁 {root}", callback_data=f"res_nav:{root}")])
-        rows.append([InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")])
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
         await query.edit_message_text(
             "📁 *res/ Tree Browser*\n\n"
             "━━━━━━━━━━━━━━━━━━━━━\n"
@@ -21066,7 +19009,7 @@ async def button_handler(update, context):
     # ── ANDROID MANIFEST BROWSER ──────────────────────────────────────────────
     elif data == "manifest_browse_open":
         if not is_admin(user.id): return
-        workspace = manual_workspace.get(user.id)
+        workspace = sbs_workspace.get(user.id)
         if not workspace or not os.path.exists(workspace):
             await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
             return
@@ -21102,7 +19045,7 @@ async def button_handler(update, context):
                     f"🔧 Fix {len(triggers)} Trigger Values",
                     callback_data="manifest_fix_triggers")])
             rows.append([InlineKeyboardButton(
-                "🔙 Back", callback_data="phase2_back_from_inspect")])
+                "🔙 Back", callback_data="back_admin")])
 
             trigger_note = (
                 f"⚠️ {len(triggers)} trigger words in label/description values"
@@ -21219,7 +19162,7 @@ async def button_handler(update, context):
     # ── RESOURCES.ARSC BROWSER ────────────────────────────────────────────────
     elif data == "arsc_browse_open":
         if not is_admin(user.id): return
-        workspace = manual_workspace.get(user.id)
+        workspace = sbs_workspace.get(user.id)
         if not workspace or not os.path.exists(workspace):
             await query.answer("⚠️ No workspace. Run Decode step first.", show_alert=True)
             return
@@ -21234,7 +19177,7 @@ async def button_handler(update, context):
                 "Run Decode step first — apktool decodes resources.arsc to res/values/strings.xml.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="phase2_back_from_inspect")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="back_admin")],
                 ]))
             return
 
@@ -21253,7 +19196,7 @@ async def button_handler(update, context):
             f"🟢 View All {len(entries)} Strings",
             callback_data="arsc_view_all")])
         rows.append([InlineKeyboardButton(
-            "🔙 Back", callback_data="phase2_back_from_inspect")])
+            "🔙 Back", callback_data="back_admin")])
 
         await query.edit_message_text(
             f"📦 *resources.arsc Browser*\n\n"
@@ -21351,375 +19294,6 @@ async def button_handler(update, context):
 
 
     # ── PHASE 2 — Back from inspection ───────────────────────────────────────
-    elif data == "phase2_back_from_inspect":
-        if not is_admin(user.id): return
-        # If Phase 2 is paused — go back to pause screen
-        if phase2_paused.get(user.id):
-            after_ops = phase2_after_ops.get(user.id, [])
-            await query.edit_message_text(
-                "⏸️ *Phase 2 — Paused for Inspection*\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "✅ Obfuscation complete\n"
-                "✅ Safe rename complete\n\n"
-                "🔍 Continue inspecting or tap\n"
-                "*▶️ Continue Phase 2* when ready.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "▶️ Continue Phase 2",
-                        callback_data="phase2_continue")],
-                    [InlineKeyboardButton(
-                        "🌲 Inspect smali/ Files",
-                        callback_data="smali_tree_open")],
-                    [InlineKeyboardButton(
-                        "📁 Inspect res/ Files",
-                        callback_data="res_tree_open")],
-                    [InlineKeyboardButton(
-                        "📄 Inspect AndroidManifest",
-                        callback_data="manifest_browse_open")],
-                    [InlineKeyboardButton(
-                        "📦 Inspect resources.arsc",
-                        callback_data="arsc_browse_open")],
-                    [InlineKeyboardButton(
-                        "🛡️ Safety Analysis",
-                        callback_data="safety_analyse"),
-                     InlineKeyboardButton(
-                        "🔬 AV Trigger Scan",
-                        callback_data="av_trigger_scan")],
-                    [InlineKeyboardButton(
-                        "👁️ Dry Run Preview",
-                        callback_data="dry_run_preview"),
-                     InlineKeyboardButton(
-                        "🔐 Permission Audit",
-                        callback_data="perm_audit")],
-                    [InlineKeyboardButton(
-                        "📋 Session Report",
-                        callback_data="session_report"),
-                     InlineKeyboardButton(
-                        "↩️ Undo Last Step",
-                        callback_data="mcp_undo")],
-                ]))
-        else:
-            # No active pause — go to phase selection
-            engine   = ManualControlEngine(CryptoEngine(), manual_work_dir.get(user.id, WORK_DIR))
-            apk_name = os.path.basename(manual_apk_path.get(user.id, "your.apk"))
-            try:
-                await query.edit_message_text(
-                    f"🎛️ *Manual Control Panel*\n\n"
-                    f"📦 `{apk_name}` loaded\n\n"
-                    f"Select a phase to run:\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━",
-                    parse_mode="Markdown",
-                    reply_markup=engine.build_preset_keyboard())
-            except Exception:
-                await context.bot.send_message(
-                    chat_id=user.id,
-                    text=f"🎛️ *Manual Control Panel*\n\n"
-                         f"📦 `{apk_name}` loaded\n\n"
-                         f"Select a phase to run:\n"
-                         f"━━━━━━━━━━━━━━━━━━━━━",
-                    parse_mode="Markdown",
-                    reply_markup=engine.build_preset_keyboard())
-
-    # ── PHASE 2 — Continue after inspection ──────────────────────────────────
-    elif data == "phase2_continue":
-        if not is_admin(user.id): return
-        if not phase2_paused.get(user.id):
-            await query.answer("⚠️ No paused Phase 2 session.", show_alert=True)
-            return
-
-        work_dir  = manual_work_dir.get(user.id)
-        apk_path  = manual_apk_path.get(user.id)
-        workspace = manual_workspace.get(user.id)
-        aes_key   = manual_aes_key.get(user.id) or AESKeyManager.generate()
-        after_ops = phase2_after_ops.get(user.id, [])
-
-        if not after_ops:
-            await query.answer("⚠️ No remaining operations.", show_alert=True)
-            return
-
-        phase2_paused.pop(user.id, None)
-        phase2_after_ops.pop(user.id, None)
-
-        status_msg = await query.edit_message_text(
-            f"🛡️ *Phase 2 — Continuing...*\n\n"
-            f"⏳ Running {len(after_ops)} remaining operations...",
-            parse_mode="Markdown")
-
-        tools   = ToolInstaller()
-        tools.install_all()
-        scanner = ComplianceScannerEngine()
-        engine  = ManualControlEngine(CryptoEngine(), work_dir)
-
-        job_results   = []
-        current_apk   = apk_path
-        keystore_ctx  = manual_keystore_ctx.get(user.id, {})
-        done_steps    = manual_done_steps.get(user.id, set())
-        start_time    = time.time()
-
-        # Use existing workspace from inspection
-        current_workspace = workspace
-
-        for i, op_key in enumerate(after_ops):
-            label = engine.STEP_LABELS.get(op_key, op_key)
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=update.effective_chat.id,
-                    message_id=status_msg.message_id,
-                    text=f"🛡️ *Phase 2 — Continuing*\n\n"
-                         f"Step {i+1}/{len(after_ops)}: {label}\n"
-                         f"⏳ Processing...",
-                    parse_mode="Markdown")
-            except Exception:
-                pass
-
-            # Pre-update current_apk from rebuild_apk result before
-            # post-rebuild steps run
-            rebuilt_path_check = os.path.join(work_dir, "rebuilt.apk")
-            if os.path.exists(rebuilt_path_check) and op_key in ("integrity_manifest", "keystore_generation", "unique_fingerprint", "zipalign", "sign_apk", "protection_score"):
-                current_apk = rebuilt_path_check
-
-            loop = asyncio.get_event_loop()
-            _op4 = op_key; _apk4 = current_apk; _ws4 = current_workspace
-            _kctx4 = keystore_ctx; _done4 = set(done_steps)
-            result = await loop.run_in_executor(
-                None,
-                lambda: engine.run_operation(
-                    _op4, _apk4, _ws4,
-                    work_dir, aes_key, tools, scanner,
-                    rebuilt_apk_override=_apk4,
-                    keystore_ctx=_kctx4,
-                    completed_ops=_done4))
-
-            if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
-                current_apk = result["rebuilt_apk"]
-            if op_key == "rebuild_apk" and result.get("workspace"):
-                current_workspace = result["workspace"]
-                manual_workspace[user.id] = current_workspace
-
-            if "❌" not in result.get("status", ""):
-                done_steps.add(op_key)
-            job_results.append(result)
-
-        manual_done_steps[user.id]   = done_steps
-        manual_keystore_ctx[user.id] = keystore_ctx
-
-        # Summary
-        applied    = [r["op"] for r in job_results if "❌" not in r.get("status","")]
-        scorer     = ProtectionScoreEngine()
-        score_r    = scorer.calculate(applied)
-        elapsed    = int(time.time() - start_time)
-        mins, secs = elapsed // 60, elapsed % 60
-
-        final_apk = None
-        for r in reversed(job_results):
-            if r.get("final_apk") and os.path.exists(r["final_apk"]):
-                final_apk = r["final_apk"]
-                break
-
-        lines = [
-            "✅ *Phase 2 — Complete*\n",
-            "━━━━━━━━━━━━━━━━━━━━━",
-        ]
-        for r in job_results:
-            icon = "✅" if "❌" not in r.get("status","") else "❌"
-            lines.append(f"{icon} {r.get('label', r.get('op',''))}")
-        lines += [
-            "━━━━━━━━━━━━━━━━━━━━━",
-            f"🕐 Time: `{mins}m {secs}s`",
-            f"📊 Score: *{score_r['score']}/100 — {score_r['grade']}*",
-        ]
-
-        await status_msg.edit_text("\n".join(lines), parse_mode="Markdown")
-
-        if final_apk and os.path.exists(final_apk):
-            with open(final_apk, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=user.id,
-                    document=f,
-                    filename="EPIC_PHASE_2_CODE_PROTECTION.apk",
-                    caption="✅ *Phase 2 — Install & Test*\n\nInstall on your device.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Run Next Phase", callback_data="mcp_show_presets")],
-                        [InlineKeyboardButton("⬅️ Back to Menu",   callback_data="back_admin")],
-                    ]))
-        else:
-            await context.bot.send_message(
-                chat_id=user.id,
-                text="⚠️ No signed APK produced.",
-                reply_markup=back_a())
-
-
-# ── MESSAGE HANDLER ───────────────────────────────────────────────────────────
-async def message_handler(update, context):
-    user = update.effective_user
-    text = update.message.text.strip() if update.message.text else ""
-
-    # ── Admin: custom compliance word ─────────────────────────────────────────
-    if is_admin(user.id) and pending_manual.get(user.id) == "awaiting_custom_word":
-        pending_manual.pop(user.id, None)
-        word = text.lower().strip()
-        if word:
-            lst = compliance_custom_list.get(user.id, [])
-            lst.append(word)
-            compliance_custom_list[user.id] = lst
-            await update.message.reply_text(
-                f"✅ Word `{word}` added to compliance scan list.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬅️ Back", callback_data="back_admin")],
-                ]))
-        return
-
-    # ── Default ───────────────────────────────────────────────────────────────
-    if is_admin(user.id):
-        await update.message.reply_text(
-            "👑 *Admin Panel*\n\nChoose an action:",
-            parse_mode="Markdown", reply_markup=admin_kb())
-
-
-# ── DOCUMENT HANDLER ──────────────────────────────────────────────────────────
-async def document_handler(update, context):
-    user = update.effective_user
-    doc  = update.message.document
-
-    if not doc:
-        return
-
-    # ── Admin: Manual Control Panel APK upload ────────────────────────────────
-    if is_admin(user.id) and pending_manual.get(user.id) == "awaiting_apk":
-        if not doc.file_name.endswith(".apk"):
-            await update.message.reply_text(
-                "❌ Please send a valid .apk file.", reply_markup=back_a())
-            return
-
-        size_mb = doc.file_size / (1024 * 1024)
-        if size_mb > MAX_APK_MB:
-            await update.message.reply_text(
-                f"❌ APK too large ({size_mb:.1f}MB). Max: {MAX_APK_MB}MB",
-                reply_markup=back_a())
-            return
-
-        status_msg = await update.message.reply_text(
-            "📥 *Receiving APK...*\n\n⏳ Please wait...",
-            parse_mode="Markdown")
-
-        try:
-            job_id   = f"manual_{int(time.time())}"
-            work_dir = os.path.join(WORK_DIR, job_id)
-            os.makedirs(work_dir, exist_ok=True)
-
-            tg_file  = await context.bot.get_file(doc.file_id)
-            apk_in   = os.path.join(work_dir, doc.file_name)
-            await tg_file.download_to_drive(apk_in)
-
-            manual_apk_path[user.id]  = apk_in
-            manual_work_dir[user.id]  = work_dir
-            manual_selected[user.id]  = set()
-            manual_aes_key[user.id]   = AESKeyManager.generate()
-            manual_job_start[user.id] = time.time()
-            pending_manual[user.id]   = "apk_ready"
-
-            engine = ManualControlEngine(CryptoEngine(), work_dir)
-
-            await status_msg.edit_text(
-                f"✅ *APK Received*\n\n"
-                f"📁 `{doc.file_name}` ({size_mb:.1f}MB)\n\n"
-                f"Select a phase to run:\n"
-                f"━━━━━━━━━━━━━━━━━━━━━",
-                parse_mode="Markdown",
-                reply_markup=engine.build_preset_keyboard())
-
-        except Exception as e:
-            pending_manual.pop(user.id, None)
-            await status_msg.edit_text(
-                f"❌ *Failed to receive APK:* `{e}`",
-                parse_mode="Markdown", reply_markup=back_a())
-        return
-
-    # ── Admin: Detection Analysis APK upload ─────────────────────────────────
-    # ── Admin: Base APK upload ───────────────────────────────────────────────
-    if is_admin(user.id) and pending_base_apk.get(user.id) == "awaiting_apk":
-        if not doc.file_name.endswith(".apk"):
-            await update.message.reply_text(
-                "❌ Please send a valid .apk file.", reply_markup=base_apk_kb())
-            return
-
-        size_mb = doc.file_size / (1024 * 1024)
-        if size_mb > MAX_APK_MB:
-            await update.message.reply_text(
-                f"❌ APK too large ({size_mb:.1f}MB). Max: {MAX_APK_MB}MB",
-                reply_markup=base_apk_kb())
-            return
-
-        status_msg = await update.message.reply_text(
-            "📦 <b>Saving Base APK...</b>\n\n⏳ Please wait...",
-            parse_mode="HTML")
-
-        try:
-            pending_base_apk.pop(user.id, None)
-
-            # Build new config with Telegram file ID
-            new_config = {
-                "base_apk_file_id":  doc.file_id,
-                "base_apk_filename": doc.file_name,
-                "base_apk_size_mb":  round(size_mb, 2),
-                "base_apk_uploaded": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-
-            # Save locally and commit to GitHub
-            success, msg = BaseApkStorageEngine.save_config(new_config)
-            _refresh_base_apk_config()
-
-            if success:
-                # Download to local cache immediately for this session
-                os.makedirs(BASE_APK_DIR, exist_ok=True)
-                local_path = os.path.join(BASE_APK_DIR, doc.file_name)
-                tg_file = await context.bot.get_file(doc.file_id)
-                await tg_file.download_to_drive(local_path)
-
-                safe_name = doc.file_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                safe_date = new_config['base_apk_uploaded'].replace("&", "&amp;")
-                await status_msg.edit_text(
-                    f"📦 <b>Base APK Saved Successfully!</b>\n\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"📄 Filename:  <code>{safe_name}</code>\n"
-                    f"📏 Size:      <code>{size_mb:.2f} MB</code>\n"
-                    f"📅 Saved:     <code>{safe_date}</code>\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-                    f"✅ Stored permanently in GitHub.\n"
-                    f"Survives every restart and code push.\n"
-                    f"You will never need to upload this again.",
-                    parse_mode="HTML", reply_markup=base_apk_kb())
-            else:
-                safe_msg = str(msg).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                await status_msg.edit_text(
-                    f"❌ <b>Save Failed</b>\n\n<code>{safe_msg}</code>\n\n"
-                    f"Check your GH_PAT secret is correctly set in GitHub Actions secrets.",
-                    parse_mode="HTML", reply_markup=base_apk_kb())
-
-        except Exception as e:
-            pending_base_apk.pop(user.id, None)
-            safe_err = str(e).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            await status_msg.edit_text(
-                f"❌ <b>Base APK Save Failed:</b> <code>{safe_err}</code>",
-                parse_mode="HTML", reply_markup=base_apk_kb())
-        return
-
-    # Protect APK now auto-loads from Base APK — no document upload needed
-
-
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-def main():
-    print("\033[1;36m\nEPIC PROTECTOR — Elite Master Hybrid Engine Starting...\n\033[0m")
-    os.makedirs(WORK_DIR, exist_ok=True)
-
-    print("\033[1;33m[STARTUP] Running system self-check...\033[0m")
-    check_results = _startup_self_check()
-    missing = [k for k, v in check_results.items() if "❌" in v]
-    if missing:
-        print(f"\033[1;31m[STARTUP] WARNING — Missing: {missing}\033[0m")
     else:
         print("\033[1;32m[STARTUP] All tools verified — system ready.\033[0m")
 
