@@ -13,6 +13,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+
+  # ── PUSH NOTIFICATION — runs immediately on every push ─────────────────────
+  notify-push:
+    name: Push Notification
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push'
+    steps:
+      - name: Send Push Notification to Telegram
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID:  ${{ secrets.ADMIN_ID }}
+        run: |
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          MESSAGE="🔔 *EPIC PROTECTOR — New Update*%0A%0A"
+          MESSAGE="${MESSAGE}📦 Repo: \`${{ github.repository }}\`%0A"
+          MESSAGE="${MESSAGE}🌿 Branch: \`${{ github.ref_name }}\`%0A"
+          MESSAGE="${MESSAGE}👤 Author: \`${{ github.actor }}\`%0A"
+          MESSAGE="${MESSAGE}📝 Change: \`${{ github.event.head_commit.message }}\`%0A"
+          MESSAGE="${MESSAGE}🔖 Commit: \`${SHORT_SHA}\`%0A%0A"
+          MESSAGE="${MESSAGE}⚠️ Any previous bot run has been stopped.%0A"
+          MESSAGE="${MESSAGE}⚙️ [Starting fresh — View Run](${RUN_URL})"
+          curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${ADMIN_ID}" \
+            -d parse_mode="Markdown" \
+            -d disable_web_page_preview="true" \
+            -d text="${MESSAGE}"
+          echo "✅ Push notification sent."
+
+  # ── BOT RUNNER ─────────────────────────────────────────────────────────────
   run-bot:
     name: EPIC PROTECTOR — Elite Bot Runner (24-Step)
     runs-on: ubuntu-22.04
@@ -91,16 +122,11 @@ jobs:
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          # Restore master_root/ from repo via API (handled by MasterRootCertEngine)
-          # Also copy from repo root if committed (legacy support)
           MASTER_ROOT_DIR="$GITHUB_WORKSPACE/epic_tools/master_root"
           mkdir -p "$MASTER_ROOT_DIR"
-
-          # If master_root/ exists in repo checkout — copy to epic_tools
           if [ -f "$GITHUB_WORKSPACE/master_root/master_root.jks" ]; then
             cp "$GITHUB_WORKSPACE/master_root/master_root.jks"  "$MASTER_ROOT_DIR/master_root.jks"
             cp "$GITHUB_WORKSPACE/master_root/master_root.json" "$MASTER_ROOT_DIR/master_root.json"
-            # Fix hardcoded path in master_root.json to match current runner path
             sed -i "s|\"keystore_path\": \"[^\"]*\"|\"keystore_path\": \"$MASTER_ROOT_DIR/master_root.jks\"|g" \
               "$MASTER_ROOT_DIR/master_root.json"
             echo "✅ Master root certificate restored — path updated to: $MASTER_ROOT_DIR"
