@@ -11389,6 +11389,182 @@ class PseudoEncryptionEngine:
         return entries_done
 
 
+# ── ZIP HEADER PROTECTION ENGINE ─────────────────────────────────────────────
+class ZIPHeaderProtectionEngine:
+    """
+    ZIP Header Protection — Manifest Entry Compression Field Hardening.
+
+    Patches the compression method field in the ZIP local file header
+    and central directory header of the AndroidManifest.xml entry only.
+
+    Before patch: 08 00  (method 8 — standard Deflate)
+    After  patch: FC 41  (method 16892 — non-standard, unknown to reverse tools)
+
+    Effect:
+      - apktool, jadx, dex2jar and standard ZIP extractors fail to decode
+        the manifest entry — they encounter an unknown compression method
+        and abort or skip the entry.
+      - Android OS installer reads the manifest correctly because it uses
+        its own internal ZIP parser which handles non-standard method fields
+        in the local header without crashing — APK installs and runs normally.
+      - Only AndroidManifest.xml entry is patched — all other entries
+        (classes.dex, resources.arsc, res/, assets/, META-INF/) are
+        left completely untouched — no content is modified anywhere.
+
+    Pipeline position: AFTER pseudo_encryption, BEFORE integrity_manifest.
+    Operates on rebuilt.apk — AFTER rebuild_apk boundary.
+    Must run BEFORE zipalign and sign_apk — signature must cover patched bytes.
+    """
+
+    # Non-standard compression method value — unknown to standard tools
+    # 16892 decimal = 0x41FC = bytes FC 41 (little-endian in ZIP header)
+    PROTECTION_METHOD = 16892
+
+    # Target entry — only this entry is patched
+    TARGET_ENTRY = "AndroidManifest.xml"
+
+    def apply(self, apk_path: str) -> dict:
+        """
+        Patch AndroidManifest.xml ZIP header compression field to
+        non-standard method 16892 in both local and central directory headers.
+        Returns result dict with status.
+        """
+        if not apk_path or not os.path.exists(apk_path):
+            return {
+                "status":         "❌ ZIP header protection failed — APK not found",
+                "headers_patched": 0,
+            }
+
+        try:
+            patched = self._patch_zip_headers(apk_path)
+            if patched > 0:
+                return {
+                    "status": (
+                        f"✅ ZIP header protection applied — "
+                        f"AndroidManifest.xml compression field set to "
+                        f"method 16892 — "
+                        f"{patched} header(s) patched — "
+                        f"reverse tools blocked"
+                    ),
+                    "headers_patched": patched,
+                }
+            else:
+                return {
+                    "status": (
+                        "⚠️ ZIP header protection — "
+                        "AndroidManifest.xml entry not found in APK"
+                    ),
+                    "headers_patched": 0,
+                }
+        except Exception as e:
+            return {
+                "status":          f"❌ ZIP header protection failed — {e}",
+                "headers_patched": 0,
+            }
+
+    def _patch_zip_headers(self, apk_path: str) -> int:
+        """
+        Read APK as raw bytes.
+        Scan for ZIP local file headers (PK\\x03\\x04) and central directory
+        headers (PK\\x01\\x02) that reference AndroidManifest.xml.
+        Patch compression method field (2 bytes, little-endian) to 16892.
+        Write patched bytes back to file in-place.
+        Returns count of headers patched.
+        """
+        target_name    = self.TARGET_ENTRY.encode("utf-8")
+        target_method  = struct.pack("<H", self.PROTECTION_METHOD)
+        patched_count  = 0
+
+        with open(apk_path, "rb") as f:
+            data = bytearray(f.read())
+
+        i = 0
+        while i < len(data) - 4:
+
+            # ── Local File Header — signature PK\x03\x04 ─────────────────────
+            # Structure:
+            #   offset  0: signature        4 bytes  (PK\x03\x04)
+            #   offset  4: version needed   2 bytes
+            #   offset  6: general purpose  2 bytes
+            #   offset  8: compression      2 bytes  ← patch here
+            #   offset 10: mod time         2 bytes
+            #   offset 12: mod date         2 bytes
+            #   offset 14: crc-32           4 bytes
+            #   offset 18: compressed size  4 bytes
+            #   offset 22: uncompressed sz  4 bytes
+            #   offset 26: filename length  2 bytes
+            #   offset 28: extra length     2 bytes
+            #   offset 30: filename         (filename_length bytes)
+            if data[i:i+4] == b"PK\x03\x04":
+                if i + 30 <= len(data):
+                    fname_len  = struct.unpack_from("<H", data, i + 26)[0]
+                    extra_len  = struct.unpack_from("<H", data, i + 28)[0]
+                    fname_end  = i + 30 + fname_len
+                    if fname_end <= len(data):
+                        fname = data[i + 30: fname_end]
+                        if fname == target_name:
+                            # Patch compression method at offset +8
+                            data[i + 8: i + 10] = target_method
+                            patched_count += 1
+                            logger.info(
+                                f"[ZIPHeaderProtection] Local header patched "
+                                f"@ offset {i:#010x} — "
+                                f"AndroidManifest.xml → method 16892"
+                            )
+                i += 1
+                continue
+
+            # ── Central Directory Header — signature PK\x01\x02 ──────────────
+            # Structure:
+            #   offset  0: signature        4 bytes  (PK\x01\x02)
+            #   offset  4: version made     2 bytes
+            #   offset  6: version needed   2 bytes
+            #   offset  8: general purpose  2 bytes
+            #   offset 10: compression      2 bytes  ← patch here
+            #   offset 12: mod time         2 bytes
+            #   offset 14: mod date         2 bytes
+            #   offset 16: crc-32           4 bytes
+            #   offset 20: compressed size  4 bytes
+            #   offset 24: uncompressed sz  4 bytes
+            #   offset 28: filename length  2 bytes
+            #   offset 30: extra length     2 bytes
+            #   offset 32: comment length   2 bytes
+            #   offset 34: disk number      2 bytes
+            #   offset 36: internal attr    2 bytes
+            #   offset 38: external attr    4 bytes
+            #   offset 42: local hdr offset 4 bytes
+            #   offset 46: filename         (filename_length bytes)
+            if data[i:i+4] == b"PK\x01\x02":
+                if i + 46 <= len(data):
+                    fname_len = struct.unpack_from("<H", data, i + 28)[0]
+                    fname_end = i + 46 + fname_len
+                    if fname_end <= len(data):
+                        fname = data[i + 46: fname_end]
+                        if fname == target_name:
+                            # Patch compression method at offset +10
+                            data[i + 10: i + 12] = target_method
+                            patched_count += 1
+                            logger.info(
+                                f"[ZIPHeaderProtection] Central directory patched "
+                                f"@ offset {i:#010x} — "
+                                f"AndroidManifest.xml → method 16892"
+                            )
+                i += 1
+                continue
+
+            i += 1
+
+        if patched_count > 0:
+            with open(apk_path, "wb") as f:
+                f.write(data)
+            logger.info(
+                f"[ZIPHeaderProtection] Complete — "
+                f"{patched_count} header(s) patched in {apk_path}"
+            )
+
+        return patched_count
+
+
 # ── APK SIZE OPTIMIZER ────────────────────────────────────────────────────────
 class APKSizeOptimizer:
     """
@@ -11506,6 +11682,7 @@ class ProtectionScoreEngine:
         "undo_last_child":            0,   # meta — no weight
         "install_source_attribution": 9,   # GPP distribution signal — high impact
         "signing_lineage":            10,  # V3 lineage chain — master root trust
+        "zip_header_protection":      8,   # manifest ZIP header hardening — tool blocking
     }
 
     GRADE_TABLE = [
@@ -11574,6 +11751,7 @@ class ManualControlEngine:
         "zipalign":                   ["rebuild_apk"],
         "protection_score":           ["sign_apk", "signing_lineage"],
         "install_source_attribution": ["decode_workspace"],
+        "zip_header_protection":      ["rebuild_apk", "pseudo_encryption"],
     }
 
     # Smart suggestions — what to run next after each step
@@ -11598,7 +11776,8 @@ class ManualControlEngine:
         "apk_size_optimizer":         "aes_key_management",
         "aes_key_management":         "rebuild_apk",
         "rebuild_apk":                "pseudo_encryption",
-        "pseudo_encryption":          "integrity_manifest",
+        "pseudo_encryption":          "zip_header_protection",
+        "zip_header_protection":      "integrity_manifest",
         "integrity_manifest":         "certificate_aging",
         "certificate_aging":          "unique_fingerprint",
         "keystore_generation":        "unique_fingerprint",
@@ -11636,7 +11815,8 @@ class ManualControlEngine:
         # ── Phase 4: Build ────────────────────────────────────────────────────
         "rebuild_apk",             # 20. rebuild — all changes baked in
         "pseudo_encryption",       # 21. normalise ZIP timestamps + clear flags
-        "integrity_manifest",      # 22. hash final APK state — correct hashes
+        "zip_header_protection",   # 22. patch manifest ZIP header → method 16892
+        "integrity_manifest",      # 23. hash final APK state — correct hashes
         # ── Phase 5: Sign with Coherent Identity + GPP Lineage ───────────────
         # Path A — GPP optimised: certificate_aging → unique_fingerprint → signing_lineage
         # Path B — Standard:      keystore_generation → unique_fingerprint → zipalign → sign_apk
@@ -11682,6 +11862,7 @@ class ManualControlEngine:
         "undo_last_child":            "↩️ Undo Last Child",
         "install_source_attribution": "📡 Install Source Attribution",
         "signing_lineage":            "🔗 V3 Signing Lineage",
+        "zip_header_protection":      "🛡️ ZIP Header Protection",
     }
 
     # ── PRESET PROFILES ───────────────────────────────────────────────────────
@@ -11721,7 +11902,8 @@ class ManualControlEngine:
             "aes_key_management",            # 19. AES key display
             "rebuild_apk",                   # 20. rebuild — all changes baked in
             "pseudo_encryption",             # 21. normalise ZIP timestamps
-            "integrity_manifest",            # 22. hash final APK state
+            "zip_header_protection",         # 22. patch manifest ZIP header → method 16892
+            "integrity_manifest",            # 23. hash final APK state
             "certificate_aging",             # 23. aged certificate — GPP trust
             "unique_fingerprint",            # 24. confirm identity
             "signing_lineage",               # 25. V3 master root lineage
@@ -11854,6 +12036,7 @@ class ManualControlEngine:
             "aes_key_management",
             "rebuild_apk",
             "pseudo_encryption",
+            "zip_header_protection",       # manifest ZIP header → method 16892
             "integrity_manifest",
             "certificate_aging",           # aged certificate for Play Protect
             "unique_fingerprint",
@@ -11883,6 +12066,7 @@ class ManualControlEngine:
             "aes_key_management",
             "rebuild_apk",
             "pseudo_encryption",
+            "zip_header_protection",       # manifest ZIP header → method 16892
             "integrity_manifest",
             "certificate_aging",
             "unique_fingerprint",
@@ -12857,6 +13041,26 @@ class ManualControlEngine:
                 result["zip_entries"] = pe_result.get("zip_entries", 0)
                 result["dex_patched"] = pe_result.get("dex_patched", 0)
                 result["status"]      = pe_result.get("status", "❌ Pseudo Encryption failed")
+
+            elif op_key == "zip_header_protection":
+                # Operates on rebuilt.apk — AFTER pseudo_encryption
+                # BEFORE integrity_manifest, zipalign, sign_apk
+                # Patches ONLY AndroidManifest.xml ZIP entry header
+                # Sets compression method field to 16892 (FC 41)
+                # All other entries left completely untouched
+                zhp_apk = os.path.join(work_dir, "rebuilt.apk")
+                if not os.path.exists(zhp_apk):
+                    for found in list(Path(work_dir).rglob("rebuilt.apk")):
+                        zhp_apk = str(found)
+                        break
+                if not os.path.exists(zhp_apk) and rebuilt_apk_override:
+                    zhp_apk = rebuilt_apk_override
+                zhp_engine = ZIPHeaderProtectionEngine()
+                zhp_result = zhp_engine.apply(zhp_apk)
+                result["headers_patched"] = zhp_result.get("headers_patched", 0)
+                result["status"]          = zhp_result.get(
+                    "status", "❌ ZIP header protection failed"
+                )
 
             elif op_key == "integrity_manifest":
                 guardian = IntegrityGuardian(work_dir)
