@@ -32,7 +32,6 @@ ELITE APPROVED SAFE KEYWORDS — ALWAYS USE THESE:
   verification→ checking and validation
   integrity   → file and code checking
   validation  → input and environment checks
-  hardening   → manifest and code strengthening
   marker      → identification fields
   shield      → protection layer names
   authentication → identity verification
@@ -516,308 +515,6 @@ class AXMLManifestPatcher:
         return bytes(final), to_add
 
 
-class Level2_ManifestProtector:
-    """Harden AndroidManifest.xml in the workspace directory BEFORE rebuild."""
-
-    def __init__(self, work_dir):
-        self.work_dir = work_dir
-
-    def protect(self, workspace_dir) -> dict:
-        mp = os.path.join(workspace_dir, "AndroidManifest.xml")
-        changes = {}
-        if not os.path.exists(mp):
-            return changes
-        with open(mp, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-
-        # ── FIX: Patch wrong values AND add flags when completely absent ───────
-        # debuggable — fix if true, add if absent
-        if 'android:debuggable="true"' in content:
-            content = content.replace('android:debuggable="true"', 'android:debuggable="false"')
-            changes["Security debug flag hardened"] = True
-        elif 'android:debuggable' not in content and '<application' in content:
-            content = re.sub(r'(<application\b)', r'\1 android:debuggable="false"', content, count=1)
-            changes["Security debug flag enforced"] = True
-
-        # allowBackup — fix if true, add if absent
-        if 'android:allowBackup="true"' in content:
-            content = content.replace('android:allowBackup="true"', 'android:allowBackup="false"')
-            changes["Backup disabled"] = True
-        elif 'android:allowBackup' not in content and '<application' in content:
-            content = re.sub(r'(<application\b)', r'\1 android:allowBackup="false"', content, count=1)
-            changes["Backup enforcement added"] = True
-
-        # usesCleartextTraffic — fix if true, add if absent
-        if 'android:usesCleartextTraffic="true"' in content:
-            content = content.replace('android:usesCleartextTraffic="true"', 'android:usesCleartextTraffic="false"')
-            changes["Cleartext blocked"] = True
-        elif 'android:usesCleartextTraffic' not in content and '<application' in content:
-            content = re.sub(r'(<application\b)', r'\1 android:usesCleartextTraffic="false"', content, count=1)
-            changes["Cleartext traffic blocked"] = True
-
-        # ── NEW: extractNativeLibs — prevent native lib extraction to disk ─────
-        if 'android:extractNativeLibs="true"' in content:
-            content = content.replace('android:extractNativeLibs="true"', 'android:extractNativeLibs="false"')
-            changes["Native lib extraction blocked"] = True
-        elif 'android:extractNativeLibs' not in content and '<application' in content:
-            content = re.sub(r'(<application\b)', r'\1 android:extractNativeLibs="false"', content, count=1)
-            changes["Native lib extraction prevention added"] = True
-
-        # ── NEW: testOnly — ensure explicitly false ───────────────────────────
-        if 'android:testOnly="true"' in content:
-            content = content.replace('android:testOnly="true"', 'android:testOnly="false"')
-            changes["Test-only mode disabled"] = True
-        elif 'android:testOnly' not in content and '<application' in content:
-            content = re.sub(r'(<application\b)', r'\1 android:testOnly="false"', content, count=1)
-            changes["Test-only flag enforced"] = True
-
-        # ── NEW: taskAffinity — clear to prevent task hijacking ───────────────
-        if 'android:taskAffinity' not in content and '<application' in content:
-            content = re.sub(r'(<application\b)', r'\1 android:taskAffinity=""', content, count=1)
-            changes["Task affinity cleared — task hijacking blocked"] = True
-
-        # ── NEW: allowTaskReparenting — prevent UI spoofing ──────────────────
-        if 'android:allowTaskReparenting="true"' in content:
-            content = content.replace('android:allowTaskReparenting="true"', 'android:allowTaskReparenting="false"')
-            changes["Task reparenting disabled"] = True
-        elif 'android:allowTaskReparenting' not in content and '<application' in content:
-            content = re.sub(r'(<application\b)', r'\1 android:allowTaskReparenting="false"', content, count=1)
-            changes["Task reparenting prevention added"] = True
-
-        # ── NEW: exported=false on all non-entry-point components ────────────
-        # Entry point tags (must stay exported or have their own value)
-        _entry_tags = {'activity', 'service', 'receiver', 'provider'}
-        _intent_filter_pattern = re.compile(
-            r'(<(?:activity|service|receiver|provider)\b[^>]*?>.*?</(?:activity|service|receiver|provider)>)',
-            re.DOTALL
-        )
-        _exported_added = 0
-        def _add_exported_false(m):
-            nonlocal _exported_added
-            block = m.group(1)
-            # If it has an intent-filter it must be exported (entry point) — skip
-            if '<intent-filter' in block:
-                return block
-            # If exported already set — skip
-            if 'android:exported' in block:
-                return block
-            # Add exported=false to the opening tag
-            fixed = re.sub(r'(<(?:activity|service|receiver|provider)\b)', r'\1 android:exported="false"', block, count=1)
-            _exported_added += 1
-            return fixed
-        content = _intent_filter_pattern.sub(_add_exported_false, content)
-        if _exported_added:
-            changes[f"exported=false added to {_exported_added} non-entry-point components"] = True
-
-        # ── Hardware acceleration ─────────────────────────────────────────────
-        if 'android:hardwareAccelerated' not in content and '<application' in content:
-            content = re.sub(r'(<application\b)', r'\1 android:hardwareAccelerated="true"', content, count=1)
-
-        # ── FLAG_SECURE meta-data marker ──────────────────────────────────────
-        # Runtime enforcement is handled by SecurityGuard smali (Step 11)
-        flag_secure_meta = '\n        <meta-data android:name="android.app.ui.security_mode" android:value="1"/>'
-        if 'android.app.ui.security_mode' not in content and '</application>' in content:
-            content = content.replace('</application>', flag_secure_meta + '\n    </application>')
-            changes["Anti-screen-capture flag configured"] = True
-
-        # ── NEW: FLAG_SECURE smali enforcement — inject into all Activity classes
-        # Walk workspace smali — add WindowManager FLAG_SECURE call to all
-        # Activity subclasses that have an onCreate method
-        _flag_secure_injected = 0
-        _smali_roots = [d for d in Path(workspace_dir).iterdir()
-                        if d.is_dir() and d.name.startswith('smali')]
-        for _sroot in _smali_roots:
-            for _sf in _sroot.rglob('*.smali'):
-                try:
-                    _sc = _sf.read_text(encoding='utf-8', errors='ignore')
-                    # Only Activity subclasses
-                    if 'Landroid/app/Activity;' not in _sc and \
-                       'Landroid/support/v7/app/AppCompatActivity;' not in _sc and \
-                       'Landroidx/appcompat/app/AppCompatActivity;' not in _sc:
-                        continue
-                    # Only if has onCreate
-                    if '.method public onCreate(Landroid/os/Bundle;)V' not in _sc:
-                        continue
-                    # Skip if already injected
-                    if 'FLAG_SECURE' in _sc or 'flag_secure' in _sc.lower():
-                        continue
-                    # Inject after super.onCreate call
-                    _inject = (
-                        '\n    # FLAG_SECURE — prevent screen capture and recording\n'
-                        '    invoke-virtual {p0}, Landroid/app/Activity;->getWindow()Landroid/view/Window;\n'
-                        '    move-result-object v0\n'
-                        '    const/high16 v1, 0x2000\n'
-                        '    invoke-virtual {v0, v1}, Landroid/view/Window;->addFlags(I)V\n'
-                    )
-                    # Insert after super.onCreate line
-                    _sc2 = re.sub(
-                        r'(invoke-super \{p0, p1\}, L[^;]+;->onCreate\(Landroid/os/Bundle;\)V\n)',
-                        r'\1' + _inject,
-                        _sc, count=1
-                    )
-                    if _sc2 != _sc:
-                        _sf.write_text(_sc2, encoding='utf-8')
-                        _flag_secure_injected += 1
-                except Exception:
-                    pass
-        if _flag_secure_injected:
-            changes[f"FLAG_SECURE enforced in {_flag_secure_injected} Activity classes"] = True
-
-        # ── Network security config ───────────────────────────────────────────
-        res_xml_dir = os.path.join(workspace_dir, "res", "xml")
-        os.makedirs(res_xml_dir, exist_ok=True)
-        nsc_path = os.path.join(res_xml_dir, "network_security_config.xml")
-        nsc_content = """<?xml version="1.0" encoding="utf-8"?>
-<network-security-config>
-    <base-config cleartextTrafficPermitted="false">
-        <trust-anchors>
-            <certificates src="system"/>
-        </trust-anchors>
-    </base-config>
-    <debug-overrides>
-        <trust-anchors>
-            <certificates src="system"/>
-        </trust-anchors>
-    </debug-overrides>
-</network-security-config>
-"""
-        with open(nsc_path, 'w', encoding='utf-8') as f:
-            f.write(nsc_content)
-
-        if 'networkSecurityConfig' not in content and '<application' in content:
-            content = re.sub(
-                r'(<application\b)',
-                r'\1 android:networkSecurityConfig="@xml/network_security_config"',
-                content, count=1
-            )
-            changes["Network security config generated and linked"] = True
-
-        # ── SSL Pinning marker ────────────────────────────────────────────────
-        ssl_pin_meta = '\n        <meta-data android:name="android.net.conn.tls_policy" android:value="strict"/>'
-        if 'android.net.conn.tls_policy' not in content and '</application>' in content:
-            content = content.replace('</application>', ssl_pin_meta + '\n    </application>')
-            changes["SSL Pinning enforcement marker added"] = True
-
-        # ── Build policy metadata ─────────────────────────────────────────────
-        meta = '\n        <meta-data android:name="android.app.build_policy" android:value="release"/>'
-        if 'android.app.build_policy' not in content and '</application>' in content:
-            content = content.replace('</application>', meta + '\n    </application>')
-            changes["Security metadata added"] = True
-
-        # ── Installation Authority Permission Group ───────────────────────────
-        if '<application' in content:
-            perms_to_add = []
-
-            if 'REQUEST_INSTALL_PACKAGES' not in content:
-                perms_to_add.append(
-                    '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>'
-                )
-                changes["Installation request permission configured"] = True
-
-            if 'INSTALL_PACKAGES' not in content:
-                perms_to_add.append(
-                    '    <uses-permission android:name="android.permission.INSTALL_PACKAGES"\n'
-                    '        android:protectionLevel="signature"/>'
-                )
-                changes["Installation authority permission configured"] = True
-
-            if 'OVERRIDE_PACKAGE_VERIFICATION' not in content:
-                perms_to_add.append(
-                    '    <uses-permission android:name="android.permission.OVERRIDE_PACKAGE_VERIFICATION"\n'
-                    '        android:protectionLevel="signature"/>'
-                )
-                changes["Verification override permission configured"] = True
-
-            if 'QUERY_ALL_PACKAGES' not in content:
-                perms_to_add.append(
-                    '    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>'
-                )
-                changes["Package query permission configured"] = True
-
-            if 'REQUEST_DELETE_PACKAGES' not in content:
-                perms_to_add.append(
-                    '    <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES"/>'
-                )
-                changes["Package removal permission configured"] = True
-
-            if perms_to_add:
-                perm_block = (
-                    '\n'
-                    + '\n'.join(perms_to_add)
-                    + '\n'
-                )
-                content = content.replace(
-                    '<application',
-                    perm_block + '\n    <application',
-                    1
-                )
-
-        with open(mp, 'w', encoding='utf-8') as f:
-            f.write(content)
-
-        # ── Install Source Attribution — GPP false warning prevention ─────────
-        # Applied here so all attribution flags are baked in before rebuild_apk
-        # InstallSourceAttributionEngine is defined later in this file —
-        # called via deferred instantiation to avoid forward-reference issues
-        try:
-            _isa = InstallSourceAttributionEngine()
-            _isa_result = _isa.apply(workspace_dir)
-            for _ch in _isa_result.get("changes", []):
-                changes[_ch] = True
-        except NameError:
-            pass  # Engine not yet defined at import time — safe to skip here
-
-        # ── AXML Binary Patcher — direct binary injection fallback ────────
-        # The workspace XML edits above are used by apktool when it can rebuild.
-        # For APKs where apktool fails (anti-tool tricks, non-standard res IDs),
-        # we ALSO patch the binary AXML directly in the work_dir APKs so the
-        # permissions survive even when _inject_workspace_manifest() is called.
-        # This runs on whatever stripped APK exists in work_dir right now.
-        try:
-            _axml_perms = [
-                "REQUEST_INSTALL_PACKAGES",
-                "INSTALL_PACKAGES",
-                "OVERRIDE_PACKAGE_VERIFICATION",
-                "QUERY_ALL_PACKAGES",
-            ]
-            # Find the candidate APK to patch binary manifest on
-            _apk_candidates = []
-            for _cand in ["input_stripped.apk", "base_stripped.apk", "base.apk"]:
-                _cp = os.path.join(self.work_dir, _cand)
-                if os.path.exists(_cp):
-                    _apk_candidates.append(_cp)
-            for _apk_path in _apk_candidates:
-                try:
-                    import zipfile as _zf, io as _io, tempfile as _tf, shutil as _sh
-                    with _zf.ZipFile(_apk_path, 'r') as _zin:
-                        _mf_raw = _zin.read("AndroidManifest.xml")
-                    _patched_mf, _added = AXMLManifestPatcher.patch(_mf_raw, _axml_perms)
-                    if _added:
-                        # Rewrite APK with patched manifest
-                        _tmp = _apk_path + ".axml_patched"
-                        with _zf.ZipFile(_apk_path, 'r') as _zin:
-                            with _zf.ZipFile(_tmp, 'w') as _zout:
-                                for _item in _zin.infolist():
-                                    if _item.filename == "AndroidManifest.xml":
-                                        _info = _zf.ZipInfo("AndroidManifest.xml")
-                                        _info.compress_type = _item.compress_type
-                                        _zout.writestr(_info, _patched_mf)
-                                    else:
-                                        _zout.writestr(_item, _zin.read(_item.filename))
-                        _sh.move(_tmp, _apk_path)
-                        for _a in _added:
-                            changes[f"Binary AXML: {_a.split('.')[-1]}"] = True
-                        logger.info(f"[Level2] AXML binary patched: {len(_added)} perms → {_apk_path}")
-                    break  # only patch the first found candidate
-                except Exception as _axml_err:
-                    logger.warning(f"[Level2] AXML binary patch failed on {_apk_path}: {_axml_err}")
-        except Exception as _outer:
-            logger.warning(f"[Level2] AXML outer error: {_outer}")
-
-        return changes
-
-
-# ── LEVEL 3 — SECURITY GUARD INTEGRATION (on workspace dir) ─────────────────────
 class Level3_SecurityGuardIntegrator:
     """Integrate EpicSecurityGuard into application security layer."""
 
@@ -11429,7 +11126,6 @@ class ProtectionScoreEngine:
         "strip_signature":       4,
         "decode_workspace":      3,
         "compliance_scan":       5,
-        "manifest_hardening":    8,
         "proguard_hardening":    6,
         "safe_rename":           7,
         "obfuscation":           10,
@@ -11500,7 +11196,6 @@ class ManualControlEngine:
     # Steps that require another step to have run first
     STEP_DEPENDENCIES = {
         "compliance_scan":            ["decode_workspace"],
-        "manifest_hardening":         ["decode_workspace"],
         "proguard_hardening":         ["decode_workspace"],
         "safe_rename":                ["decode_workspace", "obfuscation"],
         "obfuscation":                ["decode_workspace"],
@@ -11531,8 +11226,6 @@ class ManualControlEngine:
         "preflight_validation":       "strip_signature",
         "strip_signature":            "decode_workspace",
         "decode_workspace":           "compliance_scan",
-        "compliance_scan":            "manifest_hardening",
-        "manifest_hardening":         "install_source_attribution",
         "install_source_attribution": "proguard_hardening",
         "proguard_hardening":         "obfuscation",
         "obfuscation":                "safe_rename",
@@ -11567,7 +11260,6 @@ class ManualControlEngine:
         "decode_workspace",        # 3.  decode APK to workspace
         "compliance_scan",         # 4.  scan for red flags before touching
         # ── Phase 2: Code Protection (all smali changes before rebuild) ───────
-        "manifest_hardening",      # 5.  harden manifest flags
         "install_source_attribution", # 6. GPP attribution flags in manifest
         "proguard_hardening",      # 7.  add proguard rules
         "obfuscation",             # 8.  obfuscate — all smali changes here
@@ -11606,7 +11298,6 @@ class ManualControlEngine:
         "strip_signature":      "🧹 Strip Signature",
         "decode_workspace":     "📂 Decode → Workspace",
         "compliance_scan":      "🔍 Compliance Scan",
-        "manifest_hardening":   "🔒 Manifest Hardening",
         "proguard_hardening":   "📋 ProGuard Hardening",
         "safe_rename":          "✏️ Safe Rename",
         "obfuscation":          "🔀 Obfuscation",
@@ -12160,7 +11851,7 @@ class ManualControlEngine:
         # Track whether this step modifies smali — used by rebuild bypass logic
         SMALI_MODIFYING_STEPS = {
             "obfuscation", "safe_rename", "encryption", "security_guard",
-            "tamper_detection", "dex_repackaging", "manifest_hardening",
+            "tamper_detection", "dex_repackaging",
             "proguard_hardening", "native_methods_obfuscation",
             "dex_sourcefile_strip", "resource_normalisation",
             "install_source_attribution",
@@ -12170,7 +11861,7 @@ class ManualControlEngine:
 
         # Steps that require a decoded workspace — fail cleanly if not present
         NEEDS_WORKSPACE = {
-            "compliance_scan", "manifest_hardening", "proguard_hardening",
+            "compliance_scan", "proguard_hardening",
             "safe_rename", "obfuscation", "security_guard", "tamper_detection",
             "encryption", "dex_repackaging", "metadata_stripping",
             "apk_size_optimizer", "rebuild_apk", "string_splitting",
@@ -12210,7 +11901,7 @@ class ManualControlEngine:
                     for ci in crit_issues:
                         code    = ci.get("code", "")
                         msg     = ci.get("message", "")
-                        fixable = " — auto-fixable by manifest_hardening" \
+                        fixable = "" \
                                   if ci.get("fixable") else ""
                         detail_lines.append(f"🔴 {code}: {msg}{fixable}")
                     detail = " | ".join(detail_lines) if detail_lines else \
@@ -12243,12 +11934,6 @@ class ManualControlEngine:
                 total    = len(findings) if isinstance(findings, list) else 0
                 result["findings"] = total
                 result["status"]   = f"✅ Scan complete — {total} findings"
-
-            elif op_key == "manifest_hardening":
-                l2 = Level2_ManifestProtector(work_dir)
-                changes = l2.protect(workspace)
-                result["changes"] = len(changes)
-                result["status"]  = f"✅ {len(changes)} manifest hardening changes"
 
             elif op_key == "proguard_hardening":
                 hardener = ProGuardHardener()
@@ -12501,7 +12186,7 @@ class ManualControlEngine:
                 SMALI_MODIFYING_OPS = {
                     "obfuscation", "safe_rename", "encryption",
                     "security_guard", "tamper_detection", "dex_repackaging",
-                    "manifest_hardening", "proguard_hardening",
+                    "proguard_hardening",
                     "native_methods_obfuscation", "dex_sourcefile_strip",
                 }
                 # Use completed_ops passed from caller — accurate per-session
@@ -13005,7 +12690,7 @@ class ComplianceScannerEngine:
     preview, compliance score, and rename consistency enforcement.
 
     Integrated into the protection pipeline — runs after Level 1 decode,
-    before Level 2 manifest hardening. No protection proceeds until admin
+    before code protection steps. No protection proceeds until admin
     reviews and approves all findings.
 
     Scan targets:
@@ -17195,7 +16880,7 @@ async def button_handler(update, context):
         # ── Steps that operate on workspace (before rebuild) ──────────────────
         WORKSPACE_STEPS = {
             "preflight_validation", "strip_signature", "decode_workspace",
-            "compliance_scan", "manifest_hardening", "install_source_attribution",
+            "compliance_scan", "install_source_attribution",
             "proguard_hardening", "obfuscation", "safe_rename", "encryption",
             "security_guard", "tamper_detection", "dex_repackaging",
             "native_methods_obfuscation", "dex_sourcefile_strip",
