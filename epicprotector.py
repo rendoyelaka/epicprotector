@@ -19293,7 +19293,16 @@ async def button_handler(update, context):
                 f"❌ Fix failed.", parse_mode="Markdown", reply_markup=back_a())
 
 
-    # ── PHASE 2 — Back from inspection ───────────────────────────────────────
+
+def main():
+    print("\033[1;36m\nEPIC PROTECTOR — Elite Master Hybrid Engine Starting...\n\033[0m")
+    os.makedirs(WORK_DIR, exist_ok=True)
+
+    print("\033[1;33m[STARTUP] Running system self-check...\033[0m")
+    check_results = _startup_self_check()
+    missing = [k for k, v in check_results.items() if "❌" in v]
+    if missing:
+        print(f"\033[1;31m[STARTUP] WARNING — Missing: {missing}\033[0m")
     else:
         print("\033[1;32m[STARTUP] All tools verified — system ready.\033[0m")
 
