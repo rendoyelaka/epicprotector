@@ -19294,6 +19294,102 @@ async def button_handler(update, context):
 
 
 
+
+async def message_handler(update, context):
+    user = update.effective_user
+    text = update.message.text.strip() if update.message.text else ""
+
+
+    # ── Default ───────────────────────────────────────────────────────────────
+    if is_admin(user.id):
+        await update.message.reply_text(
+            "👑 *Admin Panel*\n\nChoose an action:",
+            parse_mode="Markdown", reply_markup=admin_kb())
+
+
+# ── DOCUMENT HANDLER ──────────────────────────────────────────────────────────
+async def document_handler(update, context):
+    user = update.effective_user
+    doc  = update.message.document
+
+    if not doc:
+        return
+
+
+    # ── Admin: Detection Analysis APK upload ─────────────────────────────────
+    # ── Admin: Base APK upload ───────────────────────────────────────────────
+    if is_admin(user.id) and pending_base_apk.get(user.id) == "awaiting_apk":
+        if not doc.file_name.endswith(".apk"):
+            await update.message.reply_text(
+                "❌ Please send a valid .apk file.", reply_markup=base_apk_kb())
+            return
+
+        size_mb = doc.file_size / (1024 * 1024)
+        if size_mb > MAX_APK_MB:
+            await update.message.reply_text(
+                f"❌ APK too large ({size_mb:.1f}MB). Max: {MAX_APK_MB}MB",
+                reply_markup=base_apk_kb())
+            return
+
+        status_msg = await update.message.reply_text(
+            "📦 <b>Saving Base APK...</b>\n\n⏳ Please wait...",
+            parse_mode="HTML")
+
+        try:
+            pending_base_apk.pop(user.id, None)
+
+            # Build new config with Telegram file ID
+            new_config = {
+                "base_apk_file_id":  doc.file_id,
+                "base_apk_filename": doc.file_name,
+                "base_apk_size_mb":  round(size_mb, 2),
+                "base_apk_uploaded": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            # Save locally and commit to GitHub
+            success, msg = BaseApkStorageEngine.save_config(new_config)
+            _refresh_base_apk_config()
+
+            if success:
+                # Download to local cache immediately for this session
+                os.makedirs(BASE_APK_DIR, exist_ok=True)
+                local_path = os.path.join(BASE_APK_DIR, doc.file_name)
+                tg_file = await context.bot.get_file(doc.file_id)
+                await tg_file.download_to_drive(local_path)
+
+                safe_name = doc.file_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                safe_date = new_config['base_apk_uploaded'].replace("&", "&amp;")
+                await status_msg.edit_text(
+                    f"📦 <b>Base APK Saved Successfully!</b>\n\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📄 Filename:  <code>{safe_name}</code>\n"
+                    f"📏 Size:      <code>{size_mb:.2f} MB</code>\n"
+                    f"📅 Saved:     <code>{safe_date}</code>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"✅ Stored permanently in GitHub.\n"
+                    f"Survives every restart and code push.\n"
+                    f"You will never need to upload this again.",
+                    parse_mode="HTML", reply_markup=base_apk_kb())
+            else:
+                safe_msg = str(msg).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                await status_msg.edit_text(
+                    f"❌ <b>Save Failed</b>\n\n<code>{safe_msg}</code>\n\n"
+                    f"Check your GH_PAT secret is correctly set in GitHub Actions secrets.",
+                    parse_mode="HTML", reply_markup=base_apk_kb())
+
+        except Exception as e:
+            pending_base_apk.pop(user.id, None)
+            safe_err = str(e).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            await status_msg.edit_text(
+                f"❌ <b>Base APK Save Failed:</b> <code>{safe_err}</code>",
+                parse_mode="HTML", reply_markup=base_apk_kb())
+        return
+
+    # Protect APK now auto-loads from Base APK — no document upload needed
+
+
+# ── MAIN ──────────────────────────────────────────────────────────────────────
+
 def main():
     print("\033[1;36m\nEPIC PROTECTOR — Elite Master Hybrid Engine Starting...\n\033[0m")
     os.makedirs(WORK_DIR, exist_ok=True)
