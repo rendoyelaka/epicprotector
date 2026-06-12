@@ -8249,9 +8249,27 @@ class Level6_Signer:
         """
         # ── Step 0 — Strip existing signature + normalise compression ────────
         stripper     = SignatureStripper()
-        strip_report = stripper.detect(inp)
 
-        # Always normalise — strip() also fixes classes.dex compression to STORED
+        # Validate inp is a real ZIP before calling strip()
+        if not inp or not os.path.exists(inp):
+            raise RuntimeError(
+                f"Sign APK: input file not found: {inp}"
+            )
+        try:
+            with zipfile.ZipFile(inp, 'r') as _zv:
+                _zv.namelist()
+        except zipfile.BadZipFile as _bze:
+            raise RuntimeError(
+                f"Signature strip failed: Bad magic number for file header — "
+                f"APK file is not a valid ZIP: {inp} — "
+                f"ensure rebuild_apk completed successfully before sign_apk"
+            )
+        except Exception as _zve:
+            raise RuntimeError(
+                f"Signature strip failed: {_zve} — APK: {inp}"
+            )
+
+        # Always normalise — strip() fixes classes.dex compression to STORED
         # which apksigner requires. Must run even when no signatures found because
         # apktool rebuild produces classes.dex as DEFLATED — apksigner rejects this.
         stripped_apk = inp.replace(".apk", "_stripped.apk")
@@ -12307,32 +12325,38 @@ class ManualControlEngine:
 
             elif op_key == "sign_apk":
                 l6 = Level6_Signer(work_dir)
-                # Determine which APK to sign.
-                # Priority 1: rebuilt.apk produced by rebuild_apk step this job.
-                # Priority 2: any .apk in work_dir that is not a stripped intermediate.
-                # Priority 3: the override APK passed from pipeline runner (base APK).
-                # This allows Sign APK to work even when Rebuild APK was not selected.
                 apk_to_sign = None
 
-                # Priority 1 — rebuilt.apk in work_dir (direct path)
-                direct_rebuilt = os.path.join(work_dir, "rebuilt.apk")
-                if os.path.exists(direct_rebuilt):
-                    apk_to_sign = direct_rebuilt
+                # Priority 1 — aligned.apk produced by zipalign step
+                direct_aligned = os.path.join(work_dir, "aligned.apk")
+                if os.path.exists(direct_aligned):
+                    apk_to_sign = direct_aligned
 
-                # Priority 1b — search recursively for rebuilt.apk
+                # Priority 2 — rebuilt.apk in work_dir
+                if not apk_to_sign:
+                    direct_rebuilt = os.path.join(work_dir, "rebuilt.apk")
+                    if os.path.exists(direct_rebuilt):
+                        apk_to_sign = direct_rebuilt
+
+                # Priority 3 — search recursively for aligned.apk
+                if not apk_to_sign:
+                    for found in list(Path(work_dir).rglob("aligned.apk")):
+                        apk_to_sign = str(found)
+                        break
+
+                # Priority 4 — search recursively for rebuilt.apk
                 if not apk_to_sign:
                     for found in list(Path(work_dir).rglob("rebuilt.apk")):
                         apk_to_sign = str(found)
                         break
 
-                # Priority 2 — override APK from pipeline runner
-                # This is current_apk which may be base APK or stripped APK
+                # Priority 5 — override APK from pipeline runner
                 if not apk_to_sign:
                     candidate = rebuilt_apk_override
                     if candidate and os.path.exists(candidate):
                         apk_to_sign = candidate
 
-                # Priority 3 — apk_path directly (original input)
+                # Priority 6 — apk_path directly
                 if not apk_to_sign:
                     if apk_path and os.path.exists(apk_path):
                         apk_to_sign = apk_path
@@ -16528,6 +16552,8 @@ async def button_handler(update, context):
                         current_apk = stripped
                 if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
                     current_apk = result["rebuilt_apk"]
+                if op_key == "zipalign" and result.get("aligned_apk"):
+                    current_apk = result["aligned_apk"]
                 if op_key == "sign_apk" and result.get("final_apk"):
                     current_apk = result["final_apk"]
 
@@ -16856,6 +16882,9 @@ async def button_handler(update, context):
             if op_key == "rebuild_apk" and result.get("rebuilt_apk"):
                 sbs_current_apk[user.id] = result["rebuilt_apk"]
                 current_apk = result["rebuilt_apk"]
+            if op_key == "zipalign" and result.get("aligned_apk"):
+                sbs_current_apk[user.id] = result["aligned_apk"]
+                current_apk = result["aligned_apk"]
             if op_key == "signing_lineage" and result.get("output_apk"):
                 sbs_current_apk[user.id] = result["output_apk"]
                 current_apk = result["output_apk"]
