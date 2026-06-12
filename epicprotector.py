@@ -9201,18 +9201,24 @@ class ManifestComponentRenamerEngine:
         # ── Step 3: Rename smali files on disk ───────────────────────────
         files_renamed = 0
         for old_name, new_name in rename_map.items():
-            old_rel = self._to_smali_path(old_name)
-            new_rel = self._to_smali_path(new_name)
+            old_rel = self._to_smali_path(old_name)  # com/android/pictach/MainActivity
+            new_rel = self._to_smali_path(new_name)  # com/android/pictach/CoreHandler000
             for smali_dir in smali_dirs:
-                old_file = smali_dir / (old_rel.split("/")[-1] + ".smali")
-                new_file = smali_dir / (new_rel.split("/")[-1] + ".smali")
-                if old_file.exists() and not new_file.exists():
+                old_file = smali_dir / (old_rel + ".smali")
+                new_file = smali_dir / (new_rel + ".smali")
+                if old_file.exists():
                     try:
+                        # Create parent directory if new package path differs
+                        new_file.parent.mkdir(parents=True, exist_ok=True)
                         old_file.rename(new_file)
                         files_renamed += 1
+                        logger.info(
+                            f"[ManifestComponentRenamer] "
+                            f"File: {old_file.name} → {new_file.name}")
                     except Exception as e:
                         logger.warning(
-                            f"[ManifestComponentRenamer] File rename failed: {e}")
+                            f"[ManifestComponentRenamer] File rename failed "
+                            f"{old_file}: {e}")
 
         renamed_count = len(rename_map)
         return {
