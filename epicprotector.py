@@ -18037,6 +18037,50 @@ async def button_handler(update, context):
         return
 
     # ── TEST REPORT ───────────────────────────────────────────────────────────
+    elif data == "sbs_skip":
+        if not is_admin(user.id): return
+        phase_idx = sbs_step_index.get(user.id, 0)
+        config    = _get_base_apk_config()
+        apk_name  = config.get("base_apk_filename", "base.apk")
+        # Advance to next phase
+        sbs_step_index[user.id] = phase_idx + 1
+        # Reset p2 step index if skipping phase 2
+        if phase_idx < len(SBS_PHASES) and SBS_PHASES[phase_idx]["key"] == "phase_2":
+            sbs_p2_step_idx.pop(user.id, None)
+            sbs_p2_active[user.id] = False
+        next_idx = phase_idx + 1
+        if next_idx >= len(SBS_PHASES):
+            await query.edit_message_text(
+                f"🧪 *Step-by-Step Test*\n\n📦 `{apk_name}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"⏭️ All phases skipped\n"
+                f"━━━━━━━━━━━━━━━━━━━━━",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 View Report", callback_data="sbs_report")],
+                    [InlineKeyboardButton("🔄 Restart", callback_data="sbs_open")],
+                    [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_admin")],
+                ]))
+            return
+        next_phase = SBS_PHASES[next_idx]
+        await query.edit_message_text(
+            f"🧪 *Step-by-Step Test*\n\n📦 `{apk_name}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏭️ Phase {phase_idx+1} skipped\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Next: {next_phase['icon']} *{next_phase['label']}*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(
+                    f"▶️ Run {next_phase['icon']} {next_phase['label']}",
+                    callback_data="sbs_run")],
+                [InlineKeyboardButton("⏭️ Skip This Phase", callback_data="sbs_skip")],
+                [InlineKeyboardButton("📋 View Test Report", callback_data="sbs_report")],
+                [InlineKeyboardButton("🔄 Restart", callback_data="sbs_open")],
+                [InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_admin")],
+            ]))
+        return
+
     elif data == "sbs_report":
         if not is_admin(user.id): return
 
