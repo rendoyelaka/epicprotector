@@ -12142,25 +12142,49 @@ class ManualControlEngine:
                 result["items_removed"] = r["total"]
 
                 # Step 2 — Clean APK-level tool fingerprints if rebuilt APK exists
+                # Resolve rebuilt APK path from override or work_dir
                 apk_cleaned = 0
                 apk_removed = 0
                 apk_ts_year = ""
-                if rebuilt_apk and os.path.exists(rebuilt_apk):
+                _rebuilt_apk_path = None
+                if rebuilt_apk_override and os.path.exists(rebuilt_apk_override):
+                    _rebuilt_apk_path = rebuilt_apk_override
+                else:
+                    _candidate = os.path.join(work_dir, "rebuilt.apk")
+                    if os.path.exists(_candidate):
+                        _rebuilt_apk_path = _candidate
+                    else:
+                        for _found in list(Path(work_dir).rglob("rebuilt.apk")):
+                            _rebuilt_apk_path = str(_found)
+                            break
+
+                if _rebuilt_apk_path and os.path.exists(_rebuilt_apk_path):
                     meta_cleaner = APKMetadataCleanerEngine()
-                    cr = meta_cleaner.clean(rebuilt_apk)
+                    cr = meta_cleaner.clean(_rebuilt_apk_path)
                     apk_cleaned = cr.get("cleaned", 0)
                     apk_removed = cr.get("removed", 0)
-                    # Extract timestamp year from status
                     import re as _re
-                    ts_match = _re.search(r"to (\d{4})", cr.get("status",""))
+                    ts_match = _re.search(r"to (\d{4})", cr.get("status", ""))
                     apk_ts_year = ts_match.group(1) if ts_match else ""
-
-                result["status"] = (
-                    f"✅ {r['total']} workspace items stripped | "
-                    f"APK: {apk_cleaned} cleaned, "
-                    f"{apk_removed} tool entries removed"
-                    + (f", timestamps→{apk_ts_year}" if apk_ts_year else "")
-                )
+                    if "❌" in cr.get("status", ""):
+                        result["status"] = (
+                            f"✅ {r['total']} workspace items stripped | "
+                            f"APK clean failed: {cr.get('status','')}"
+                        )
+                    else:
+                        result["status"] = (
+                            f"✅ {r['total']} workspace items stripped | "
+                            f"APK: {apk_cleaned} cleaned, "
+                            f"{apk_removed} tool entries removed"
+                            + (f", timestamps→{apk_ts_year}" if apk_ts_year else "")
+                        )
+                else:
+                    # No rebuilt APK yet — workspace-only stripping is complete and correct
+                    # APK-level cleaning will run automatically when rebuild_apk step runs
+                    result["status"] = (
+                        f"✅ {r['total']} workspace items stripped — "
+                        f"APK-level cleaning will apply after rebuild"
+                    )
 
             elif op_key == "apk_size_optimizer":
                 optimizer = APKSizeOptimizer()
