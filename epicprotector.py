@@ -8247,19 +8247,25 @@ class Level6_Signer:
 
         Returns dict with output APK path and identity report.
         """
-        # ── Step 0 — Strip existing signature ────────────────────────────────
-        stripper    = SignatureStripper()
+        # ── Step 0 — Strip existing signature + normalise compression ────────
+        stripper     = SignatureStripper()
         strip_report = stripper.detect(inp)
 
-        if strip_report["total_found"] > 0:
-            stripped_apk = inp.replace(".apk", "_stripped.apk")
-            strip_result = stripper.strip(inp, stripped_apk)
+        # Always normalise — strip() also fixes classes.dex compression to STORED
+        # which apksigner requires. Must run even when no signatures found because
+        # apktool rebuild produces classes.dex as DEFLATED — apksigner rejects this.
+        stripped_apk = inp.replace(".apk", "_stripped.apk")
+        if stripped_apk == inp:
+            stripped_apk = inp + "_stripped.apk"
+        strip_result = stripper.strip(inp, stripped_apk)
+        if strip_result.get("stripped_files"):
             logger.info(
                 f"[Level6] Stripped {len(strip_result['stripped_files'])} "
                 f"signature artifacts.")
-            inp = stripped_apk
-        else:
-            strip_result = {"stripped_files": [], "files_kept": 0}
+        logger.info(
+            f"[Level6] Compression normalised — classes.dex forced STORED — "
+            f"ready for apksigner.")
+        inp = stripped_apk
 
         # ── Step 1 — Use pre-loaded identity or generate fresh one ───────────
         # If sign_apk step pre-loaded _identity from keystore_ctx (keystore_generation
