@@ -17326,6 +17326,90 @@ async def button_handler(update, context):
         sbs_step_results[user.id] = step_results
         sbs_keystore_ctx[user.id] = keystore_ctx
 
+        # ── Phase 1 — rebuild + sign + deliver APK for install test ──────────
+        if phase["key"] == "phase_1":
+            current_ws  = sbs_workspace.get(user.id)
+            current_apk = sbs_current_apk.get(user.id, apk_path)
+            tools   = ToolInstaller()
+            scanner = ComplianceScannerEngine()
+            loop    = asyncio.get_event_loop()
+
+            await status_msg.edit_text(
+                f"🔍 *Phase 1 Complete*\n\n📦 `{apk_name}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n🔨 Building test APK...",
+                parse_mode="Markdown")
+
+            p1_build_steps = [
+                "rebuild_apk", "keystore_generation",
+                "unique_fingerprint", "zipalign",
+                "manifest_entry_hardening", "sign_apk",
+            ]
+            p1_icons  = {}
+            p1_final  = None
+
+            for b_op in p1_build_steps:
+                _b = b_op
+                try:
+                    br = await loop.run_in_executor(
+                        None,
+                        lambda: engine.run_operation(
+                            _b, current_apk, current_ws,
+                            work_dir, aes_key, tools, scanner,
+                            rebuilt_apk_override=current_apk,
+                            keystore_ctx=keystore_ctx,
+                            completed_ops=set(done_steps)))
+                except Exception as e:
+                    br = {"status": f"❌ {str(e)[:100]}"}
+                p1_icons[b_op] = "✅" if "❌" not in br.get("status","") else "❌"
+                if b_op == "rebuild_apk" and br.get("rebuilt_apk"):
+                    current_apk = br["rebuilt_apk"]
+                    sbs_current_apk[user.id] = current_apk
+                if b_op == "zipalign" and br.get("aligned_apk"):
+                    current_apk = br["aligned_apk"]
+                    sbs_current_apk[user.id] = current_apk
+                if b_op == "sign_apk" and br.get("final_apk"):
+                    p1_final = br["final_apk"]
+                    sbs_current_apk[user.id] = p1_final
+
+            build_summary = "\n".join([
+                f"{p1_icons.get(b,'⬜')} {engine.STEP_LABELS.get(b,b)}"
+                for b in p1_build_steps])
+
+            apk_ready = p1_final and os.path.exists(p1_final)
+            next_phase = SBS_PHASES[phase_idx+1] if phase_idx+1 < len(SBS_PHASES) else None
+
+            kb = []
+            if apk_ready:
+                kb.append([InlineKeyboardButton("📲 Get APK", callback_data="sbs_get_apk")])
+            if next_phase:
+                kb.append([InlineKeyboardButton(
+                    f"✅ Install OK — Continue to {next_phase['icon']} {next_phase['label']}",
+                    callback_data="sbs_run")])
+            kb.append([InlineKeyboardButton("🔄 Restart", callback_data="sbs_open")])
+            kb.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_admin")])
+
+            await status_msg.edit_text(
+                f"🔍 *Phase 1 — Setup & Analysis*\n\n📦 `{apk_name}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n{build_summary}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                + ("📲 *APK ready — install and test*" if apk_ready else "⚠️ Build failed"),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb))
+
+            if apk_ready:
+                size_mb = os.path.getsize(p1_final) / (1024*1024)
+                with open(p1_final, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=user.id, document=f,
+                        filename="P1_Setup_Analysis.apk",
+                        caption=(
+                            f"🔍 *Phase 1 — Setup & Analysis*\n"
+                            f"📦 {size_mb:.2f} MB\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"📲 Install and test.\nTap *Install OK* when ready."),
+                        parse_mode="Markdown")
+            return
+
         # Build result lines for this phase
         result_lines = []
         for i, (op_key, res) in enumerate(
