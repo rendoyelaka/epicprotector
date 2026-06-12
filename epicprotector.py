@@ -17722,7 +17722,23 @@ async def button_handler(update, context):
         step_results = sbs_step_results.get(user.id, [])
         config       = _get_base_apk_config()
         apk_name     = config.get("base_apk_filename", "base.apk")
-        step_idx     = sbs_step_index.get(user.id, 1)
+
+        # Use Phase 2 step index for correct step number in filename
+        p2_step  = sbs_p2_step_idx.get(user.id, 0)
+        phase_idx = sbs_step_index.get(user.id, 1)
+
+        # Get last completed step name for filename
+        last_op = ""
+        if step_results:
+            last_op = step_results[-1].get("op", "")
+        engine   = ManualControlEngine(CryptoEngine(), work_dir)
+        step_label = engine.STEP_LABELS.get(last_op, last_op).replace(" ", "_")
+
+        # Build filename — P1 or P2_StepN_StepName
+        if sbs_p2_active.get(user.id):
+            apk_fname = f"P2_Step{p2_step}_{step_label}_{apk_name}"
+        else:
+            apk_fname = f"P{phase_idx}_{step_label}_{apk_name}"
 
         final_apk = None
         for r in reversed(step_results):
@@ -17750,7 +17766,7 @@ async def button_handler(update, context):
             await context.bot.send_document(
                 chat_id=user.id,
                 document=f,
-                filename=f"SBS_STEP{step_idx}_{apk_name}",
+                filename=apk_fname,
                 caption=(
                     f"🧪 *Step-by-Step Test APK*\n"
                     f"📦 {size_mb:.2f} MB\n\n"
