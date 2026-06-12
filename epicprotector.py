@@ -11871,6 +11871,15 @@ class ManualControlEngine:
                 obf_report_lines = ["🔀 *Obfuscation Pipeline*\n",
                                     "━━━━━━━━━━━━━━━━━━━━━"]
 
+                # Detailed report for text file
+                detail_lines = [
+                    "EPIC PROTECTOR — Obfuscation Detailed Report",
+                    "=" * 60,
+                    f"Workspace: {workspace}",
+                    "=" * 60,
+                    "",
+                ]
+
                 # Child 1 — Safety Analyser (must run first — builds protected list)
                 safety_engine  = SafetyAnalyserEngine()
                 safety_result  = safety_engine.analyse(workspace)
@@ -11878,6 +11887,16 @@ class ManualControlEngine:
                 obf_report_lines.append(
                     f"✅ Safety Analyser: {len(safety_result['crash_risk'])} "
                     f"protected, {len(safety_result['safe'])} safe")
+                detail_lines += [
+                    "── SAFETY ANALYSER ──────────────────────────────────────",
+                    f"Protected (crash risk): {len(safety_result['crash_risk'])}",
+                    f"Safe to obfuscate:      {len(safety_result['safe'])}",
+                ]
+                for cls in sorted(safety_result.get('crash_risk', []))[:30]:
+                    detail_lines.append(f"  [PROTECTED] {cls}")
+                if len(safety_result.get('crash_risk', [])) > 30:
+                    detail_lines.append(f"  ... and {len(safety_result['crash_risk'])-30} more")
+                detail_lines.append("")
 
                 # Child 2 — AV Trigger Scanner (must run second)
                 av_engine  = AVTriggerScannerEngine()
@@ -11885,19 +11904,40 @@ class ManualControlEngine:
                 obf_report_lines.append(
                     f"✅ AV Scanner: 🔴{len(av_result['critical'])} "
                     f"🟡{len(av_result['warnings'])} 🟢{len(av_result['advisory'])}")
+                detail_lines += [
+                    "── AV TRIGGER SCANNER ───────────────────────────────────",
+                    f"Critical: {len(av_result['critical'])}",
+                    f"Warnings: {len(av_result['warnings'])}",
+                    f"Advisory: {len(av_result['advisory'])}",
+                ]
+                for f in av_result.get('critical', []):
+                    detail_lines.append(f"  [CRITICAL] {f.get('pattern','')} in {f.get('file','')}")
+                for f in av_result.get('warnings', []):
+                    detail_lines.append(f"  [WARNING]  {f.get('pattern','')} in {f.get('file','')}")
+                detail_lines.append("")
 
                 # Auto-fix critical AV findings
+                av_fixed_count = 0
                 if av_result["critical"]:
-                    fixed = av_engine.auto_fix_critical(
+                    av_fixed_count = av_engine.auto_fix_critical(
                         workspace, av_result["critical"], aes_key)
                     obf_report_lines.append(
-                        f"  🔴 Auto-fixed: {fixed} critical patterns")
+                        f"  🔴 Auto-fixed: {av_fixed_count} critical patterns")
+                    detail_lines.append(f"Auto-fixed critical patterns: {av_fixed_count}")
+                    detail_lines.append("")
 
                 # Child 3 — smali/ classes obfuscation (uses protected list)
                 obf_result  = self.obfuscate_target(workspace, "smali/")
                 obf_report_lines.append(
                     f"✅ smali/ classes: "
                     f"{obf_result.get('files_processed',0)} files processed")
+                detail_lines += [
+                    "── SMALI OBFUSCATION ────────────────────────────────────",
+                    f"Files processed:  {obf_result.get('files_processed',0)}",
+                    f"Source renamed:   {obf_result.get('classes_renamed',0)}",
+                    f"Fields renamed:   {obf_result.get('fields_renamed',0)}",
+                    "",
+                ]
 
                 # Child 3b — Native Methods (identify + protect + noise)
                 native_engine  = NativeMethodsObfuscationEngine()
@@ -11905,12 +11945,25 @@ class ManualControlEngine:
                 obf_report_lines.append(
                     f"✅ Native Methods: "
                     f"{native_result.get('native_count',0)} methods protected")
+                detail_lines += [
+                    "── NATIVE METHODS ───────────────────────────────────────",
+                    f"Native methods found:    {native_result.get('native_count',0)}",
+                    f"Methods protected:       {native_result.get('protected',0)}",
+                ]
+                for m in native_result.get('methods', [])[:20]:
+                    detail_lines.append(f"  [NATIVE] {m}")
+                detail_lines.append("")
 
                 # Child 4 — String Values (StringSplitter)
                 splitter    = StringSplitterEngine()
                 split_count = splitter.apply(workspace)
                 obf_report_lines.append(
                     f"✅ String Values: {split_count} strings split")
+                detail_lines += [
+                    "── STRING SPLITTER ──────────────────────────────────────",
+                    f"Strings split into fragments: {split_count}",
+                    "",
+                ]
 
                 # Child 5 — DEX Fingerprint Randomisation
                 dex_engine  = DEXFingerprintRandomiserEngine()
@@ -11918,6 +11971,11 @@ class ManualControlEngine:
                 obf_report_lines.append(
                     f"✅ DEX Fingerprint: "
                     f"{dex_result.get('files_processed',0)} files randomised")
+                detail_lines += [
+                    "── DEX FINGERPRINT RANDOMISER ───────────────────────────",
+                    f"Files randomised: {dex_result.get('files_processed',0)}",
+                    "",
+                ]
 
                 # Child 6 — Entropy Normaliser
                 entropy_engine = EntropyNormaliserEngine()
@@ -11925,6 +11983,11 @@ class ManualControlEngine:
                 obf_report_lines.append(
                     f"✅ Entropy Normaliser: "
                     f"{ent_result.get('files_normalised',0)} files normalised")
+                detail_lines += [
+                    "── ENTROPY NORMALISER ───────────────────────────────────",
+                    f"Files normalised: {ent_result.get('files_normalised',0)}",
+                    "",
+                ]
 
                 # Child 7 — Reference Map + Smart Safe Renamer (must run last)
                 ref_map_engine = ReferenceMapEngine()
@@ -11935,6 +11998,13 @@ class ManualControlEngine:
                     f"✅ Smart Renamer: "
                     f"{rename_result.get('renamed',0)} renamed, "
                     f"{rename_result.get('protected',0)} protected")
+                detail_lines += [
+                    "── SMART SAFE RENAMER ───────────────────────────────────",
+                    f"Classes renamed:   {rename_result.get('renamed',0)}",
+                    f"Classes protected: {rename_result.get('protected',0)}",
+                    f"Total mapped:      {rename_result.get('total_map',0)}",
+                    "",
+                ]
 
                 # Child 8 — Permission Audit (read-only)
                 perm_auditor  = PermissionAuditorEngine()
@@ -11943,6 +12013,14 @@ class ManualControlEngine:
                     f"✅ Permission Audit: "
                     f"{perm_result.get('total',0)} permissions — "
                     f"{'⚠️ risk combos found' if perm_result.get('combo_flags') else 'clean'}")
+                detail_lines += [
+                    "── PERMISSION AUDIT ─────────────────────────────────────",
+                    f"Total permissions: {perm_result.get('total',0)}",
+                    f"Risk combos:       {'YES — ' + str(perm_result.get('combo_flags',[])) if perm_result.get('combo_flags') else 'None'}",
+                ]
+                for p in perm_result.get('permissions', []):
+                    detail_lines.append(f"  {p}")
+                detail_lines.append("")
 
                 # Child 9 — Post-Obfuscation Verification
                 post_verifier = PostObfuscationVerifier()
@@ -11951,6 +12029,19 @@ class ManualControlEngine:
                     "━━━━━━━━━━━━━━━━━━━━━")
                 obf_report_lines.append(
                     f"{'✅ Post-Verification: Ready to rebuild' if verify_result['overall'] else '⚠️ Post-Verification: Issues found'}")
+                detail_lines += [
+                    "── POST-OBFUSCATION VERIFICATION ────────────────────────",
+                    f"Overall: {'✅ PASS' if verify_result['overall'] else '⚠️ ISSUES FOUND'}",
+                ]
+                for check, passed in verify_result.items():
+                    if check != 'overall':
+                        detail_lines.append(f"  {'✅' if passed else '❌'} {check}")
+                detail_lines += [
+                    "",
+                    "=" * 60,
+                    "END OF OBFUSCATION REPORT",
+                    "=" * 60,
+                ]
 
                 result["files_processed"]  = obf_result.get("files_processed", 0)
                 result["strings_split"]    = split_count
@@ -11958,6 +12049,7 @@ class ManualControlEngine:
                 result["protected_count"]  = len(protected_list)
                 result["verify_passed"]    = verify_result["overall"]
                 result["obf_report"]       = "\n".join(obf_report_lines)
+                result["detail_report"]    = "\n".join(detail_lines)
                 result["status"] = (
                     f"✅ Full obfuscation pipeline complete — "
                     f"{obf_result.get('files_processed',0)} files — "
@@ -17169,6 +17261,31 @@ async def button_handler(update, context):
                 ),
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(kb_rows))
+
+            # Send detailed obfuscation report as text file if available
+            if op_key == "obfuscation" and result.get("detail_report"):
+                try:
+                    import io
+                    report_bytes = result["detail_report"].encode("utf-8")
+                    report_file  = io.BytesIO(report_bytes)
+                    report_file.name = f"P2_Step{p2_step+1}_Obfuscation_Report.txt"
+                    await context.bot.send_document(
+                        chat_id=user.id,
+                        document=report_file,
+                        filename=report_file.name,
+                        caption=(
+                            f"📋 *Obfuscation Detailed Report*\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"✅ {result.get('files_processed',0)} files processed\n"
+                            f"🔴 {result.get('av_critical',0)} AV patterns fixed\n"
+                            f"🔒 {result.get('protected_count',0)} classes protected\n"
+                            f"📝 {result.get('strings_split',0)} strings split\n"
+                            f"━━━━━━━━━━━━━━━━━━━━━\n"
+                            f"Full details in the text file above."
+                        ),
+                        parse_mode="Markdown")
+                except Exception as _re:
+                    logger.warning(f"[Obfuscation] Report send failed: {_re}")
 
             return
 
