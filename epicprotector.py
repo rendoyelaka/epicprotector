@@ -9094,36 +9094,39 @@ class ManifestComponentRenamerEngine:
             }
 
         ns = "http://schemas.android.com/apk/res/android"
+        # Support both Clark notation {ns}name and android:name prefix
+        def get_android_attr(elem, attr):
+            val = elem.get(f"{{{ns}}}{attr}")
+            if val is None:
+                val = elem.get(f"android:{attr}")
+            return val or ""
 
         # Find the LAUNCHER activity — never rename it
         launcher_activities = set()
         for activity in root.iter("activity"):
             for intent_filter in activity.iter("intent-filter"):
                 for category in intent_filter.iter("category"):
-                    if category.get(f"{{{ns}}}name") == "android.intent.category.LAUNCHER":
-                        name = activity.get(f"{{{ns}}}name", "")
+                    if get_android_attr(category, "name") == "android.intent.category.LAUNCHER":
+                        name = get_android_attr(activity, "name")
                         if name:
                             launcher_activities.add(name)
 
         # Collect all component class names
-        components = {}  # old_name -> element_tag
+        components = {}
         component_tags = ["activity", "service", "receiver", "provider"]
         for tag in component_tags:
             for elem in root.iter(tag):
-                name = elem.get(f"{{{ns}}}name", "")
+                name = get_android_attr(elem, "name")
                 if not name:
                     continue
-                # Expand relative names
                 if name.startswith("."):
                     name = pkg + name
-                # Only rename app-owned classes — not system/androidx classes
                 if not name.startswith(pkg):
                     continue
-                # Never rename launcher activity
                 if name in launcher_activities:
-                    logger.info(
-                        f"[ManifestComponentRenamer] Skipping launcher: {name}")
+                    logger.info(f"[ManifestComponentRenamer] Skipping launcher: {name}")
                     continue
+                components[name] = tag
                 components[name] = tag
 
         if not components:
