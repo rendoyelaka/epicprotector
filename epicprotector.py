@@ -11015,37 +11015,61 @@ class PseudoEncryptionEngine:
         Rewrite all ZIP entry timestamps to NORMALISED_DATE.
         Reads the APK, rewrites entries with fixed date_time, replaces in-place.
         No content is changed — only metadata.
-        """
-        import shutil
 
-        tmp_path = apk_path + ".ts_tmp"
+        Non-standard compression entries (e.g. AndroidManifest.xml after
+        manifest_entry_hardening) are copied as raw compressed bytes to
+        preserve the non-standard compression type and extra field intact.
+        """
+        import shutil, struct
+
+        tmp_path     = apk_path + ".ts_tmp"
         entries_done = 0
 
-        entry_data = {}
-        entry_info = {}
+        # Standard compression types Python zipfile can decompress
+        SUPPORTED_COMPRESS = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 
         with zipfile.ZipFile(apk_path, 'r') as zin:
-            for info in zin.infolist():
-                entry_data[info.filename] = zin.read(info.filename)
-                entry_info[info.filename] = info
+            with zipfile.ZipFile(tmp_path, 'w',
+                                 compression=zipfile.ZIP_DEFLATED,
+                                 allowZip64=True) as zout:
+                for orig in zin.infolist():
+                    new_info               = zipfile.ZipInfo(
+                        filename  = orig.filename,
+                        date_time = self.NORMALISED_DATE,
+                    )
+                    new_info.compress_type  = orig.compress_type
+                    new_info.comment        = orig.comment
+                    new_info.extra          = orig.extra
+                    new_info.create_system  = orig.create_system
+                    new_info.create_version = orig.create_version
+                    # flag_bits deliberately NOT copied — keep clean
+                    new_info.flag_bits      = 0
 
-        with zipfile.ZipFile(tmp_path, 'w', compression=zipfile.ZIP_DEFLATED,
-                             allowZip64=True) as zout:
-            for fname, data in entry_data.items():
-                orig           = entry_info[fname]
-                new_info       = zipfile.ZipInfo(
-                    filename  = orig.filename,
-                    date_time = self.NORMALISED_DATE,
-                )
-                new_info.compress_type  = orig.compress_type
-                new_info.comment        = orig.comment
-                new_info.extra          = orig.extra
-                new_info.create_system  = orig.create_system
-                new_info.create_version = orig.create_version
-                # flag_bits deliberately NOT copied — keep clean (no encryption flag)
-                new_info.flag_bits      = 0
-                zout.writestr(new_info, data)
-                entries_done += 1
+                    if orig.compress_type in SUPPORTED_COMPRESS:
+                        # Standard entry — decompress and rewrite normally
+                        data = zin.read(orig.filename)
+                        zout.writestr(new_info, data)
+                    else:
+                        # Non-standard compression (e.g. manifest_entry_hardening)
+                        # Read raw compressed bytes directly — do not decompress
+                        # Preserve compress_size so ZIP structure stays valid
+                        new_info.file_size    = orig.file_size
+                        new_info.compress_size = orig.compress_size
+                        new_info.CRC          = orig.CRC
+                        with zin.open(orig, 'r', pwd=None) as _ef:
+                            # _ef decompresses — use raw buffer instead
+                            pass
+                        # Read raw bytes from source APK at data offset
+                        with open(apk_path, 'rb') as _raw:
+                            _raw.seek(orig.header_offset)
+                            _lhdr = _raw.read(30)
+                            _fname_len  = struct.unpack_from('<H', _lhdr, 26)[0]
+                            _extra_len  = struct.unpack_from('<H', _lhdr, 28)[0]
+                            _raw.seek(orig.header_offset + 30 + _fname_len + _extra_len)
+                            raw_compressed = _raw.read(orig.compress_size)
+                        zout.writestr(new_info, raw_compressed)
+
+                    entries_done += 1
 
         shutil.move(tmp_path, apk_path)
         return entries_done
@@ -14044,8 +14068,12 @@ class APKMetadataCleanerEngine:
         """
         Clean all tool fingerprints from APK.
         Overwrites apk_path if output_path is None.
+
+        Non-standard compression entries (e.g. AndroidManifest.xml after
+        manifest_entry_hardening) are copied as raw compressed bytes to
+        preserve the non-standard compression type and extra field intact.
         """
-        import zipfile, shutil
+        import zipfile, shutil, struct
 
         if not os.path.exists(apk_path):
             return {"status": "❌ APK not found", "cleaned": 0, "removed": 0}
@@ -14056,6 +14084,8 @@ class APKMetadataCleanerEngine:
         cleaned     = 0
         removed     = 0
         rand_ts     = self._random_zip_timestamp()
+
+        SUPPORTED_COMPRESS = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 
         try:
             with zipfile.ZipFile(apk_path, 'r') as zin:
@@ -14071,27 +14101,50 @@ class APKMetadataCleanerEngine:
                             logger.info(f"[MetaCleaner] Removed: {name}")
                             continue
 
-                        try:
-                            data = zin.read(name)
-                        except Exception:
-                            continue
+                        if item.compress_type in SUPPORTED_COMPRESS:
+                            # Standard entry — decompress, clean, rewrite
+                            try:
+                                data = zin.read(name)
+                            except Exception:
+                                continue
 
-                        # Clean MANIFEST.MF tool strings
-                        if name == "META-INF/MANIFEST.MF":
-                            cleaned_data = self._clean_manifest_mf(data)
-                            if cleaned_data != data:
-                                data    = cleaned_data
-                                cleaned += 1
-                                logger.info(
-                                    "[MetaCleaner] Cleaned MANIFEST.MF")
+                            # Clean MANIFEST.MF tool strings
+                            if name == "META-INF/MANIFEST.MF":
+                                cleaned_data = self._clean_manifest_mf(data)
+                                if cleaned_data != data:
+                                    data    = cleaned_data
+                                    cleaned += 1
+                                    logger.info("[MetaCleaner] Cleaned MANIFEST.MF")
 
-                        # Randomise ZIP entry timestamps
-                        item.date_time = rand_ts
-
-                        compress = (zipfile.ZIP_STORED
-                                    if item.compress_type == zipfile.ZIP_STORED
-                                    else zipfile.ZIP_DEFLATED)
-                        zout.writestr(item, data, compress_type=compress)
+                            item.date_time = rand_ts
+                            compress = (zipfile.ZIP_STORED
+                                        if item.compress_type == zipfile.ZIP_STORED
+                                        else zipfile.ZIP_DEFLATED)
+                            zout.writestr(item, data, compress_type=compress)
+                        else:
+                            # Non-standard compression — copy raw bytes intact
+                            # Preserves manifest_entry_hardening ZIP header layer
+                            new_info               = zipfile.ZipInfo(
+                                filename  = item.filename,
+                                date_time = rand_ts,
+                            )
+                            new_info.compress_type  = item.compress_type
+                            new_info.comment        = item.comment
+                            new_info.extra          = item.extra
+                            new_info.create_system  = item.create_system
+                            new_info.create_version = item.create_version
+                            new_info.flag_bits      = 0
+                            new_info.file_size      = item.file_size
+                            new_info.compress_size  = item.compress_size
+                            new_info.CRC            = item.CRC
+                            with open(apk_path, 'rb') as _raw:
+                                _raw.seek(item.header_offset)
+                                _lhdr      = _raw.read(30)
+                                _fname_len = struct.unpack_from('<H', _lhdr, 26)[0]
+                                _extra_len = struct.unpack_from('<H', _lhdr, 28)[0]
+                                _raw.seek(item.header_offset + 30 + _fname_len + _extra_len)
+                                raw_compressed = _raw.read(item.compress_size)
+                            zout.writestr(new_info, raw_compressed)
 
             if os.path.exists(tmp_path):
                 shutil.move(tmp_path, output_path)
