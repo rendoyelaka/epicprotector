@@ -10845,6 +10845,117 @@ class MultiDexEncryptionEngine:
 
 
 
+# ── MANIFEST ENTRY HARDENING ENGINE ──────────────────────────────────────────
+class ManifestEntryHardeningEngine:
+    """
+    ZIP Header Protection — Anti-Analysis Layer.
+
+    Applies a non-standard compression type to the AndroidManifest.xml
+    local file header inside the built APK ZIP structure.
+
+    Layer 1 — Compression type field: random value from elite pool per build.
+               Android PackageManager reads AXML natively — unaffected.
+               Standard ZIP-based analysis tools (jadx, apktool) fail to parse.
+
+    Layer 2 — Extra field: random junk bytes appended to local header extra
+               field. Breaks fallback raw-read attempts by analysis tools.
+
+    Safe pool (tested against base.apk — all confirmed):
+        [12, 14, 19, 98, 99, 102, 127, 200, 255]
+    Type 9 excluded — too close to DEFLATED, tools handle it.
+
+    Position in pipeline: after rebuild_apk, before pseudo_encryption.
+    Operates on the rebuilt APK file — not the workspace.
+    """
+
+    # Confirmed safe pool — tested on base.apk
+    # All values: APK installs fine + tools break
+    ELITE_POOL = [12, 14, 19, 98, 99, 102, 127, 200, 255]
+
+    # Junk extra field size range (bytes)
+    EXTRA_JUNK_MIN = 4
+    EXTRA_JUNK_MAX = 16
+
+    def apply(self, apk_path: str) -> dict:
+        """
+        Apply ZIP header protection to AndroidManifest.xml entry.
+        Returns result dict with status, selected compression type, extra bytes added.
+        """
+        import struct, random
+
+        result = {
+            "status":       "❌ Manifest Entry Hardening failed",
+            "comp_type":    None,
+            "extra_bytes":  0,
+            "apk_path":     apk_path,
+        }
+
+        if not apk_path or not os.path.exists(apk_path):
+            result["status"] = "❌ APK file not found"
+            return result
+
+        try:
+            with open(apk_path, "rb") as f:
+                data = bytearray(f.read())
+
+            sig       = b"PK\x03\x04"
+            pos       = 0
+            found     = False
+            comp_type = random.choice(self.ELITE_POOL)
+            junk_size = random.randint(self.EXTRA_JUNK_MIN, self.EXTRA_JUNK_MAX)
+            junk      = bytes(random.randint(0, 255) for _ in range(junk_size))
+
+            while pos < len(data) - 4:
+                if data[pos:pos+4] == sig:
+                    fname_len = struct.unpack_from("<H", data, pos + 26)[0]
+                    extra_len = struct.unpack_from("<H", data, pos + 28)[0]
+                    fname     = data[pos+30:pos+30+fname_len].decode("utf-8", errors="ignore")
+
+                    if fname == "AndroidManifest.xml":
+                        # Layer 1 — set non-standard compression type
+                        data[pos + 8] = comp_type & 0xFF
+                        data[pos + 9] = (comp_type >> 8) & 0xFF
+
+                        # Layer 2 — append junk to extra field
+                        # Update extra field length (2 bytes at offset +28)
+                        new_extra_len = extra_len + junk_size
+                        struct.pack_into("<H", data, pos + 28, new_extra_len)
+
+                        # Insert junk bytes after existing extra field
+                        insert_pos = pos + 30 + fname_len + extra_len
+                        data = data[:insert_pos] + bytearray(junk) + data[insert_pos:]
+
+                        found = True
+                        logger.info(
+                            f"[ManifestEntryHardening] Applied — "
+                            f"comp_type={comp_type} extra_junk={junk_size}B"
+                        )
+                        break
+
+                pos += 1
+
+            if not found:
+                result["status"] = "❌ AndroidManifest.xml entry not found in APK"
+                return result
+
+            with open(apk_path, "wb") as f:
+                f.write(data)
+
+            result["status"]      = (
+                f"✅ Manifest entry hardened — "
+                f"compression type: {comp_type} — "
+                f"extra field junk: {junk_size} bytes"
+            )
+            result["comp_type"]   = comp_type
+            result["extra_bytes"] = junk_size
+            return result
+
+        except Exception as e:
+            logger.error(f"[ManifestEntryHardening] Error: {e}")
+            result["status"] = f"❌ Manifest Entry Hardening error: {e}"
+            return result
+
+
 # ── PSEUDO ENCRYPTION ENGINE ─────────────────────────────────────────────────
 class PseudoEncryptionEngine:
     """
@@ -11040,6 +11151,7 @@ class ProtectionScoreEngine:
         "metadata_stripping":    5,
         "apk_size_optimizer":    2,
         "rebuild_apk":           3,
+        "manifest_entry_hardening": 8, # ZIP header anti-analysis — tool blocking layer
         "pseudo_encryption":     7,   # scanner confusion — ZIP flag + DEX marker
         "integrity_manifest":    5,
         "aes_key_management":    4,
@@ -11111,6 +11223,7 @@ class ManualControlEngine:
         "metadata_stripping":         ["decode_workspace"],
         "apk_size_optimizer":         ["decode_workspace"],
         "rebuild_apk":                ["decode_workspace"],
+        "manifest_entry_hardening":   ["rebuild_apk"],
         "pseudo_encryption":          ["rebuild_apk"],
         "integrity_manifest":         ["rebuild_apk"],
         "certificate_aging":          ["rebuild_apk"],
@@ -11139,7 +11252,8 @@ class ManualControlEngine:
         "metadata_stripping":         "apk_size_optimizer",
         "apk_size_optimizer":         "aes_key_management",
         "aes_key_management":         "rebuild_apk",
-        "rebuild_apk":                "pseudo_encryption",
+        "rebuild_apk":                "manifest_entry_hardening",
+        "manifest_entry_hardening":   "pseudo_encryption",
         "pseudo_encryption":          "integrity_manifest",
         "integrity_manifest":         "certificate_aging",
         "certificate_aging":          "unique_fingerprint",
@@ -11173,8 +11287,9 @@ class ManualControlEngine:
         "aes_key_management",      # 19. display AES key before rebuild
         # ── Phase 4: Build ────────────────────────────────────────────────────
         "rebuild_apk",             # 20. rebuild — all changes baked in
-        "pseudo_encryption",       # 21. normalise ZIP timestamps + clear flags
-        "integrity_manifest",      # 22. hash final APK state — correct hashes
+        "manifest_entry_hardening", # 21. ZIP header protection — anti-analysis layer
+        "pseudo_encryption",       # 22. normalise ZIP timestamps + clear flags
+        "integrity_manifest",      # 23. hash final APK state — correct hashes
         # ── Phase 5: Sign with Coherent Identity + GPP Lineage ───────────────
         # Path A — GPP optimised: certificate_aging → unique_fingerprint → signing_lineage
         # Path B — Standard:      keystore_generation → unique_fingerprint → zipalign → sign_apk
@@ -11203,6 +11318,7 @@ class ManualControlEngine:
         "metadata_stripping":   "🧹 Metadata Stripping",
         "apk_size_optimizer":   "📦 APK Size Optimizer",
         "rebuild_apk":          "🔨 Rebuild APK",
+        "manifest_entry_hardening": "🛡️ Manifest Entry Hardening",
         "pseudo_encryption":    "🎭 Pseudo Encryption",
         "integrity_manifest":   "🔗 Integrity Manifest",
         "aes_key_management":   "🔑 AES Key Management",
@@ -12089,6 +12205,22 @@ class ManualControlEngine:
                     if not smali_was_modified else
                     "✅ APK rebuilt via apktool — all smali changes compiled"
                 )
+
+            elif op_key == "manifest_entry_hardening":
+                # Operates on the rebuilt APK — must run after rebuild_apk
+                # before pseudo_encryption and signing steps
+                meh_apk = os.path.join(work_dir, "rebuilt.apk")
+                if not os.path.exists(meh_apk):
+                    for found in list(Path(work_dir).rglob("rebuilt.apk")):
+                        meh_apk = str(found)
+                        break
+                if not os.path.exists(meh_apk) and rebuilt_apk_override:
+                    meh_apk = rebuilt_apk_override
+                meh_engine = ManifestEntryHardeningEngine()
+                meh_result = meh_engine.apply(meh_apk)
+                result["comp_type"]   = meh_result.get("comp_type")
+                result["extra_bytes"] = meh_result.get("extra_bytes", 0)
+                result["status"]      = meh_result.get("status", "❌ Manifest Entry Hardening failed")
 
             elif op_key == "pseudo_encryption":
                 # Operates on the rebuilt APK — finds rebuilt.apk in work_dir
@@ -16081,6 +16213,7 @@ SBS_PHASES = [
         "icon":  "🔨",
         "steps": [
             "rebuild_apk",
+            "manifest_entry_hardening",
             "pseudo_encryption",
             "integrity_manifest",
         ],
