@@ -146,7 +146,7 @@ send_msg(f"✅ Step 2 complete: {len(rename_map)} renamed | "
 
 # ── Step 3: Rebuild ───────────────────────────────────────────────────────────
 rebuilt = os.path.join(WORK_DIR, "rebuilt.apk")
-r = run(["apktool", "b", ws, "-o", rebuilt, "--use-aapt2"])
+r = run(["apktool", "b", ws, "-o", rebuilt])
 if not os.path.exists(rebuilt):
     send_msg(f"❌ apktool rebuild failed: {r.stderr[:300]}")
     sys.exit(1)
