@@ -1,0 +1,27 @@
+name: Manual Rename Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  manual-rename-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y apktool default-jdk zipalign apksigner
+
+      - name: Run Manual Rename Test
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID:  ${{ secrets.ADMIN_ID }}
+        run: python3 manual_rename_test.py
