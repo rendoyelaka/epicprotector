@@ -18777,31 +18777,11 @@ def main():
         try:
             bot = application.bot
 
-            # ── Step 1: Delete previous bot messages to clear chat ────────────
-            # Telegram does not allow bulk delete so we attempt to delete
-            # the last 100 message IDs before the current update ID
-            # This cleans up the previous session visually
-            try:
-                updates = await bot.get_updates(limit=1, timeout=1)
-                if updates:
-                    last_id = updates[-1].update_id
-                else:
-                    last_id = 0
-
-                # Delete last 100 messages sent by the bot in admin chat
-                deleted = 0
-                for msg_id in range(last_id, max(0, last_id - 100), -1):
-                    try:
-                        await bot.delete_message(
-                            chat_id=ADMIN_ID, message_id=msg_id)
-                        deleted += 1
-                    except Exception:
-                        pass
-                if deleted:
-                    logger.info(
-                        f"[Startup] Cleared {deleted} previous messages.")
-            except Exception as e:
-                logger.info(f"[Startup] Chat clear skipped: {e}")
+            # ── Step 1: Chat clear — removed ─────────────────────────────────
+            # Telegram update IDs and message IDs are different number spaces.
+            # Attempting deleteMessage with update IDs produces 400 Bad Request
+            # for every call — floods the log with errors on every bot startup.
+            # No bulk delete attempted — chat history preserved across sessions.
 
             # ── Step 2: Send startup notification to admin ────────────────────
             base_cfg  = _get_base_apk_config()
