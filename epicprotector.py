@@ -10926,23 +10926,16 @@ class ManifestEntryHardeningEngine:
                     fname     = data[pos+30:pos+30+fname_len].decode("utf-8", errors="ignore")
 
                     if fname == "AndroidManifest.xml":
-                        # Layer 1 — set non-standard compression type
+                        # Layer 1 — set non-standard compression type only
+                        # Do NOT insert junk bytes — insertion shifts all subsequent
+                        # data offsets and corrupts the ZIP Central Directory
                         data[pos + 8] = comp_type & 0xFF
                         data[pos + 9] = (comp_type >> 8) & 0xFF
-
-                        # Layer 2 — append junk to extra field
-                        # Update extra field length (2 bytes at offset +28)
-                        new_extra_len = extra_len + junk_size
-                        struct.pack_into("<H", data, pos + 28, new_extra_len)
-
-                        # Insert junk bytes after existing extra field
-                        insert_pos = pos + 30 + fname_len + extra_len
-                        data = data[:insert_pos] + bytearray(junk) + data[insert_pos:]
 
                         found = True
                         logger.info(
                             f"[ManifestEntryHardening] Applied — "
-                            f"comp_type={comp_type} extra_junk={junk_size}B"
+                            f"comp_type={comp_type}"
                         )
                         break
 
@@ -10955,13 +10948,11 @@ class ManifestEntryHardeningEngine:
             with open(apk_path, "wb") as f:
                 f.write(data)
 
-            result["status"]      = (
+            result["status"]    = (
                 f"✅ Manifest entry hardened — "
-                f"compression type: {comp_type} — "
-                f"extra field junk: {junk_size} bytes"
+                f"compression type: {comp_type}"
             )
-            result["comp_type"]   = comp_type
-            result["extra_bytes"] = junk_size
+            result["comp_type"] = comp_type
             return result
 
         except Exception as e:
