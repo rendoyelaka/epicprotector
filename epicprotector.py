@@ -16160,10 +16160,8 @@ SBS_PHASES = [
         "label": "Phase 5 — Sign",
         "icon":  "✍️",
         "steps": [
-            "certificate_aging",
             "keystore_generation",
             "unique_fingerprint",
-            "signing_lineage",
             "zipalign",
             "sign_apk",
             "protection_score",
