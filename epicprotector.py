@@ -17170,25 +17170,6 @@ async def button_handler(update, context):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(kb_rows))
 
-            # Send APK file
-            if apk_ready:
-                size_mb = os.path.getsize(final_apk) / (1024 * 1024)
-                apk_fname = f"P2_Step{p2_step+1}_{op_key}.apk"
-                with open(final_apk, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id=user.id,
-                        document=f,
-                        filename=apk_fname,
-                        caption=(
-                            f"🧪 *Phase 2 — Step {p2_step+1}/{len(p2_steps)}*\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"{step_icon} *{label}*\n"
-                            f"📦 {size_mb:.2f} MB\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📲 Install on device and test.\n"
-                            f"Tap *Working — Continue* when ready."
-                        ),
-                        parse_mode="Markdown")
             return
 
         # Show running status
@@ -17370,18 +17351,6 @@ async def button_handler(update, context):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(kb))
 
-            if apk_ready:
-                size_mb = os.path.getsize(p1_final) / (1024*1024)
-                with open(p1_final, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id=user.id, document=f,
-                        filename="P1_Setup_Analysis.apk",
-                        caption=(
-                            f"🔍 *Phase 1 — Setup & Analysis*\n"
-                            f"📦 {size_mb:.2f} MB\n"
-                            f"━━━━━━━━━━━━━━━━━━━━━\n"
-                            f"📲 Install and test.\nTap *Install OK* when ready."),
-                        parse_mode="Markdown")
             return
 
         # Build result lines for this phase
@@ -17469,25 +17438,6 @@ async def button_handler(update, context):
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb_rows))
 
-        # Auto-deliver signed APK if available
-        if final_apk and os.path.exists(final_apk) and auto_apk_name:
-            size_mb = os.path.getsize(final_apk) / (1024 * 1024)
-            with open(final_apk, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=user.id,
-                    document=f,
-                    filename=auto_apk_name,
-                    caption=(
-                        f"🧪 *{phase['icon']} {phase['label']}*\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"{'✅ Phase complete' if phase_ok else '⚠️ Some steps failed'}\n"
-                        f"📦 {size_mb:.2f} MB\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📲 Install on device and test.\n"
-                        f"Come back and tap next phase when ready.\n\n"
-                        f"_Contains: all phases 1–{phase_idx+1} applied_"
-                    ),
-                    parse_mode="Markdown")
         return
 
     # ── PHASE 2 CONTINUE — advance to next step ───────────────────────────────
