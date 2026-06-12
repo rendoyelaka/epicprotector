@@ -74,10 +74,11 @@ launchers = set()
 for act in root.iter("activity"):
     for inf in act.iter("intent-filter"):
         for cat in inf.iter("category"):
-            if cat.get(f"{{{ns}}}name") == "android.intent.category.LAUNCHER":
-                n = act.get(f"{{{ns}}}name","")
+            cat_name = cat.get(f"{{{ns}}}name","") or cat.get("android:name","")
+            if cat_name == "android.intent.category.LAUNCHER":
+                n = act.get(f"{{{ns}}}name","") or act.get("android:name","")
                 if n.startswith("."): n = pkg+n
-                launchers.add(n)
+                if n: launchers.add(n)
 
 # Collect components
 components = {}
@@ -145,7 +146,7 @@ send_msg(f"✅ Step 2 complete: {len(rename_map)} renamed | "
 
 # ── Step 3: Rebuild ───────────────────────────────────────────────────────────
 rebuilt = os.path.join(WORK_DIR, "rebuilt.apk")
-r = run(["apktool", "b", ws, "-o", rebuilt])
+r = run(["apktool", "b", ws, "-o", rebuilt, "--use-aapt2"])
 if not os.path.exists(rebuilt):
     send_msg(f"❌ apktool rebuild failed: {r.stderr[:300]}")
     sys.exit(1)
