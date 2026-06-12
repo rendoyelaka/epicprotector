@@ -12114,6 +12114,7 @@ class ManualControlEngine:
                 result["status"]          = r["status"]
 
             elif op_key == "manifest_component_renamer":
+                logger.info(f"[ManifestComponentRenamer] workspace={workspace}")
                 mcr        = ManifestComponentRenamerEngine()
                 mcr_result = mcr.apply(workspace)
                 result["renamed"]             = mcr_result.get("renamed", 0)
@@ -12475,6 +12476,7 @@ class ManualControlEngine:
                     "obfuscation", "safe_rename", "encryption",
                     "security_guard", "tamper_detection", "dex_repackaging",
                     "native_methods_obfuscation", "dex_sourcefile_strip",
+                    "red_flag_renamer", "manifest_component_renamer",
                 }
                 # Use completed_ops passed from caller — accurate per-session
                 # If no smali-modifying ops ran — bypass apktool entirely
