@@ -11997,6 +11997,7 @@ class ManualControlEngine:
             "obfuscation", "safe_rename", "encryption", "security_guard",
             "tamper_detection", "dex_repackaging",
             "dex_sourcefile_strip", "resource_normalisation",
+            "red_flag_renamer", "manifest_component_renamer",
         }
         if op_key in SMALI_MODIFYING_STEPS:
             result["smali_modified"] = True
@@ -12007,6 +12008,8 @@ class ManualControlEngine:
             "encryption", "dex_repackaging", "metadata_stripping",
             "apk_size_optimizer", "rebuild_apk", "string_splitting",
             "dex_sourcefile_strip", "resource_normalisation",
+            "red_flag_renamer", "manifest_component_renamer",
+            "compliance_scan",
         }
         if op_key in NEEDS_WORKSPACE:
             if not workspace or not os.path.isdir(workspace):
