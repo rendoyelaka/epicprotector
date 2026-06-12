@@ -11892,7 +11892,7 @@ class ManualControlEngine:
                     f"Protected (crash risk): {len(safety_result['crash_risk'])}",
                     f"Safe to obfuscate:      {len(safety_result['safe'])}",
                 ]
-                for cls in sorted(safety_result.get('crash_risk', []))[:30]:
+                for cls in sorted(safety_result.get('crash_risk', []), key=lambda x: x.get('class',''))[:30]:
                     detail_lines.append(f"  [PROTECTED] {cls}")
                 if len(safety_result.get('crash_risk', [])) > 30:
                     detail_lines.append(f"  ... and {len(safety_result['crash_risk'])-30} more")
