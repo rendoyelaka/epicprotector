@@ -10548,7 +10548,7 @@ class SafeRenameEngine:
 
 class MultiDexEncryptionEngine:
     """
-    Option 2: MultiDex Split Encryption.
+    Option 2: MultiDex Split Encryption — InMemoryDexClassLoader.
 
     BUILD TIME:
       1. All real app smali moved to smali_classes2/ -> compiles to classes2.dex
@@ -10560,9 +10560,10 @@ class MultiDexEncryptionEngine:
     RUNTIME:
       1. Android loads stub classes.dex
       2. EpicDexLoader.attachBaseContext() fires first
-      3. Reads assets/classes2.dex.enc, decrypts, writes to private filesDir
-      4. DexClassLoader loads decrypted dex, injects into classloader chain
+      3. Reads assets/classes2.dex.enc, decrypts into RAM — never written to disk
+      4. InMemoryDexClassLoader loads DEX directly from ByteBuffer in RAM
       5. Original app classes available normally — no crash
+      6. GPP cannot find decrypted DEX — it never exists on disk
     """
 
     # ── Correct smali — no f-string braces, all registers valid ─────────────
@@ -10578,7 +10579,7 @@ class MultiDexEncryptionEngine:
 .end method
 
 .method public attachBaseContext(Landroid/content/Context;)V
-    .registers 12
+    .registers 10
     .param p1, "base"
 
     invoke-super {p0, p1}, Landroid/app/Application;->attachBaseContext(Landroid/content/Context;)V
@@ -10618,40 +10619,22 @@ class MultiDexEncryptionEngine:
     invoke-virtual {v2}, Ljava/io/ByteArrayOutputStream;->toByteArray()[B
     move-result-object v5
 
-    # v6 = decrypted bytes
+    # v6 = decrypted DEX bytes — stays in RAM only, never written to disk
     invoke-static {v5}, Lcom/epicprotector/loader/EpicKeyStore;->decrypt([B)[B
     move-result-object v6
 
-    # v7 = output File (filesDir/epic_p.dex)
-    invoke-virtual {p1}, Landroid/content/Context;->getFilesDir()Ljava/io/File;
+    # v7 = ByteBuffer wrapping decrypted DEX bytes
+    invoke-static {v6}, Ljava/nio/ByteBuffer;->wrap([B)Ljava/nio/ByteBuffer;
     move-result-object v7
 
-    new-instance v8, Ljava/io/File;
-    const-string v9, "epic_p.dex"
-    invoke-direct {v8, v7, v9}, Ljava/io/File;-><init>(Ljava/io/File;Ljava/lang/String;)V
-
-    # write decrypted dex
-    new-instance v9, Ljava/io/FileOutputStream;
-    invoke-direct {v9, v8}, Ljava/io/FileOutputStream;-><init>(Ljava/io/File;)V
-    invoke-virtual {v9, v6}, Ljava/io/FileOutputStream;->write([B)V
-    invoke-virtual {v9}, Ljava/io/FileOutputStream;->close()V
-
-    # v10 = dex path string
-    invoke-virtual {v8}, Ljava/io/File;->getAbsolutePath()Ljava/lang/String;
-    move-result-object v10
-
-    # v11 = optimised dir (filesDir path string)
-    invoke-virtual {v7}, Ljava/io/File;->getAbsolutePath()Ljava/lang/String;
-    move-result-object v11
-
-    # v0 = parent ClassLoader
+    # v8 = parent ClassLoader
     invoke-virtual {p1}, Landroid/content/Context;->getClassLoader()Ljava/lang/ClassLoader;
-    move-result-object v0
+    move-result-object v8
 
-    # load dex — DexClassLoader(dexPath, optDir, null, parent)
-    new-instance v1, Ldalvik/system/DexClassLoader;
-    const/4 v2, 0x0
-    invoke-direct {v1, v10, v11, v2, v0}, Ldalvik/system/DexClassLoader;-><init>(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/ClassLoader;)V
+    # Load DEX entirely in memory — requires API 26+ (minSdk=28 safe)
+    # InMemoryDexClassLoader(ByteBuffer dexBuffer, ClassLoader parent)
+    new-instance v9, Ldalvik/system/InMemoryDexClassLoader;
+    invoke-direct {v9, v7, v8}, Ldalvik/system/InMemoryDexClassLoader;-><init>(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V
 
     :try_end_0
     .catch Ljava/lang/Exception; {:try_start_0 .. :try_end_0} :catch_all
@@ -11126,13 +11109,13 @@ class ManualControlEngine:
     STEP_DEPENDENCIES = {
         "compliance_scan":            ["decode_workspace"],
         "red_flag_renamer":           ["compliance_scan", "decode_workspace"],
-        "safe_rename":                ["decode_workspace", "obfuscation"],
         "obfuscation":                ["decode_workspace"],
-        "security_guard":             ["decode_workspace", "obfuscation", "encryption"],
+        "safe_rename":                ["decode_workspace", "obfuscation"],
+        "dex_repackaging":            ["decode_workspace", "safe_rename"],
+        "encryption":                 ["decode_workspace", "dex_repackaging"],
+        "native_methods_obfuscation": ["decode_workspace", "encryption"],
+        "security_guard":             ["decode_workspace", "native_methods_obfuscation"],
         "tamper_detection":           ["decode_workspace", "security_guard"],
-        "encryption":                 ["decode_workspace", "obfuscation"],
-        "dex_repackaging":            ["decode_workspace"],
-        "native_methods_obfuscation": ["decode_workspace"],
         "dex_sourcefile_strip":       ["decode_workspace"],
         "resource_normalisation":     ["decode_workspace"],
         "metadata_stripping":         ["decode_workspace"],
@@ -11156,12 +11139,12 @@ class ManualControlEngine:
         "decode_workspace":           "compliance_scan",
         "compliance_scan":            "red_flag_renamer",
         "red_flag_renamer":           "obfuscation",
-        "safe_rename":                "encryption",
-        "encryption":                 "security_guard",
+        "safe_rename":                "dex_repackaging",
+        "dex_repackaging":            "encryption",
+        "encryption":                 "native_methods_obfuscation",
+        "native_methods_obfuscation": "security_guard",
         "security_guard":             "tamper_detection",
-        "tamper_detection":           "dex_repackaging",
-        "dex_repackaging":            "native_methods_obfuscation",
-        "native_methods_obfuscation": "dex_sourcefile_strip",
+        "tamper_detection":           "dex_sourcefile_strip",
         "dex_sourcefile_strip":       "resource_normalisation",
         "resource_normalisation":     "metadata_stripping",
         "metadata_stripping":         "apk_size_optimizer",
@@ -11187,13 +11170,13 @@ class ManualControlEngine:
         "compliance_scan",         # 4.  scan for red flags before touching
         "red_flag_renamer",        # 5.  rename all red flags to safe words
         # ── Phase 2: Code Protection (all smali changes before rebuild) ───────
-        "obfuscation",             # 8.  obfuscate — all smali changes here
-        "safe_rename",             # 9.  rename after obfuscation settles
-        "encryption",              # 10. encode strings after all code changes
-        "security_guard",          # 11. integrate guard AFTER all smali settled
-        "tamper_detection",        # 12. embed hashes AFTER all smali settled
-        "dex_repackaging",         # 13. repackage DEX after all changes
-        "native_methods_obfuscation", # 14. native method handling (workspace)
+        "obfuscation",             # 8.  obfuscate — rename all smali first
+        "safe_rename",             # 9.  rename files/classes after obfuscation
+        "dex_repackaging",         # 10. move smali to classes2 + encrypt DEX in RAM
+        "encryption",              # 11. encrypt assets/lib after DEX repackaged
+        "native_methods_obfuscation", # 12. handle native signatures before guard
+        "security_guard",          # 13. inject guard AFTER all smali settled
+        "tamper_detection",        # 14. hash all smali LAST — nothing changes after
         # ── Phase 3: Resource & Metadata Cleanup ──────────────────────────────
         "dex_sourcefile_strip",    # 15. strip .source debug attributes (workspace)
         "resource_normalisation",  # 16. fix resources.arsc anomalies (workspace)
@@ -16342,11 +16325,11 @@ SBS_PHASES = [
         "steps": [
             "obfuscation",
             "safe_rename",
+            "dex_repackaging",
             "encryption",
+            "native_methods_obfuscation",
             "security_guard",
             "tamper_detection",
-            "dex_repackaging",
-            "native_methods_obfuscation",
         ],
     },
     {
