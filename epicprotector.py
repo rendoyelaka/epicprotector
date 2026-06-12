@@ -10864,7 +10864,7 @@ class ManifestEntryHardeningEngine:
         [12, 14, 19, 98, 99, 102, 127, 200, 255]
     Type 9 excluded — too close to DEFLATED, tools handle it.
 
-    Position in pipeline: after rebuild_apk, before pseudo_encryption.
+    Position in pipeline: after rebuild_apk, before integrity_manifest.
     Operates on the rebuilt APK file — not the workspace.
     """
 
@@ -10957,122 +10957,7 @@ class ManifestEntryHardeningEngine:
 
 
 # ── PSEUDO ENCRYPTION ENGINE ─────────────────────────────────────────────────
-class PseudoEncryptionEngine:
-    """
-    APK Timestamp Normaliser.
 
-    Rewrites the date_time field of every ZIP entry to a fixed
-    legitimate-looking build date (2019-01-01 00:00:00).
-
-    Why this is the right approach:
-      - ZIP encryption flag (bit 0) is a direct GPP hard trigger — removed.
-      - DEX SHA-1 header patching corrupts the DEX on Android <= 9 — removed.
-      - Timestamp normalisation is what legitimate build tools (Gradle, AAPT2)
-        do — all entries get a reproducible build timestamp.
-      - Normalised timestamps reduce APK entropy variance, which lowers
-        heuristic risk scores on some scanner engines.
-      - Completely safe: no content is modified, only ZIP metadata.
-
-    Pipeline position: AFTER rebuild_apk, BEFORE sign_apk.
-    """
-
-    # Fixed build date — matches what legitimate Gradle release builds use
-    # (2019-01-01 00:00:00 is the standard reproducible-build epoch for Android)
-    NORMALISED_DATE = (2019, 1, 1, 0, 0, 0)
-
-    def apply(self, apk_path: str) -> dict:
-        """
-        Normalise all ZIP entry timestamps in the APK.
-        Returns result dict with status and entry count.
-        """
-        if not apk_path or not os.path.exists(apk_path):
-            return {
-                "status":      "❌ Timestamp normalisation failed — APK not found",
-                "zip_entries": 0,
-                "dex_patched": 0,
-            }
-
-        try:
-            entries_normalised = self._normalise_timestamps(apk_path)
-            return {
-                "status": (
-                    f"✅ APK timestamps normalised — "
-                    f"{entries_normalised} entries set to reproducible build date — "
-                    f"entropy reduced"
-                ),
-                "zip_entries": entries_normalised,
-                "dex_patched": 0,
-            }
-        except Exception as e:
-            return {
-                "status":      f"❌ Timestamp normalisation failed — {e}",
-                "zip_entries": 0,
-                "dex_patched": 0,
-            }
-
-    def _normalise_timestamps(self, apk_path: str) -> int:
-        """
-        Rewrite all ZIP entry timestamps to NORMALISED_DATE.
-        Reads the APK, rewrites entries with fixed date_time, replaces in-place.
-        No content is changed — only metadata.
-
-        Non-standard compression entries (e.g. AndroidManifest.xml after
-        manifest_entry_hardening) are copied as raw compressed bytes to
-        preserve the non-standard compression type and extra field intact.
-        """
-        import shutil, struct
-
-        tmp_path     = apk_path + ".ts_tmp"
-        entries_done = 0
-
-        # Standard compression types Python zipfile can decompress
-        SUPPORTED_COMPRESS = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
-
-        with zipfile.ZipFile(apk_path, 'r') as zin:
-            with zipfile.ZipFile(tmp_path, 'w',
-                                 compression=zipfile.ZIP_DEFLATED,
-                                 allowZip64=True) as zout:
-                for orig in zin.infolist():
-                    new_info               = zipfile.ZipInfo(
-                        filename  = orig.filename,
-                        date_time = self.NORMALISED_DATE,
-                    )
-                    new_info.compress_type  = orig.compress_type
-                    new_info.comment        = orig.comment
-                    new_info.extra          = orig.extra
-                    new_info.create_system  = orig.create_system
-                    new_info.create_version = orig.create_version
-                    # flag_bits deliberately NOT copied — keep clean
-                    new_info.flag_bits      = 0
-
-                    if orig.compress_type in SUPPORTED_COMPRESS:
-                        # Standard entry — decompress and rewrite normally
-                        data = zin.read(orig.filename)
-                        zout.writestr(new_info, data)
-                    else:
-                        # Non-standard compression (e.g. manifest_entry_hardening)
-                        # Read raw compressed bytes directly — do not decompress
-                        # Preserve compress_size so ZIP structure stays valid
-                        new_info.file_size    = orig.file_size
-                        new_info.compress_size = orig.compress_size
-                        new_info.CRC          = orig.CRC
-                        with zin.open(orig, 'r', pwd=None) as _ef:
-                            # _ef decompresses — use raw buffer instead
-                            pass
-                        # Read raw bytes from source APK at data offset
-                        with open(apk_path, 'rb') as _raw:
-                            _raw.seek(orig.header_offset)
-                            _lhdr = _raw.read(30)
-                            _fname_len  = struct.unpack_from('<H', _lhdr, 26)[0]
-                            _extra_len  = struct.unpack_from('<H', _lhdr, 28)[0]
-                            _raw.seek(orig.header_offset + 30 + _fname_len + _extra_len)
-                            raw_compressed = _raw.read(orig.compress_size)
-                        zout.writestr(new_info, raw_compressed)
-
-                    entries_done += 1
-
-        shutil.move(tmp_path, apk_path)
-        return entries_done
 
 
 # ── APK SIZE OPTIMIZER ────────────────────────────────────────────────────────
@@ -11176,7 +11061,6 @@ class ProtectionScoreEngine:
         "apk_size_optimizer":    2,
         "rebuild_apk":           3,
         "manifest_entry_hardening": 8, # ZIP header anti-analysis — tool blocking layer
-        "pseudo_encryption":     7,   # scanner confusion — ZIP flag + DEX marker
         "integrity_manifest":    5,
         "aes_key_management":    4,
         "keystore_generation":   5,
@@ -11248,7 +11132,6 @@ class ManualControlEngine:
         "apk_size_optimizer":         ["decode_workspace"],
         "rebuild_apk":                ["decode_workspace"],
         "manifest_entry_hardening":   ["rebuild_apk"],
-        "pseudo_encryption":          ["rebuild_apk"],
         "integrity_manifest":         ["rebuild_apk"],
         "certificate_aging":          ["rebuild_apk"],
         "keystore_generation":        ["rebuild_apk"],
@@ -11277,8 +11160,7 @@ class ManualControlEngine:
         "apk_size_optimizer":         "aes_key_management",
         "aes_key_management":         "rebuild_apk",
         "rebuild_apk":                "manifest_entry_hardening",
-        "manifest_entry_hardening":   "pseudo_encryption",
-        "pseudo_encryption":          "integrity_manifest",
+        "manifest_entry_hardening":   "integrity_manifest",
         "integrity_manifest":         "certificate_aging",
         "certificate_aging":          "unique_fingerprint",
         "keystore_generation":        "unique_fingerprint",
@@ -11312,8 +11194,7 @@ class ManualControlEngine:
         # ── Phase 4: Build ────────────────────────────────────────────────────
         "rebuild_apk",             # 20. rebuild — all changes baked in
         "manifest_entry_hardening", # 21. ZIP header protection — anti-analysis layer
-        "pseudo_encryption",       # 22. normalise ZIP timestamps + clear flags
-        "integrity_manifest",      # 23. hash final APK state — correct hashes
+        "integrity_manifest",      # 22. hash final APK state — correct hashes
         # ── Phase 5: Sign with Coherent Identity + GPP Lineage ───────────────
         # Path A — GPP optimised: certificate_aging → unique_fingerprint → signing_lineage
         # Path B — Standard:      keystore_generation → unique_fingerprint → zipalign → sign_apk
@@ -11343,7 +11224,6 @@ class ManualControlEngine:
         "apk_size_optimizer":   "📦 APK Size Optimizer",
         "rebuild_apk":          "🔨 Rebuild APK",
         "manifest_entry_hardening": "🛡️ Manifest Entry Hardening",
-        "pseudo_encryption":    "🎭 Pseudo Encryption",
         "integrity_manifest":   "🔗 Integrity Manifest",
         "aes_key_management":   "🔑 AES Key Management",
         "keystore_generation":  "🗝️ Keystore Generation",
@@ -11833,19 +11713,18 @@ class ManualControlEngine:
         Signing always happens — admin never receives unsigned APK.
 
         Path A — signing_lineage selected:
-          Adds: rebuild_apk, pseudo_encryption, certificate_aging,
+          Adds: rebuild_apk, certificate_aging,
                 unique_fingerprint, signing_lineage
           Does NOT add: zipalign, sign_apk — lineage handles these internally
 
         Path B — standard path (no signing_lineage):
-          Adds: rebuild_apk, pseudo_encryption, keystore_generation,
+          Adds: rebuild_apk, keystore_generation,
                 unique_fingerprint, zipalign, sign_apk
         """
         result = set(selected_ops)
 
         # Always mandatory — rebuild must always run
         result.add("rebuild_apk")
-        result.add("pseudo_encryption")
         result.add("unique_fingerprint")
         result.add("protection_score")
 
@@ -12256,7 +12135,7 @@ class ManualControlEngine:
 
             elif op_key == "manifest_entry_hardening":
                 # Operates on the rebuilt APK — must run after rebuild_apk
-                # before pseudo_encryption and signing steps
+                # before integrity_manifest and signing steps
                 meh_apk = os.path.join(work_dir, "rebuilt.apk")
                 if not os.path.exists(meh_apk):
                     for found in list(Path(work_dir).rglob("rebuilt.apk")):
@@ -12269,24 +12148,6 @@ class ManualControlEngine:
                 result["comp_type"]   = meh_result.get("comp_type")
                 result["extra_bytes"] = meh_result.get("extra_bytes", 0)
                 result["status"]      = meh_result.get("status", "❌ Manifest Entry Hardening failed")
-
-            elif op_key == "pseudo_encryption":
-                # Operates on the rebuilt APK — finds rebuilt.apk in work_dir
-                # or falls back to rebuilt_apk_override from pipeline runner.
-                # Must run AFTER rebuild_apk and BEFORE zipalign + sign_apk.
-                pe_apk = os.path.join(work_dir, "rebuilt.apk")
-                if not os.path.exists(pe_apk):
-                    # Search recursively
-                    for found in list(Path(work_dir).rglob("rebuilt.apk")):
-                        pe_apk = str(found)
-                        break
-                if not os.path.exists(pe_apk) and rebuilt_apk_override:
-                    pe_apk = rebuilt_apk_override
-                pe_engine = PseudoEncryptionEngine()
-                pe_result = pe_engine.apply(pe_apk)
-                result["zip_entries"] = pe_result.get("zip_entries", 0)
-                result["dex_patched"] = pe_result.get("dex_patched", 0)
-                result["status"]      = pe_result.get("status", "❌ Pseudo Encryption failed")
 
             elif op_key == "integrity_manifest":
                 guardian = IntegrityGuardian(work_dir)
@@ -16291,7 +16152,6 @@ SBS_PHASES = [
         "steps": [
             "rebuild_apk",
             "manifest_entry_hardening",
-            "pseudo_encryption",
             "integrity_manifest",
         ],
     },
@@ -16424,7 +16284,6 @@ async def button_handler(update, context):
             "strip_signature",
             "decode_workspace",
             "rebuild_apk",
-            "pseudo_encryption",
             "keystore_generation",
             "unique_fingerprint",
             "zipalign",
