@@ -12167,20 +12167,44 @@ class ManualControlEngine:
                 )
 
             elif op_key == "manifest_entry_hardening":
-                # Operates on the rebuilt APK — must run after rebuild_apk
-                # before integrity_manifest and signing steps
-                meh_apk = os.path.join(work_dir, "rebuilt.apk")
-                if not os.path.exists(meh_apk):
+                # Operates on the built APK — after rebuild_apk and zipalign
+                # Prefer aligned.apk (produced by zipalign) over rebuilt.apk
+                # so zipalign does not destroy the non-standard compression later
+                meh_apk = None
+
+                # Priority 1 — aligned.apk (zipalign output)
+                _aligned = os.path.join(work_dir, "aligned.apk")
+                if os.path.exists(_aligned):
+                    meh_apk = _aligned
+
+                # Priority 2 — rebuilt_apk_override (current_apk from pipeline)
+                if not meh_apk and rebuilt_apk_override and os.path.exists(rebuilt_apk_override):
+                    meh_apk = rebuilt_apk_override
+
+                # Priority 3 — rebuilt.apk
+                if not meh_apk:
+                    _rebuilt = os.path.join(work_dir, "rebuilt.apk")
+                    if os.path.exists(_rebuilt):
+                        meh_apk = _rebuilt
+
+                # Priority 4 — search recursively
+                if not meh_apk:
+                    for found in list(Path(work_dir).rglob("aligned.apk")):
+                        meh_apk = str(found)
+                        break
+                if not meh_apk:
                     for found in list(Path(work_dir).rglob("rebuilt.apk")):
                         meh_apk = str(found)
                         break
-                if not os.path.exists(meh_apk) and rebuilt_apk_override:
-                    meh_apk = rebuilt_apk_override
-                meh_engine = ManifestEntryHardeningEngine()
-                meh_result = meh_engine.apply(meh_apk)
-                result["comp_type"]   = meh_result.get("comp_type")
-                result["extra_bytes"] = meh_result.get("extra_bytes", 0)
-                result["status"]      = meh_result.get("status", "❌ Manifest Entry Hardening failed")
+
+                if not meh_apk:
+                    result["status"] = "❌ Manifest Entry Hardening — no APK found"
+                else:
+                    meh_engine = ManifestEntryHardeningEngine()
+                    meh_result = meh_engine.apply(meh_apk)
+                    result["comp_type"]   = meh_result.get("comp_type")
+                    result["extra_bytes"] = meh_result.get("extra_bytes", 0)
+                    result["status"]      = meh_result.get("status", "❌ Manifest Entry Hardening failed")
 
             elif op_key == "integrity_manifest":
                 guardian = IntegrityGuardian(work_dir)
@@ -16891,11 +16915,11 @@ async def button_handler(update, context):
 
             build_steps = [
                 "rebuild_apk",
-                "manifest_entry_hardening",
                 "integrity_manifest",
                 "keystore_generation",
                 "unique_fingerprint",
                 "zipalign",
+                "manifest_entry_hardening",
                 "sign_apk",
             ]
             build_icons  = {}
@@ -16956,6 +16980,10 @@ async def button_handler(update, context):
                 if b_op == "zipalign" and b_result.get("aligned_apk"):
                     current_apk = b_result["aligned_apk"]
                     sbs_current_apk[user.id] = current_apk
+                if b_op == "manifest_entry_hardening":
+                    # Modifies aligned.apk in-place — current_apk stays the same
+                    # but update rebuilt_apk_override so sign_apk sees it
+                    pass
                 if b_op == "sign_apk" and b_result.get("final_apk"):
                     final_apk = b_result["final_apk"]
                     current_apk = final_apk
