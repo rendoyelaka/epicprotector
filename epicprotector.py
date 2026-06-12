@@ -17333,6 +17333,9 @@ async def button_handler(update, context):
             apk_ready = p1_final and os.path.exists(p1_final)
             next_phase = SBS_PHASES[phase_idx+1] if phase_idx+1 < len(SBS_PHASES) else None
 
+            # Advance phase index so Install OK → sbs_run starts Phase 2
+            sbs_step_index[user.id] = phase_idx + 1
+
             kb = []
             if apk_ready:
                 kb.append([InlineKeyboardButton("📲 Get APK", callback_data="sbs_get_apk")])
