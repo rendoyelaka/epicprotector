@@ -51,8 +51,9 @@ if not os.path.exists(base_apk):
 
 # ── Step 1: Decode ────────────────────────────────────────────────────────────
 ws = os.path.join(WORK_DIR, "workspace")
-shutil.rmtree(ws, ignore_errors=True)
-r = run(["apktool", "d", base_apk, "-o", ws, "-f"])
+shutil.rmtree(WORK_DIR, ignore_errors=True)
+os.makedirs(WORK_DIR, exist_ok=True)
+r = run(["apktool", "d", base_apk, "-o", ws, "-f", "-r"])
 if not os.path.exists(ws):
     send_msg(f"❌ apktool decode failed: {r.stderr[:200]}")
     sys.exit(1)
@@ -146,7 +147,7 @@ send_msg(f"✅ Step 2 complete: {len(rename_map)} renamed | "
 
 # ── Step 3: Rebuild ───────────────────────────────────────────────────────────
 rebuilt = os.path.join(WORK_DIR, "rebuilt.apk")
-r = run(["apktool", "b", ws, "-o", rebuilt])
+r = run(["apktool", "b", ws, "-o", rebuilt, "-r"])
 if not os.path.exists(rebuilt):
     send_msg(f"❌ apktool rebuild failed: {r.stderr[:300]}")
     sys.exit(1)
