@@ -8110,12 +8110,15 @@ class Level6_Signer:
         apksigner = self._find_apksigner()
         out = os.path.join(self.work_dir, "EPIC_PROTECTED.apk")
 
-        # Remove existing output — apksigner refuses to overwrite on some versions
+        # Copy input to output path first — apksigner older versions sign in-place
+        # and ignore --out flag. Copying ensures EPIC_PROTECTED.apk always exists.
+        import shutil as _shutil
         if os.path.exists(out):
             try:
                 os.remove(out)
             except Exception:
                 pass
+        _shutil.copy2(inp, out)
 
         cmd = [
             apksigner, "sign",
@@ -8131,7 +8134,7 @@ class Level6_Signer:
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if r.returncode == 0 and os.path.exists(out):
-            logger.info(f"[Level6] apksigner ({apksigner}) — V1+V2+V3 signing complete.")
+            logger.info(f"[Level6] apksigner — V1+V2+V3 signing complete.")
             return out
         logger.warning(
             f"[Level6] apksigner failed (rc={r.returncode}) — "
