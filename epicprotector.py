@@ -11065,6 +11065,7 @@ class ProtectionScoreEngine:
         "strip_signature":       4,
         "decode_workspace":      3,
         "compliance_scan":       5,
+        "red_flag_renamer":      8,
         "safe_rename":           7,
         "obfuscation":           10,
         "security_guard":        10,
@@ -11133,6 +11134,7 @@ class ManualControlEngine:
     # Steps that require another step to have run first
     STEP_DEPENDENCIES = {
         "compliance_scan":            ["decode_workspace"],
+        "red_flag_renamer":           ["compliance_scan", "decode_workspace"],
         "safe_rename":                ["decode_workspace", "obfuscation"],
         "obfuscation":                ["decode_workspace"],
         "security_guard":             ["decode_workspace", "obfuscation", "encryption"],
@@ -11161,7 +11163,8 @@ class ManualControlEngine:
         "preflight_validation":       "strip_signature",
         "strip_signature":            "decode_workspace",
         "decode_workspace":           "compliance_scan",
-        "obfuscation":                "safe_rename",
+        "compliance_scan":            "red_flag_renamer",
+        "red_flag_renamer":           "obfuscation",
         "safe_rename":                "encryption",
         "encryption":                 "security_guard",
         "security_guard":             "tamper_detection",
@@ -11191,6 +11194,7 @@ class ManualControlEngine:
         "strip_signature",         # 2.  strip existing signature
         "decode_workspace",        # 3.  decode APK to workspace
         "compliance_scan",         # 4.  scan for red flags before touching
+        "red_flag_renamer",        # 5.  rename all red flags to safe words
         # ── Phase 2: Code Protection (all smali changes before rebuild) ───────
         "obfuscation",             # 8.  obfuscate — all smali changes here
         "safe_rename",             # 9.  rename after obfuscation settles
@@ -11228,6 +11232,7 @@ class ManualControlEngine:
         "strip_signature":      "🧹 Strip Signature",
         "decode_workspace":     "📂 Decode → Workspace",
         "compliance_scan":      "🔍 Compliance Scan",
+        "red_flag_renamer":     "🚩 Red Flag Renamer",
         "safe_rename":          "✏️ Safe Rename",
         "obfuscation":          "🔀 Obfuscation",
         "security_guard":       "🛡️ Security Guard",
@@ -11852,13 +11857,32 @@ class ManualControlEngine:
                 result["status"]    = "✅ APK decoded to workspace"
 
             elif op_key == "compliance_scan":
-                # scan_workspace returns a flat list of finding dicts
                 findings = compliance_scanner.scan_workspace(workspace)
                 total    = len(findings) if isinstance(findings, list) else 0
-                result["findings"] = total
-                result["status"]   = f"✅ Scan complete — {total} findings"
+                result["findings"]      = total
+                result["findings_list"] = findings if isinstance(findings, list) else []
+                result["status"]        = f"✅ Scan complete — {total} findings"
 
-            elif op_key == "safe_rename":
+            elif op_key == "red_flag_renamer":
+                # Get findings from compliance_scan result in this session
+                findings_list = []
+                for prev in reversed(step_results if 'step_results' in dir() else []):
+                    if prev.get("op") == "compliance_scan":
+                        findings_list = prev.get("findings_list", [])
+                        break
+                # Also check completed_ops context
+                if not findings_list and hasattr(compliance_scanner, "findings"):
+                    findings_list = compliance_scanner.findings or []
+                # Re-scan if no findings cached
+                if not findings_list and workspace and os.path.exists(workspace):
+                    findings_list = compliance_scanner.scan_workspace(workspace)
+
+                rfr = RedFlagRenamerEngine()
+                rfr_result = rfr.apply(workspace, findings_list, compliance_scanner)
+                result["words_fixed"]   = rfr_result.get("words_fixed", 0)
+                result["files_fixed"]   = rfr_result.get("files_fixed", 0)
+                result["paths_renamed"] = rfr_result.get("paths_renamed", 0)
+                result["status"]        = rfr_result.get("status", "❌ Red Flag Renamer failed")
                 renamer = SafeRenameEngine(work_dir)
                 r = renamer.apply(workspace)
                 result["renamed_classes"] = r["renamed_classes"]
@@ -12634,6 +12658,159 @@ class ManualControlEngine:
 
         return "\n".join(lines)
 
+
+
+# ── RED FLAG RENAMER ENGINE ───────────────────────────────────────────────────
+class RedFlagRenamerEngine:
+    """
+    Reference-aware red flag word renamer.
+
+    Takes compliance scan findings and renames every banned word
+    to its safe legitimate replacement — everywhere it appears:
+      - smali class names, method names, string values, comments
+      - res/values/strings.xml and all res XML files
+      - AndroidManifest.xml (decoded plain XML)
+      - File names and folder names in workspace
+
+    Reference-aware: when a word is renamed in a declaration,
+    all references to it across ALL files are renamed too.
+    This prevents crashes from broken references.
+
+    resources.arsc and .so files are NOT touched — binary only.
+    """
+
+    # File extensions to scan for text replacement
+    TEXT_EXTENSIONS = {
+        ".smali", ".xml", ".txt", ".json", ".properties", ".gradle",
+        ".mf", ".sf", ".rsa", ".dsa", ".ec",
+    }
+
+    def apply(self, workspace_dir: str,
+              findings: list,
+              scanner: "ComplianceScannerEngine") -> dict:
+        """
+        Rename all red flag words to safe replacements across workspace.
+        Returns summary dict with counts and before/after log.
+        """
+        if not findings:
+            return {
+                "status":       "✅ Red Flag Renamer — no findings to fix",
+                "words_fixed":  0,
+                "files_fixed":  0,
+                "renames":      [],
+            }
+
+        # Build word → safe replacement map from findings
+        replace_map = {}
+        for f in findings:
+            word       = f.get("word", "").lower()
+            suggestion = f.get("suggestion", "") or scanner._get_suggestion(word)
+            if word and suggestion and word != suggestion.lower():
+                replace_map[word] = suggestion
+
+        if not replace_map:
+            return {
+                "status":       "✅ Red Flag Renamer — no replacements needed",
+                "words_fixed":  0,
+                "files_fixed":  0,
+                "renames":      [],
+            }
+
+        workspace_path = Path(workspace_dir)
+        files_fixed    = 0
+        total_replaced = 0
+        rename_log     = []
+
+        # ── Step 1: Replace inside all text files ────────────────────────────
+        for fp in workspace_path.rglob("*"):
+            if not fp.is_file():
+                continue
+            if fp.suffix.lower() not in self.TEXT_EXTENSIONS:
+                continue
+            # Skip binary compiled files
+            if fp.name in ("resources.arsc",):
+                continue
+
+            try:
+                content = fp.read_text(encoding="utf-8", errors="ignore")
+                original = content
+                file_count = 0
+
+                for word, safe in replace_map.items():
+                    # Replace all case variants
+                    for w, s in [
+                        (word,              safe),
+                        (word.capitalize(), safe.capitalize()),
+                        (word.upper(),      safe.upper()),
+                    ]:
+                        if w in content:
+                            count = content.count(w)
+                            content = content.replace(w, s)
+                            file_count += count
+
+                if content != original:
+                    fp.write_text(content, encoding="utf-8")
+                    files_fixed    += 1
+                    total_replaced += file_count
+                    rename_log.append({
+                        "file":  str(fp.relative_to(workspace_path)),
+                        "count": file_count,
+                    })
+                    logger.info(
+                        f"[RedFlagRenamer] {file_count} replacements in "
+                        f"{fp.relative_to(workspace_path)}")
+
+            except Exception as e:
+                logger.warning(f"[RedFlagRenamer] Skipped {fp.name}: {e}")
+
+        # ── Step 2: Rename files and folders with banned names ────────────────
+        # Collect all items sorted deepest-first to rename children before parents
+        renamed_paths = 0
+        all_items = sorted(
+            workspace_path.rglob("*"),
+            key=lambda p: len(p.parts),
+            reverse=True
+        )
+        for item in all_items:
+            old_name = item.name
+            new_name = old_name
+            for word, safe in replace_map.items():
+                for w, s in [
+                    (word,              safe),
+                    (word.capitalize(), safe.capitalize()),
+                    (word.upper(),      safe.upper()),
+                ]:
+                    if w in new_name:
+                        new_name = new_name.replace(w, s)
+
+            if new_name != old_name and item.exists():
+                try:
+                    new_path = item.parent / new_name
+                    item.rename(new_path)
+                    renamed_paths += 1
+                    logger.info(
+                        f"[RedFlagRenamer] Renamed: {old_name} → {new_name}")
+                except Exception as e:
+                    logger.warning(
+                        f"[RedFlagRenamer] Could not rename {old_name}: {e}")
+
+        words_list = ", ".join(
+            f"{w}→{s}" for w, s in list(replace_map.items())[:8])
+        if len(replace_map) > 8:
+            words_list += f" (+{len(replace_map)-8} more)"
+
+        return {
+            "status": (
+                f"✅ Red Flag Renamer — "
+                f"{total_replaced} replacements in {files_fixed} files, "
+                f"{renamed_paths} paths renamed | "
+                f"{words_list}"
+            ),
+            "words_fixed":  len(replace_map),
+            "files_fixed":  files_fixed,
+            "paths_renamed": renamed_paths,
+            "renames":      rename_log,
+        }
 
 
 class ComplianceScannerEngine:
@@ -16164,6 +16341,7 @@ SBS_PHASES = [
             "strip_signature",
             "decode_workspace",
             "compliance_scan",
+            "red_flag_renamer",
         ],
     },
     {
@@ -17501,6 +17679,31 @@ async def button_handler(update, context):
             lines.append(f"{icon} {lbl}")
             if "❌" in st:
                 lines.append(f"   _{st[:80]}_")
+
+            # Show compliance scan findings grouped by severity
+            if op == "compliance_scan" and r.get("findings_list"):
+                fl = r["findings_list"]
+                critical = [f for f in fl if f.get("severity") == "critical"]
+                warning  = [f for f in fl if f.get("severity") == "warning"]
+                advisory = [f for f in fl if f.get("severity") == "advisory"]
+                lines.append(f"━━━━━━━━━━━━━━━━━━━━━")
+                lines.append(f"🔴 Critical: {len(critical)}  🟡 Warning: {len(warning)}  🟢 Advisory: {len(advisory)}")
+                if critical:
+                    lines.append("🔴 *Critical findings:*")
+                    for f in critical[:10]:
+                        lines.append(f"  • `{f.get('word','')}` — {f.get('location','')[:60]}")
+                    if len(critical) > 10:
+                        lines.append(f"  _...and {len(critical)-10} more_")
+                if warning:
+                    lines.append("🟡 *Warnings:*")
+                    for f in warning[:8]:
+                        lines.append(f"  • `{f.get('word','')}` — {f.get('location','')[:60]}")
+                    if len(warning) > 8:
+                        lines.append(f"  _...and {len(warning)-8} more_")
+                lines.append(f"━━━━━━━━━━━━━━━━━━━━━")
+
+            if op == "red_flag_renamer" and r.get("words_fixed", 0) > 0:
+                lines.append(f"  🚩→✅ {r.get('words_fixed',0)} word types renamed in {r.get('files_fixed',0)} files, {r.get('paths_renamed',0)} paths")
 
         lines += [
             "━━━━━━━━━━━━━━━━━━━━━",
