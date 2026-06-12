@@ -17114,7 +17114,7 @@ async def button_handler(update, context):
 
             result["op"] = op_key
             step_results.append(result)
-            step_ok = "❌" not in result.get("status", "")
+            step_ok = not result.get("status", "").startswith("❌")
             if step_ok:
                 done_steps.add(op_key)
             sbs_done_steps[user.id]   = done_steps
