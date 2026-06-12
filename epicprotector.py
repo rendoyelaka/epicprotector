@@ -8102,20 +8102,27 @@ class Level6_Signer:
 
     def _sign_with_apksigner(self, inp) -> str:
         """
-        Sign using apksigner.
+        Sign using apksigner with V1+V2+V3 schemes.
         apksigner must receive an already zipaligned APK.
         Correct order for this path: zipalign → apksigner
         Returns path to signed APK or None if apksigner failed.
         """
         apksigner = self._find_apksigner()
         out = os.path.join(self.work_dir, "EPIC_PROTECTED.apk")
+
+        # Remove existing output — apksigner refuses to overwrite on some versions
+        if os.path.exists(out):
+            try:
+                os.remove(out)
+            except Exception:
+                pass
+
         cmd = [
             apksigner, "sign",
             "--ks",            self.keystore,
             "--ks-key-alias",  self.alias,
             "--ks-pass",       f"pass:{self.sp}",
             "--key-pass",      f"pass:{self.kp}",
-            "--min-sdk-version", "26",
             "--v1-signing-enabled", "true",
             "--v2-signing-enabled", "true",
             "--v3-signing-enabled", "true",
@@ -8124,12 +8131,12 @@ class Level6_Signer:
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if r.returncode == 0 and os.path.exists(out):
-            logger.info(f"[Level6] apksigner ({apksigner}) — signing complete.")
+            logger.info(f"[Level6] apksigner ({apksigner}) — V1+V2+V3 signing complete.")
             return out
         logger.warning(
             f"[Level6] apksigner failed (rc={r.returncode}) — "
-            f"stdout: {r.stdout.strip()[:200]} "
-            f"stderr: {r.stderr.strip()[:200]} — trying jarsigner fallback.")
+            f"stdout: {r.stdout.strip()[:300]} "
+            f"stderr: {r.stderr.strip()[:300]} — trying jarsigner fallback.")
         return None
 
     def _sign_with_jarsigner(self, inp) -> str:
@@ -8154,8 +8161,10 @@ class Level6_Signer:
         env["EPIC_STORE_PASS"] = self.sp
         env["EPIC_KEY_PASS"]   = self.kp
 
-        # Detect storetype from keystore file extension
-        ks_storetype = "PKCS12" if self.keystore.endswith(".keystore") else "JKS"
+        # Detect storetype — .keystore extension = JKS (keytool default)
+        # .p12 or .pfx extension = PKCS12
+        ks_ext = self.keystore.lower()
+        ks_storetype = "PKCS12" if (ks_ext.endswith(".p12") or ks_ext.endswith(".pfx")) else "JKS"
 
         cmd_env = [
             "jarsigner",
@@ -14558,7 +14567,6 @@ class SigningLineageEngine:
             "--ks-key-alias",     child_meta["alias"],
             "--ks-pass",          f"pass:{child_meta['ks_pass']}",
             "--key-pass",         f"pass:{child_meta['key_pass']}",
-            "--min-sdk-version",  "26",
             "--v1-signing-enabled", "true",
             "--v2-signing-enabled", "true",
             "--v3-signing-enabled", "true",
