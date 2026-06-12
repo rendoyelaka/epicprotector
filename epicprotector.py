@@ -8998,6 +8998,239 @@ class IntegrityGuardian:
 
 
 # ── SMALI TREE BROWSER ───────────────────────────────────────────────────────
+# ── MANIFEST COMPONENT RENAMER ENGINE ────────────────────────────────────────
+class ManifestComponentRenamerEngine:
+    """
+    Renames Activity, Service, Receiver, Provider component class names
+    in both decoded AndroidManifest.xml AND all smali files simultaneously.
+
+    Must run BEFORE any smali obfuscation steps so all references stay
+    consistent. If smali obfuscation runs first and renames a class,
+    the manifest still holds the old name — app crashes on launch.
+
+    What it renames:
+      - All Activity class names → safe meaningless names
+      - All Service class names → safe meaningless names
+      - All BroadcastReceiver class names → safe meaningless names
+      - All ContentProvider authorities/names → safe meaningless names
+      - Application android:name → if custom Application subclass
+
+    What it NEVER renames:
+      - Package name (android:package) — app identity
+      - System-defined intent actions (android.intent.action.*)
+      - Permission strings
+      - Provider authorities that are referenced in code via strings
+      - MainActivity if it is the LAUNCHER activity (keeps one entry point)
+
+    How it works:
+      1. Parse decoded AndroidManifest.xml (plain XML — apktool decoded)
+      2. Extract all component class names
+      3. Generate safe replacement names (e.g. com.pkg.a1, com.pkg.b2)
+      4. Replace in AndroidManifest.xml
+      5. Replace all occurrences in every smali file (class declaration + all references)
+      6. Rename smali files on disk to match new class names
+    """
+
+    # Safe name templates — look like legitimate internal classes
+    SAFE_PREFIXES = [
+        "CoreHandler", "BaseModule", "DataProcessor", "ServiceUnit",
+        "NetworkUnit", "StorageUnit", "SessionUnit", "BinderUnit",
+        "TaskUnit", "WorkerUnit", "ProviderUnit", "ReceiverUnit",
+    ]
+
+    def _safe_name(self, pkg: str, index: int, component_type: str) -> str:
+        """Generate a safe looking class name."""
+        import random
+        suffix = f"{index:03d}"
+        base   = self.SAFE_PREFIXES[index % len(self.SAFE_PREFIXES)]
+        return f"{pkg}.{base}{suffix}"
+
+    def _to_smali_path(self, class_name: str) -> str:
+        """Convert com.pkg.ClassName to com/pkg/ClassName."""
+        return class_name.replace(".", "/")
+
+    def _to_class_ref(self, class_name: str) -> str:
+        """Convert com.pkg.ClassName to Lcom/pkg/ClassName;"""
+        return "L" + class_name.replace(".", "/") + ";"
+
+    def apply(self, workspace_dir: str) -> dict:
+        """
+        Rename all component class names in manifest + smali.
+        Returns summary dict.
+        """
+        import xml.etree.ElementTree as ET
+        import re
+
+        workspace  = Path(workspace_dir)
+        manifest_path = workspace / "AndroidManifest.xml"
+
+        if not manifest_path.exists():
+            return {
+                "status":   "❌ AndroidManifest.xml not found in workspace",
+                "renamed":  0,
+                "skipped":  0,
+                "rename_map": {},
+            }
+
+        try:
+            tree = ET.parse(str(manifest_path))
+            root = tree.getroot()
+        except Exception as e:
+            return {
+                "status":   f"❌ Manifest parse failed: {e}",
+                "renamed":  0,
+                "skipped":  0,
+                "rename_map": {},
+            }
+
+        # Get package name
+        pkg = root.get("package", "")
+        if not pkg:
+            return {
+                "status":   "❌ Package name not found in manifest",
+                "renamed":  0,
+                "skipped":  0,
+                "rename_map": {},
+            }
+
+        ns = "http://schemas.android.com/apk/res/android"
+
+        # Find the LAUNCHER activity — never rename it
+        launcher_activities = set()
+        for activity in root.iter("activity"):
+            for intent_filter in activity.iter("intent-filter"):
+                for category in intent_filter.iter("category"):
+                    if category.get(f"{{{ns}}}name") == "android.intent.category.LAUNCHER":
+                        name = activity.get(f"{{{ns}}}name", "")
+                        if name:
+                            launcher_activities.add(name)
+
+        # Collect all component class names
+        components = {}  # old_name -> element_tag
+        component_tags = ["activity", "service", "receiver", "provider"]
+        for tag in component_tags:
+            for elem in root.iter(tag):
+                name = elem.get(f"{{{ns}}}name", "")
+                if not name:
+                    continue
+                # Expand relative names
+                if name.startswith("."):
+                    name = pkg + name
+                # Only rename app-owned classes — not system/androidx classes
+                if not name.startswith(pkg):
+                    continue
+                # Never rename launcher activity
+                if name in launcher_activities:
+                    logger.info(
+                        f"[ManifestComponentRenamer] Skipping launcher: {name}")
+                    continue
+                components[name] = tag
+
+        if not components:
+            return {
+                "status":   "✅ Manifest Component Renamer — no renameable components found",
+                "renamed":  0,
+                "skipped":  len(launcher_activities),
+                "rename_map": {},
+            }
+
+        # Build rename map
+        rename_map = {}
+        for idx, old_name in enumerate(sorted(components.keys())):
+            new_name = self._safe_name(pkg, idx, components[old_name])
+            rename_map[old_name] = new_name
+            logger.info(
+                f"[ManifestComponentRenamer] {old_name} → {new_name}")
+
+        # ── Step 1: Update AndroidManifest.xml ───────────────────────────
+        manifest_content = manifest_path.read_text(encoding="utf-8",
+                                                    errors="ignore")
+        original_manifest = manifest_content
+
+        for old_name, new_name in rename_map.items():
+            # Replace full name
+            manifest_content = manifest_content.replace(old_name, new_name)
+            # Replace relative short name .ClassName
+            short = old_name.replace(pkg, "")
+            short_new = new_name.replace(pkg, "")
+            if short != old_name:
+                manifest_content = manifest_content.replace(
+                    f'"{short}"', f'"{short_new}"')
+
+        if manifest_content != original_manifest:
+            manifest_path.write_text(manifest_content, encoding="utf-8")
+            logger.info("[ManifestComponentRenamer] AndroidManifest.xml updated")
+
+        # ── Step 2: Update all smali files ───────────────────────────────
+        smali_files_updated = 0
+        smali_dirs = [workspace / "smali"]
+        for i in range(2, 10):
+            d = workspace / f"smali_classes{i}"
+            if d.exists():
+                smali_dirs.append(d)
+
+        # Build full replacement set — class refs + file path patterns
+        replacements = []
+        for old_name, new_name in rename_map.items():
+            old_ref = self._to_class_ref(old_name)
+            new_ref = self._to_class_ref(new_name)
+            old_path = self._to_smali_path(old_name)
+            new_path = self._to_smali_path(new_name)
+            replacements.append((old_ref,  new_ref))
+            replacements.append((old_name, new_name))
+            replacements.append((old_path, new_path))
+
+        for smali_dir in smali_dirs:
+            if not smali_dir.exists():
+                continue
+            for fp in smali_dir.rglob("*.smali"):
+                try:
+                    content = fp.read_text(encoding="utf-8", errors="ignore")
+                    original = content
+                    for old, new in replacements:
+                        if old in content:
+                            content = content.replace(old, new)
+                    if content != original:
+                        fp.write_text(content, encoding="utf-8")
+                        smali_files_updated += 1
+                except Exception as e:
+                    logger.warning(
+                        f"[ManifestComponentRenamer] Smali update failed "
+                        f"{fp.name}: {e}")
+
+        # ── Step 3: Rename smali files on disk ───────────────────────────
+        files_renamed = 0
+        for old_name, new_name in rename_map.items():
+            old_rel = self._to_smali_path(old_name)
+            new_rel = self._to_smali_path(new_name)
+            for smali_dir in smali_dirs:
+                old_file = smali_dir / (old_rel.split("/")[-1] + ".smali")
+                new_file = smali_dir / (new_rel.split("/")[-1] + ".smali")
+                if old_file.exists() and not new_file.exists():
+                    try:
+                        old_file.rename(new_file)
+                        files_renamed += 1
+                    except Exception as e:
+                        logger.warning(
+                            f"[ManifestComponentRenamer] File rename failed: {e}")
+
+        renamed_count = len(rename_map)
+        return {
+            "status": (
+                f"✅ Manifest Component Renamer — "
+                f"{renamed_count} components renamed | "
+                f"{len(launcher_activities)} launcher activities preserved | "
+                f"{smali_files_updated} smali files updated | "
+                f"{files_renamed} smali files renamed on disk"
+            ),
+            "renamed":    renamed_count,
+            "skipped":    len(launcher_activities),
+            "smali_files_updated": smali_files_updated,
+            "files_renamed": files_renamed,
+            "rename_map": rename_map,
+        }
+
+
 class SmaliTreeBrowser:
     """
     Builds and navigates the smali folder tree for manual file selection.
@@ -11040,6 +11273,7 @@ class ProtectionScoreEngine:
         "decode_workspace":      3,
         "compliance_scan":       5,
         "red_flag_renamer":      8,
+        "manifest_component_renamer": 9,
         "safe_rename":           7,
         "obfuscation":           10,
         "security_guard":        10,
@@ -11109,6 +11343,7 @@ class ManualControlEngine:
     STEP_DEPENDENCIES = {
         "compliance_scan":            ["decode_workspace"],
         "red_flag_renamer":           ["compliance_scan", "decode_workspace"],
+        "manifest_component_renamer": ["decode_workspace", "red_flag_renamer"],
         "obfuscation":                ["decode_workspace"],
         "safe_rename":                ["decode_workspace", "obfuscation"],
         "dex_repackaging":            ["decode_workspace", "safe_rename"],
@@ -11138,7 +11373,8 @@ class ManualControlEngine:
         "strip_signature":            "decode_workspace",
         "decode_workspace":           "compliance_scan",
         "compliance_scan":            "red_flag_renamer",
-        "red_flag_renamer":           "obfuscation",
+        "red_flag_renamer":           "manifest_component_renamer",
+        "manifest_component_renamer": "obfuscation",
         "safe_rename":                "dex_repackaging",
         "dex_repackaging":            "encryption",
         "encryption":                 "native_methods_obfuscation",
@@ -11169,6 +11405,7 @@ class ManualControlEngine:
         "decode_workspace",        # 3.  decode APK to workspace
         "compliance_scan",         # 4.  scan for red flags before touching
         "red_flag_renamer",        # 5.  rename all red flags to safe words
+        "manifest_component_renamer", # 6. rename component class names in manifest + smali
         # ── Phase 2: Code Protection (all smali changes before rebuild) ───────
         "obfuscation",             # 8.  obfuscate — rename all smali first
         "safe_rename",             # 9.  rename files/classes after obfuscation
@@ -11207,6 +11444,7 @@ class ManualControlEngine:
         "decode_workspace":     "📂 Decode → Workspace",
         "compliance_scan":      "🔍 Compliance Scan",
         "red_flag_renamer":     "🚩 Red Flag Renamer",
+        "manifest_component_renamer": "📋 Manifest Component Renamer",
         "safe_rename":          "✏️ Safe Rename",
         "obfuscation":          "🔀 Obfuscation",
         "security_guard":       "🛡️ Security Guard",
@@ -11863,7 +12101,14 @@ class ManualControlEngine:
                 result["renamed_methods"] = r["renamed_methods"]
                 result["status"]          = r["status"]
 
-            elif op_key == "obfuscation":
+            elif op_key == "manifest_component_renamer":
+                mcr        = ManifestComponentRenamerEngine()
+                mcr_result = mcr.apply(workspace)
+                result["renamed"]             = mcr_result.get("renamed", 0)
+                result["skipped"]             = mcr_result.get("skipped", 0)
+                result["smali_files_updated"] = mcr_result.get("smali_files_updated", 0)
+                result["rename_map"]          = mcr_result.get("rename_map", {})
+                result["status"]              = mcr_result.get("status", "❌ Manifest Component Renamer failed")
                 # ── FULL OBFUSCATION PIPELINE WITH ALL 7 CHILDREN ────────────
                 # Order is locked — children always run in correct sequence.
                 # Package name and permissions never touched.
@@ -16408,6 +16653,7 @@ SBS_PHASES = [
             "decode_workspace",
             "compliance_scan",
             "red_flag_renamer",
+            "manifest_component_renamer",
         ],
     },
     {
@@ -17848,6 +18094,9 @@ async def button_handler(update, context):
 
             if op == "red_flag_renamer" and r.get("words_fixed", 0) > 0:
                 lines.append(f"  🚩→✅ {r.get('words_fixed',0)} word types renamed in {r.get('files_fixed',0)} files, {r.get('paths_renamed',0)} paths")
+
+            if op == "manifest_component_renamer" and r.get("renamed", 0) > 0:
+                lines.append(f"  📋 {r.get('renamed',0)} components renamed | {r.get('smali_files_updated',0)} smali files updated")
 
         lines += [
             "━━━━━━━━━━━━━━━━━━━━━",
