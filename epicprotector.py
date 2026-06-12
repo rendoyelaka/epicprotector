@@ -8110,14 +8110,14 @@ class Level6_Signer:
         apksigner = self._find_apksigner()
         out = os.path.join(self.work_dir, "EPIC_PROTECTED.apk")
 
-        # Copy input to output path first — apksigner older versions sign in-place
-        # and ignore --out flag. Copying ensures EPIC_PROTECTED.apk always exists.
         import shutil as _shutil
         if os.path.exists(out):
             try:
                 os.remove(out)
             except Exception:
                 pass
+        # Copy inp to out — old apksigner signs in-place ignoring --out
+        # New apksigner writes to --out — both cases covered
         _shutil.copy2(inp, out)
 
         cmd = [
@@ -8130,7 +8130,7 @@ class Level6_Signer:
             "--v2-signing-enabled", "true",
             "--v3-signing-enabled", "true",
             "--out",           out,
-            inp,
+            out,  # sign the copy — old versions sign in-place on this
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if r.returncode == 0 and os.path.exists(out):
@@ -8250,43 +8250,21 @@ class Level6_Signer:
 
         Returns dict with output APK path and identity report.
         """
-        # ── Step 0 — Strip existing signature + normalise compression ────────
+        # ── Step 0 — Strip existing signature ────────────────────────────────
         stripper     = SignatureStripper()
+        strip_report = stripper.detect(inp)
 
-        # Validate inp is a real ZIP before calling strip()
-        if not inp or not os.path.exists(inp):
-            raise RuntimeError(
-                f"Sign APK: input file not found: {inp}"
-            )
-        try:
-            with zipfile.ZipFile(inp, 'r') as _zv:
-                _zv.namelist()
-        except zipfile.BadZipFile as _bze:
-            raise RuntimeError(
-                f"Signature strip failed: Bad magic number for file header — "
-                f"APK file is not a valid ZIP: {inp} — "
-                f"ensure rebuild_apk completed successfully before sign_apk"
-            )
-        except Exception as _zve:
-            raise RuntimeError(
-                f"Signature strip failed: {_zve} — APK: {inp}"
-            )
-
-        # Always normalise — strip() fixes classes.dex compression to STORED
-        # which apksigner requires. Must run even when no signatures found because
-        # apktool rebuild produces classes.dex as DEFLATED — apksigner rejects this.
-        stripped_apk = inp.replace(".apk", "_stripped.apk")
-        if stripped_apk == inp:
-            stripped_apk = inp + "_stripped.apk"
-        strip_result = stripper.strip(inp, stripped_apk)
-        if strip_result.get("stripped_files"):
+        if strip_report["total_found"] > 0:
+            stripped_apk = inp.replace(".apk", "_stripped.apk")
+            if stripped_apk == inp:
+                stripped_apk = inp + "_stripped.apk"
+            strip_result = stripper.strip(inp, stripped_apk)
             logger.info(
                 f"[Level6] Stripped {len(strip_result['stripped_files'])} "
                 f"signature artifacts.")
-        logger.info(
-            f"[Level6] Compression normalised — classes.dex forced STORED — "
-            f"ready for apksigner.")
-        inp = stripped_apk
+            inp = stripped_apk
+        else:
+            strip_result = {"stripped_files": [], "files_kept": 0}
 
         # ── Step 1 — Use pre-loaded identity or generate fresh one ───────────
         # If sign_apk step pre-loaded _identity from keystore_ctx (keystore_generation
