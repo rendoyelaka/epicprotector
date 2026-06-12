@@ -12122,9 +12122,8 @@ class ManualControlEngine:
                 result["smali_files_updated"] = mcr_result.get("smali_files_updated", 0)
                 result["rename_map"]          = mcr_result.get("rename_map", {})
                 result["status"]              = mcr_result.get("status", "❌ Manifest Component Renamer failed")
-                # ── FULL OBFUSCATION PIPELINE WITH ALL 7 CHILDREN ────────────
-                # Order is locked — children always run in correct sequence.
-                # Package name and permissions never touched.
+
+            elif op_key == "obfuscation":
 
                 obf_report_lines = ["🔀 *Obfuscation Pipeline*\n",
                                     "━━━━━━━━━━━━━━━━━━━━━"]
