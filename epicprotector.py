@@ -9062,10 +9062,83 @@ class ManifestComponentRenamerEngine:
 
     def _safe_name(self, pkg: str, index: int, component_type: str) -> str:
         """Generate a safe looking class name."""
-        import random
         suffix = f"{index:03d}"
         base   = self.SAFE_PREFIXES[index % len(self.SAFE_PREFIXES)]
         return f"{pkg}.{base}{suffix}"
+
+    def patch_binary_manifest(self, apk_path: str, rename_map: dict) -> bool:
+        """
+        Directly patch component class names in the binary AXML manifest
+        inside the APK ZIP. Works without apktool — replaces UTF-8 encoded
+        class name bytes directly in the binary string pool.
+
+        Same-length constraint: new name is padded with dots or truncated
+        to match old name byte length — preserves all binary offsets exactly.
+
+        Returns True if any replacements were made.
+        """
+        if not rename_map or not os.path.exists(apk_path):
+            return False
+
+        try:
+            # Read current manifest from APK
+            with zipfile.ZipFile(apk_path, 'r') as zf:
+                if 'AndroidManifest.xml' not in zf.namelist():
+                    return False
+                manifest_data = zf.read('AndroidManifest.xml')
+
+            # Verify binary AXML format
+            if len(manifest_data) < 8 or manifest_data[:2] != bytes([0x03, 0x00]):
+                logger.warning("[ManifestComponentRenamer] Not binary AXML — skipping binary patch")
+                return False
+
+            patched = bytearray(manifest_data)
+            replacements = 0
+
+            for old_name, new_name in rename_map.items():
+                old_bytes = old_name.encode('utf-8')
+                new_bytes = new_name.encode('utf-8')
+
+                if old_bytes not in patched:
+                    logger.warning(f"[ManifestComponentRenamer] Binary: not found: {old_name}")
+                    continue
+
+                # Pad new name with dots to match old length (dots are valid in pkg names)
+                # OR truncate — same byte length required to preserve all AXML offsets
+                if len(new_bytes) < len(old_bytes):
+                    new_bytes = new_bytes + b'.' * (len(old_bytes) - len(new_bytes))
+                elif len(new_bytes) > len(old_bytes):
+                    new_bytes = new_bytes[:len(old_bytes)]
+
+                count = patched.count(old_bytes)
+                patched = patched.replace(old_bytes, new_bytes)
+                replacements += count
+                logger.info(
+                    f"[ManifestComponentRenamer] Binary: {old_name} → {new_name} "
+                    f"({count} occurrences)")
+
+            if replacements == 0:
+                return False
+
+            # Write patched manifest back into APK
+            tmp_apk = apk_path + ".manifest_patch.tmp"
+            with zipfile.ZipFile(apk_path, 'r') as src:
+                with zipfile.ZipFile(tmp_apk, 'w') as dst:
+                    for item in src.infolist():
+                        if item.filename == 'AndroidManifest.xml':
+                            dst.writestr(item, bytes(patched))
+                        else:
+                            dst.writestr(item, src.read(item.filename))
+
+            os.replace(tmp_apk, apk_path)
+            logger.info(
+                f"[ManifestComponentRenamer] Binary patch complete — "
+                f"{replacements} replacements in APK manifest")
+            return True
+
+        except Exception as e:
+            logger.warning(f"[ManifestComponentRenamer] Binary patch failed: {e}")
+            return False
 
     def _to_smali_path(self, class_name: str) -> str:
         """Convert com.pkg.ClassName to com/pkg/ClassName."""
@@ -12176,6 +12249,16 @@ class ManualControlEngine:
                 result["smali_files_updated"] = mcr_result.get("smali_files_updated", 0)
                 result["rename_map"]          = mcr_result.get("rename_map", {})
                 result["status"]              = mcr_result.get("status", "❌ Manifest Component Renamer failed")
+                # ── Save rename map for binary APK patching ───────────────────
+                _rename_map = mcr_result.get("rename_map", {})
+                if _rename_map and work_dir:
+                    try:
+                        _mcr_map_path = os.path.join(work_dir, "mcr_rename_map.json")
+                        with open(_mcr_map_path, "w", encoding="utf-8") as _mf:
+                            json.dump(_rename_map, _mf, indent=2)
+                        result["mcr_rename_map_path"] = _mcr_map_path
+                    except Exception:
+                        pass
                 # ── Mark manifest as modified so rebuild uses full apktool ────
                 if mcr_result.get("renamed", 0) > 0 and workspace:
                     try:
@@ -17816,6 +17899,29 @@ async def button_handler(update, context):
                 if b_op == "sign_apk" and br.get("final_apk"):
                     p1_final = br["final_apk"]
                     sbs_current_apk[user.id] = p1_final
+
+            # ── Binary manifest patch on final signed APK ─────────────────────
+            # Patches component class names directly in the binary AXML manifest
+            # inside the signed APK — works even when apktool rebuild fails
+            if p1_final and os.path.exists(p1_final):
+                mcr_map_path = os.path.join(work_dir, "mcr_rename_map.json")
+                if os.path.exists(mcr_map_path):
+                    try:
+                        with open(mcr_map_path, "r", encoding="utf-8") as _mf:
+                            mcr_rename_map = json.load(_mf)
+                        if mcr_rename_map:
+                            mcr_patcher = ManifestComponentRenamerEngine()
+                            patched_ok  = mcr_patcher.patch_binary_manifest(
+                                p1_final, mcr_rename_map)
+                            if patched_ok:
+                                logger.info(
+                                    "[Phase1] Binary manifest patch applied to "
+                                    f"signed APK — {len(mcr_rename_map)} components")
+                                p1_icons["binary_manifest_patch"] = "✅"
+                            else:
+                                logger.warning("[Phase1] Binary manifest patch — no changes made")
+                    except Exception as _pe:
+                        logger.warning(f"[Phase1] Binary manifest patch failed: {_pe}")
 
             build_summary = "\n".join([
                 f"{p1_icons.get(b,'⬜')} {engine.STEP_LABELS.get(b,b)}"
