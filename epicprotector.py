@@ -9066,14 +9066,45 @@ class ManifestComponentRenamerEngine:
         base   = self.SAFE_PREFIXES[index % len(self.SAFE_PREFIXES)]
         return f"{pkg}.{base}{suffix}"
 
+    def _make_same_length_name(self, old_name: str) -> str:
+        """
+        Generate a safe professional-looking class name that is
+        EXACTLY the same byte length as old_name.
+        Required for binary AXML manifest patching — length prefix
+        bytes in the string pool must not change.
+        """
+        import random as _rnd
+        _rnd.seed(hash(old_name) & 0xFFFFFF)
+        pkg       = old_name.rsplit(".", 1)[0]
+        old_len   = len(old_name.encode("utf-8"))
+        PREFIXES  = ["Core","Base","Data","Net","Sys","App","Sec","Lib","Svc","Sdk"]
+        SUFFIXES  = ["Unit","Module","Handler","Manager","Service",
+                     "Helper","Engine","Worker","Agent","Bridge"]
+        idx       = abs(hash(old_name)) % len(PREFIXES)
+        base      = f"{pkg}.{PREFIXES[idx]}{SUFFIXES[idx]}"
+        base_len  = len(base.encode("utf-8"))
+        if base_len < old_len:
+            fill = "".join(_rnd.choices("abcdefghijklmnopqrstuvwxyz",
+                                        k=old_len - base_len))
+            new = base + fill
+        elif base_len > old_len:
+            new = base[:old_len]
+        else:
+            new = base
+        # Guarantee same length
+        assert len(new.encode("utf-8")) == old_len
+        return new
+
     def patch_binary_manifest(self, apk_path: str, rename_map: dict) -> bool:
         """
         Directly patch component class names in the binary AXML manifest
         inside the APK ZIP. Works without apktool — replaces UTF-8 encoded
         class name bytes directly in the binary string pool.
 
-        Same-length constraint: new name is padded with dots or truncated
-        to match old name byte length — preserves all binary offsets exactly.
+        CRITICAL: new name MUST be same byte length as old name.
+        The AXML string pool uses absolute byte offsets — any length
+        change corrupts all subsequent string references and crashes the app.
+        _make_same_length_name() guarantees exact length match.
 
         Returns True if any replacements were made.
         """
@@ -9083,49 +9114,53 @@ class ManifestComponentRenamerEngine:
         try:
             # Read current manifest from APK
             with zipfile.ZipFile(apk_path, 'r') as zf:
-                if 'AndroidManifest.xml' not in zf.namelist():
+                if "AndroidManifest.xml" not in zf.namelist():
                     return False
-                manifest_data = zf.read('AndroidManifest.xml')
+                manifest_data = zf.read("AndroidManifest.xml")
 
             # Verify binary AXML format
             if len(manifest_data) < 8 or manifest_data[:2] != bytes([0x03, 0x00]):
-                logger.warning("[ManifestComponentRenamer] Not binary AXML — skipping binary patch")
+                logger.warning(
+                    "[ManifestComponentRenamer] Not binary AXML — "
+                    "skipping binary patch")
                 return False
 
-            patched = bytearray(manifest_data)
+            patched      = bytearray(manifest_data)
             replacements = 0
 
-            for old_name, new_name in rename_map.items():
-                old_bytes = old_name.encode('utf-8')
-                new_bytes = new_name.encode('utf-8')
-
+            for old_name in rename_map.keys():
+                old_bytes = old_name.encode("utf-8")
                 if old_bytes not in patched:
-                    logger.warning(f"[ManifestComponentRenamer] Binary: not found: {old_name}")
+                    logger.warning(
+                        f"[ManifestComponentRenamer] Binary: "
+                        f"not found: {old_name}")
                     continue
 
-                # Pad new name with dots to match old length (dots are valid in pkg names)
-                # OR truncate — same byte length required to preserve all AXML offsets
-                if len(new_bytes) < len(old_bytes):
-                    new_bytes = new_bytes + b'.' * (len(old_bytes) - len(new_bytes))
-                elif len(new_bytes) > len(old_bytes):
-                    new_bytes = new_bytes[:len(old_bytes)]
+                # Generate same-length replacement name
+                new_name  = self._make_same_length_name(old_name)
+                new_bytes = new_name.encode("utf-8")
 
-                count = patched.count(old_bytes)
+                # Strict same-length enforcement
+                assert len(new_bytes) == len(old_bytes), (
+                    f"Length mismatch: {old_name}({len(old_bytes)}) vs "
+                    f"{new_name}({len(new_bytes)})")
+
+                count   = patched.count(old_bytes)
                 patched = patched.replace(old_bytes, new_bytes)
                 replacements += count
                 logger.info(
-                    f"[ManifestComponentRenamer] Binary: {old_name} → {new_name} "
-                    f"({count} occurrences)")
+                    f"[ManifestComponentRenamer] Binary: "
+                    f"{old_name} → {new_name} ({count} occurrences)")
 
             if replacements == 0:
                 return False
 
             # Write patched manifest back into APK
             tmp_apk = apk_path + ".manifest_patch.tmp"
-            with zipfile.ZipFile(apk_path, 'r') as src:
-                with zipfile.ZipFile(tmp_apk, 'w') as dst:
+            with zipfile.ZipFile(apk_path, "r") as src:
+                with zipfile.ZipFile(tmp_apk, "w") as dst:
                     for item in src.infolist():
-                        if item.filename == 'AndroidManifest.xml':
+                        if item.filename == "AndroidManifest.xml":
                             dst.writestr(item, bytes(patched))
                         else:
                             dst.writestr(item, src.read(item.filename))
@@ -9137,7 +9172,8 @@ class ManifestComponentRenamerEngine:
             return True
 
         except Exception as e:
-            logger.warning(f"[ManifestComponentRenamer] Binary patch failed: {e}")
+            logger.warning(
+                f"[ManifestComponentRenamer] Binary patch failed: {e}")
             return False
 
     def _to_smali_path(self, class_name: str) -> str:
