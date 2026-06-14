@@ -12110,25 +12110,21 @@ class ManualControlEngine:
                 result["files_fixed"]   = files_fixed
                 result["paths_renamed"] = paths_renamed
 
-                # ── Engine 2 — Safe Rename ────────────────────────────────────
-                renamer         = SafeRenameEngine(work_dir)
-                sr              = renamer.apply(workspace)
-                renamed_classes = sr.get("renamed_classes", 0)
-                renamed_methods = sr.get("renamed_methods", 0)
-                renamed_fields  = sr.get("renamed_fields",  0)
-                files_patched   = sr.get("files_patched",   0)
+                # ── Engine 2 — Counts set to 0 (SafeRename runs in Phase 2) ─
+                # SafeRenameEngine must NOT run here — it would rename smali
+                # classes BEFORE manifest_component_renamer runs in Phase 1,
+                # breaking all component references in AndroidManifest.xml.
+                # SafeRenameEngine correctly runs in Phase 2 safe_rename step.
+                renamed_classes = 0
+                renamed_methods = 0
+                renamed_fields  = 0
+                files_patched   = 0
 
                 result["renamed_classes"] = renamed_classes
                 result["renamed_methods"] = renamed_methods
                 result["renamed_fields"]  = renamed_fields
                 result["files_patched"]   = files_patched
-
-                # ── Engine 3 — Rename map already saved by SafeRenameEngine ──
-                # SafeRenameEngine saves to work_dir/safe_rename_map.json itself
-                rename_map_path = sr.get("rename_map_saved", "")
-                if not rename_map_path:
-                    rename_map_path = os.path.join(work_dir, "safe_rename_map.json")
-                result["rename_map_path"] = rename_map_path if os.path.exists(rename_map_path) else None
+                result["rename_map_path"] = None
 
                 # ── Engine 4 — Post-rename verification re-scan ───────────────
                 post_findings = []
@@ -12144,9 +12140,6 @@ class ManualControlEngine:
                     f"✅ Red Flag Renamer complete\n"
                     f"🚩 Words fixed: {words_fixed} in {files_fixed} files, "
                     f"{paths_renamed} paths renamed\n"
-                    f"✏️ Safe Rename: {renamed_classes} classes, "
-                    f"{renamed_methods} methods, {renamed_fields} fields "
-                    f"across {files_patched} smali files\n"
                     + (f"✅ Post-scan: 0 red flags remaining"
                        if post_count == 0 else
                        f"⚠️ Post-scan: {post_count} findings still present — review needed")
@@ -17727,9 +17720,9 @@ async def button_handler(update, context):
                 current_apk = result["final_apk"]
                 final_apk   = result["final_apk"]
                 auto_apk_name = f"PHASE{phase_idx+1}_{phase['key']}.apk"
-            # ── Deliver rename map immediately after red_flag_renamer ─────────
-            if op_key == "red_flag_renamer":
-                rmap = result.get("rename_map_path")
+            # ── Deliver rename map after safe_rename step (Phase 2) ──────────
+            if op_key == "safe_rename":
+                rmap = result.get("rename_map_saved") or os.path.join(work_dir, "safe_rename_map.json")
                 if rmap and os.path.exists(rmap):
                     try:
                         with open(rmap, "rb") as _rf:
@@ -17741,15 +17734,11 @@ async def button_handler(update, context):
                                     f"✏️ *Safe Rename Map*\n"
                                     f"Classes: {result.get('renamed_classes',0)} | "
                                     f"Methods: {result.get('renamed_methods',0)} | "
-                                    f"Fields: {result.get('renamed_fields',0)}\n"
-                                    f"Post-scan: "
-                                    + ("✅ 0 red flags remaining"
-                                       if result.get("post_scan_findings",0) == 0
-                                       else f"⚠️ {result.get('post_scan_findings',0)} findings remain")
+                                    f"Fields: {result.get('renamed_fields',0)}"
                                 ),
                                 parse_mode="Markdown")
                     except Exception as _e:
-                        logger.warning(f"[RedFlagRenamer] Rename map delivery failed: {_e}")
+                        logger.warning(f"[SafeRename] Rename map delivery failed: {_e}")
 
         sbs_done_steps[user.id]   = done_steps
         sbs_step_results[user.id] = step_results
@@ -18503,14 +18492,6 @@ async def button_handler(update, context):
                     f"  🚩 Words: {r.get('words_fixed',0)} fixed in "
                     f"{r.get('files_fixed',0)} files, "
                     f"{r.get('paths_renamed',0)} paths renamed"
-                )
-                lines.append(
-                    f"  ✏️ Classes: {r.get('renamed_classes',0)} | "
-                    f"Methods: {r.get('renamed_methods',0)} | "
-                    f"Fields: {r.get('renamed_fields',0)}"
-                )
-                lines.append(
-                    f"  📄 Files patched: {r.get('files_patched',0)}"
                 )
                 post = r.get("post_scan_findings", 0)
                 lines.append(
