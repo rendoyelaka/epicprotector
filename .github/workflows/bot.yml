@@ -69,41 +69,61 @@ jobs:
           if [ -z "$ADMIN_ID" ];  then echo "❌ ADMIN_ID missing";  exit 1; fi
           echo "✅ All required secrets present."
 
-      # ── APT PACKAGE CACHE ──────────────────────────────────────────────────
-      - name: Cache APT Packages
-        id: apt-cache
+      # ── SYSTEM TOOLS CACHE — full binary paths ─────────────────────────────
+      # Cache the actual installed tool locations — not just .deb archives
+      # Key includes ubuntu version + tool versions for proper invalidation
+      - name: Cache System Tools
+        id: tools-cache
         uses: actions/cache@v4
         with:
           path: |
-            /var/cache/apt/archives
-            /usr/lib/jvm
             /usr/bin/zipalign
             /usr/bin/apksigner
+            /usr/lib/jvm
+            /usr/bin/java
+            /usr/bin/javac
+            /usr/bin/keytool
+            /etc/alternatives/java
+            /etc/alternatives/javac
+            /etc/alternatives/keytool
             /usr/share/java/smali.jar
-          key: epic-apt-packages-ubuntu22-v2
+            /usr/share/apksigner
+            /usr/lib/android-sdk
+            /opt/hostedtoolcache/java
+          key: epic-system-tools-ubuntu22-jdk-zipalign-apksigner-smali-v4
 
       - name: Install System Tools
         run: |
-          if [ "${{ steps.apt-cache.outputs.cache-hit }}" == "true" ]; then
-            echo "✅ APT cache hit — restoring packages..."
-            # Restore cached .deb packages quickly
-            sudo dpkg -i /var/cache/apt/archives/*.deb 2>/dev/null || true
-            # Verify tools
-            java -version 2>&1 | head -1 && echo "✅ java from cache" || NEED_INSTALL=1
+          if [ "${{ steps.tools-cache.outputs.cache-hit }}" == "true" ]; then
+            echo "✅ System tools cache hit — verifying binaries..."
+            # Restore symlinks that may not survive cache
+            if [ -f /usr/lib/jvm/default-java/bin/java ] && [ ! -f /usr/bin/java ]; then
+              sudo ln -sf /usr/lib/jvm/default-java/bin/java /usr/bin/java || true
+              sudo ln -sf /usr/lib/jvm/default-java/bin/javac /usr/bin/javac || true
+              sudo ln -sf /usr/lib/jvm/default-java/bin/keytool /usr/bin/keytool || true
+            fi
+            # Quick binary check — if all pass, skip install entirely
+            if command -v java &>/dev/null && \
+               command -v zipalign &>/dev/null && \
+               command -v apksigner &>/dev/null; then
+              echo "✅ All tools verified from cache — skipping install."
+              java -version 2>&1 | head -1
+              exit 0
+            fi
+            echo "⚠️ Cache hit but binaries missing — running install..."
+          else
+            echo "📥 Cache miss — installing system tools fresh..."
           fi
-          if [ "${{ steps.apt-cache.outputs.cache-hit }}" != "true" ] || ! command -v java &>/dev/null; then
-            echo "📥 Installing system tools..."
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends \
-              default-jdk \
-              zipalign \
-              apksigner \
-              libsmali-java \
-              wget \
-              unzip \
-              curl
-            echo "✅ System tools installed."
-          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            default-jdk \
+            zipalign \
+            apksigner \
+            libsmali-java \
+            wget \
+            unzip \
+            curl
+          echo "✅ System tools installed."
           echo "apksigner version: $(apksigner version 2>&1 || echo 'unknown')"
 
       - name: Verify System Tools
