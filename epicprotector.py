@@ -15589,6 +15589,8 @@ sbs_current_apk   = {}   # {user_id: str}   — current APK path (updated after 
 sbs_aes_key       = {}   # {user_id: bytes} — AES key for this session
 sbs_keystore_ctx  = {}   # {user_id: dict}  — keystore context
 sbs_done_steps    = {}   # {user_id: set}   — steps completed this session
+sbs_before_snap   = {}   # {user_id: str}   — path to before-snapshot zip
+sbs_after_snap    = {}   # {user_id: str}   — path to after-snapshot zip
 sbs_step_results  = {}   # {user_id: list}  — results of each step run
 sbs_test_log      = {}   # {user_id: list}  — list of {step, label, passed, note}
 
@@ -15602,6 +15604,35 @@ def admin_kb():
         [InlineKeyboardButton("🧪 Step-by-Step Test",         callback_data="sbs_open")],
         [InlineKeyboardButton("📊 Protection History",        callback_data="admin_history")],
         [InlineKeyboardButton("📦 Base APK",                  callback_data="admin_base_apk")],
+        [InlineKeyboardButton("📁 Workspace Browser",         callback_data="ws_browse")],
+    ])
+
+
+def ws_folder_kb(has_workspace: bool = True) -> "InlineKeyboardMarkup":
+    """Workspace Browser — folder selection keyboard."""
+    if not has_workspace:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back", callback_data="back_admin")]
+        ])
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📁 smali/",   callback_data="ws_compress_smali"),
+            InlineKeyboardButton("📁 assets/",  callback_data="ws_compress_assets"),
+        ],
+        [
+            InlineKeyboardButton("📁 res/",     callback_data="ws_compress_res"),
+            InlineKeyboardButton("📁 lib/",     callback_data="ws_compress_lib"),
+        ],
+        [
+            InlineKeyboardButton("📁 META-INF", callback_data="ws_compress_meta"),
+            InlineKeyboardButton("📦 Full Workspace", callback_data="ws_compress_full"),
+        ],
+        [InlineKeyboardButton("📲 Download Current APK", callback_data="ws_download_apk")],
+        [
+            InlineKeyboardButton("📸 BEFORE Snapshot", callback_data="ws_snapshot_before"),
+            InlineKeyboardButton("📸 AFTER Snapshot",  callback_data="ws_snapshot_after"),
+        ],
+        [InlineKeyboardButton("🔙 Back", callback_data="back_admin")],
     ])
 
 
@@ -16733,7 +16764,8 @@ async def button_handler(update, context):
                   sbs_step_index, sbs_work_dir, sbs_apk_path, sbs_workspace,
                   sbs_current_apk, sbs_aes_key, sbs_keystore_ctx,
                   sbs_done_steps, sbs_step_results, sbs_test_log,
-                  sbs_p2_step_idx, sbs_p2_active]:
+                  sbs_p2_step_idx, sbs_p2_active,
+                  sbs_before_snap, sbs_after_snap]:
             d.pop(user.id, None)
 
         # Delete the Quick Test Results message if it exists (separate from APK doc)
@@ -17491,6 +17523,10 @@ async def button_handler(update, context):
             if apk_ready:
                 kb_rows.append([InlineKeyboardButton(
                     "📲 Get APK", callback_data="sbs_get_apk")])
+                kb_rows.append([InlineKeyboardButton(
+                    "📲 Download APK at This Stage", callback_data="ws_download_apk")])
+            kb_rows.append([InlineKeyboardButton(
+                "📁 Browse Workspace Folders", callback_data="ws_browse")])
             if has_more:
                 kb_rows.append([InlineKeyboardButton(
                     f"✅ Working — Continue to Step {p2_step+2}: {next_step_label}",
@@ -17715,6 +17751,8 @@ async def button_handler(update, context):
             kb = []
             if apk_ready:
                 kb.append([InlineKeyboardButton("📲 Get APK", callback_data="sbs_get_apk")])
+                kb.append([InlineKeyboardButton("📲 Download APK at This Stage", callback_data="ws_download_apk")])
+            kb.append([InlineKeyboardButton("📁 Browse Workspace Folders", callback_data="ws_browse")])
             if next_phase:
                 kb.append([InlineKeyboardButton(
                     f"✅ Install OK — Continue to {next_phase['icon']} {next_phase['label']}",
@@ -18031,6 +18069,251 @@ async def button_handler(update, context):
                     f"📦 {size_mb:.2f} MB\n\n"
                     f"Install on device and test.\n"
                     f"Come back and continue when ready."
+                ),
+                parse_mode="Markdown")
+        await query.answer("📲 APK sent!", show_alert=False)
+        return
+
+
+    # ── BEFORE / AFTER COMPARISON ────────────────────────────────────────────
+    elif data == "ws_snapshot_before":
+        if not is_admin(user.id): return
+        workspace = sbs_workspace.get(user.id)
+        work_dir  = sbs_work_dir.get(user.id, WORK_DIR)
+        if not workspace or not os.path.isdir(workspace):
+            await query.answer("⚠️ No active workspace.", show_alert=True)
+            return
+        await query.edit_message_text(
+            "📸 *Taking BEFORE snapshot...*\n⏳ Please wait...",
+            parse_mode="Markdown")
+        engine = ManualControlEngine(CryptoEngine(), work_dir)
+        try:
+            result = engine.compress_target(workspace, "smali")
+            snap_path = result.get("archive_path", "")
+            if snap_path and os.path.exists(snap_path):
+                sbs_before_snap[user.id] = snap_path
+                size_kb = result.get("archive_size_kb", 0)
+                await query.edit_message_text(
+                    f"✅ *BEFORE snapshot saved*\n\n"
+                    f"📦 {size_kb} KB — smali/ captured\n\n"
+                    f"Now run your protection steps, then take AFTER snapshot to compare.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📸 Take AFTER Snapshot", callback_data="ws_snapshot_after")],
+                        [InlineKeyboardButton("📁 Browse Workspace", callback_data="ws_browse")],
+                        [InlineKeyboardButton("🔙 Back", callback_data="back_admin")],
+                    ]))
+            else:
+                await query.edit_message_text(
+                    "❌ Snapshot failed.", parse_mode="Markdown", reply_markup=back_a())
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Error: `{str(e)[:200]}`", parse_mode="Markdown", reply_markup=back_a())
+        return
+
+    elif data == "ws_snapshot_after":
+        if not is_admin(user.id): return
+        workspace = sbs_workspace.get(user.id)
+        work_dir  = sbs_work_dir.get(user.id, WORK_DIR)
+        if not workspace or not os.path.isdir(workspace):
+            await query.answer("⚠️ No active workspace.", show_alert=True)
+            return
+        await query.edit_message_text(
+            "📸 *Taking AFTER snapshot...*\n⏳ Please wait...",
+            parse_mode="Markdown")
+        engine = ManualControlEngine(CryptoEngine(), work_dir)
+        try:
+            result = engine.compress_target(workspace, "smali")
+            snap_path = result.get("archive_path", "")
+            if snap_path and os.path.exists(snap_path):
+                sbs_after_snap[user.id] = snap_path
+                size_kb = result.get("archive_size_kb", 0)
+                before_path = sbs_before_snap.get(user.id)
+                kb_rows = []
+                if before_path and os.path.exists(before_path):
+                    kb_rows.append([InlineKeyboardButton(
+                        "📥 Download BEFORE Snapshot", callback_data="ws_dl_before")])
+                kb_rows.append([InlineKeyboardButton(
+                    "📥 Download AFTER Snapshot", callback_data="ws_dl_after")])
+                kb_rows.append([InlineKeyboardButton("📁 Browse Workspace", callback_data="ws_browse")])
+                kb_rows.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
+                await query.edit_message_text(
+                    f"✅ *AFTER snapshot saved*\n\n"
+                    f"📦 {size_kb} KB — smali/ captured\n\n"
+                    f"Download both snapshots to compare before/after obfuscation:",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(kb_rows))
+            else:
+                await query.edit_message_text(
+                    "❌ Snapshot failed.", parse_mode="Markdown", reply_markup=back_a())
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Error: `{str(e)[:200]}`", parse_mode="Markdown", reply_markup=back_a())
+        return
+
+    elif data == "ws_dl_before":
+        if not is_admin(user.id): return
+        snap = sbs_before_snap.get(user.id)
+        if not snap or not os.path.exists(snap):
+            await query.answer("⚠️ No BEFORE snapshot found.", show_alert=True)
+            return
+        size_kb = os.path.getsize(snap) // 1024
+        with open(snap, "rb") as f:
+            await context.bot.send_document(
+                chat_id=user.id, document=f,
+                filename="BEFORE_smali.zip",
+                caption=f"📸 *BEFORE Snapshot*\n📦 {size_kb} KB",
+                parse_mode="Markdown")
+        await query.answer("📥 BEFORE snapshot sent!", show_alert=False)
+        return
+
+    elif data == "ws_dl_after":
+        if not is_admin(user.id): return
+        snap = sbs_after_snap.get(user.id)
+        if not snap or not os.path.exists(snap):
+            await query.answer("⚠️ No AFTER snapshot found.", show_alert=True)
+            return
+        size_kb = os.path.getsize(snap) // 1024
+        with open(snap, "rb") as f:
+            await context.bot.send_document(
+                chat_id=user.id, document=f,
+                filename="AFTER_smali.zip",
+                caption=f"📸 *AFTER Snapshot*\n📦 {size_kb} KB",
+                parse_mode="Markdown")
+        await query.answer("📥 AFTER snapshot sent!", show_alert=False)
+        return
+
+    # ── WORKSPACE BROWSER ─────────────────────────────────────────────────────
+    elif data == "ws_browse":
+        if not is_admin(user.id): return
+        workspace = sbs_workspace.get(user.id)
+        work_dir  = sbs_work_dir.get(user.id, WORK_DIR)
+        has_ws    = workspace and os.path.isdir(workspace)
+        msg = (
+            f"📁 *Workspace Browser*\n\n"
+            + (f"✅ Workspace active\n`{os.path.basename(workspace)}`\n\n"
+               f"Select a folder to compress and download:"
+               if has_ws else
+               "⚠️ No active workspace.\n\nRun Step-by-Step Test first to decode an APK.")
+        )
+        await query.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=ws_folder_kb(has_ws))
+        return
+
+    # ── WORKSPACE COMPRESS & DOWNLOAD ─────────────────────────────────────────
+    elif data.startswith("ws_compress_"):
+        if not is_admin(user.id): return
+        workspace = sbs_workspace.get(user.id)
+        work_dir  = sbs_work_dir.get(user.id, WORK_DIR)
+        if not workspace or not os.path.isdir(workspace):
+            await query.answer("⚠️ No active workspace.", show_alert=True)
+            return
+
+        folder_map = {
+            "ws_compress_smali":  "smali",
+            "ws_compress_assets": "assets",
+            "ws_compress_res":    "res",
+            "ws_compress_lib":    "lib",
+            "ws_compress_meta":   "META-INF",
+            "ws_compress_full":   ".",
+        }
+        target = folder_map.get(data, ".")
+        target_path = os.path.join(workspace, target) if target != "." else workspace
+
+        if not os.path.exists(target_path):
+            await query.answer(f"⚠️ Folder {target}/ not found in workspace.", show_alert=True)
+            return
+
+        await query.edit_message_text(
+            f"📁 *Compressing `{target}/`...*\n⏳ Please wait...",
+            parse_mode="Markdown")
+
+        engine = ManualControlEngine(CryptoEngine(), work_dir)
+        try:
+            result = engine.compress_target(workspace, target if target != "." else "")
+            if "error" in result:
+                await query.edit_message_text(
+                    f"❌ Compression failed: `{result['error']}`",
+                    parse_mode="Markdown", reply_markup=ws_folder_kb(True))
+                return
+
+            archive_path = result.get("archive_path", "")
+            archive_name = result.get("archive_name", "workspace.zip")
+            size_kb      = result.get("archive_size_kb", 0)
+            files_count  = result.get("files_compressed", 0)
+
+            if not archive_path or not os.path.exists(archive_path):
+                await query.edit_message_text(
+                    "❌ Archive not found after compression.",
+                    parse_mode="Markdown", reply_markup=ws_folder_kb(True))
+                return
+
+            with open(archive_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=user.id,
+                    document=f,
+                    filename=archive_name,
+                    caption=(
+                        f"📁 *Workspace Folder — `{target}/`*\n"
+                        f"📦 {size_kb} KB — {files_count} files\n\n"
+                        f"Inspect contents and return when ready."
+                    ),
+                    parse_mode="Markdown")
+
+            await query.edit_message_text(
+                f"✅ *`{target}/` sent!*\n\n"
+                f"📦 {size_kb} KB — {files_count} files\n\n"
+                f"Select another folder or go back:",
+                parse_mode="Markdown",
+                reply_markup=ws_folder_kb(True))
+
+        except Exception as e:
+            await query.edit_message_text(
+                f"❌ Error: `{str(e)[:200]}`",
+                parse_mode="Markdown", reply_markup=ws_folder_kb(True))
+        return
+
+    # ── WORKSPACE — DOWNLOAD CURRENT APK AT ANY STAGE ─────────────────────────
+    elif data == "ws_download_apk":
+        if not is_admin(user.id): return
+        work_dir     = sbs_work_dir.get(user.id, WORK_DIR)
+        current_apk  = sbs_current_apk.get(user.id)
+        config       = _get_base_apk_config()
+        apk_name     = config.get("base_apk_filename", "base.apk")
+        phase_idx    = sbs_step_index.get(user.id, 0)
+
+        # Find best available APK in order of preference
+        candidates = []
+        if current_apk and os.path.exists(current_apk):
+            candidates.append(current_apk)
+        for fname in ["EPIC_PROTECTED.apk", "signed.apk", "aligned.apk",
+                      "rebuilt.apk", "input_stripped.apk"]:
+            p = os.path.join(work_dir, fname)
+            if os.path.exists(p):
+                candidates.append(p)
+
+        if not candidates:
+            await query.answer(
+                "⚠️ No APK available yet. Run at least one phase first.",
+                show_alert=True)
+            return
+
+        best_apk  = candidates[0]
+        size_mb   = os.path.getsize(best_apk) / (1024 * 1024)
+        stage_name = f"Phase{phase_idx}" if phase_idx else "Stage0"
+        out_fname  = f"{stage_name}_{apk_name}"
+
+        with open(best_apk, "rb") as f:
+            await context.bot.send_document(
+                chat_id=user.id,
+                document=f,
+                filename=out_fname,
+                caption=(
+                    f"📲 *APK — Current Stage*\n"
+                    f"🔖 {stage_name}\n"
+                    f"📦 {size_mb:.2f} MB\n\n"
+                    f"Install and test — then return to continue."
                 ),
                 parse_mode="Markdown")
         await query.answer("📲 APK sent!", show_alert=False)
