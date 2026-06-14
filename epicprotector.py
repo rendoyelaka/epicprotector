@@ -2053,19 +2053,41 @@ class Level5_APKBuilder:
                 pass
         logger.info(f"[Level5] API level: {api_level}")
 
-        # Attempt 1 — apktool -r --api
+        # ── Detect if manifest was modified — needs full rebuild (no -r) ──────
+        manifest_modified = os.path.exists(
+            os.path.join(workspace_dir, ".epic_manifest_modified"))
+        if not manifest_modified:
+            # Check apktool.yml modification time vs AndroidManifest.xml
+            manifest_path = os.path.join(workspace_dir, "AndroidManifest.xml")
+            yml_path2     = os.path.join(workspace_dir, "apktool.yml")
+            try:
+                if (os.path.exists(manifest_path) and
+                        os.path.exists(yml_path2) and
+                        os.path.getmtime(manifest_path) >
+                        os.path.getmtime(yml_path2)):
+                    manifest_modified = True
+            except Exception:
+                pass
+
+        # Attempt 1 — Full rebuild if manifest modified, else -r (skip resources)
+        build_flags = ["-f", "--api", api_level]
+        if not manifest_modified:
+            build_flags = ["-f", "-r", "--api", api_level]
+            logger.info("[Level5] Attempt 1 — apktool -r (manifest unchanged)")
+        else:
+            logger.info("[Level5] Attempt 1 — apktool full rebuild (manifest modified)")
+
         r = subprocess.run([
             "java", "-jar", self.tools.apktool_jar,
-            "b", "-f", "-r", "--api", api_level,
-            workspace_dir, "-o", output_apk
-        ], capture_output=True, text=True)
+            "b"] + build_flags + [workspace_dir, "-o", output_apk],
+            capture_output=True, text=True)
 
         if r.returncode == 0 and os.path.exists(output_apk):
-            logger.info(f"[Level5] Built via apktool -r --api {api_level}")
+            logger.info(f"[Level5] Built via apktool flags={build_flags}")
             return self._validate_apk(output_apk)
 
         last_error = (r.stdout or "") + (r.stderr or "")
-        logger.warning("[Level5] apktool -r failed — trying DEX injection")
+        logger.warning("[Level5] apktool attempt 1 failed — trying DEX injection")
 
         # Attempt 2 — DEX injection (bypass apktool smali compiler)
         try:
@@ -2076,7 +2098,7 @@ class Level5_APKBuilder:
         except Exception as e:
             logger.warning(f"[Level5] DEX injection failed: {e}")
 
-        # Attempt 3 — apktool full rebuild (no -r)
+        # Attempt 3 — apktool full rebuild (no -r) as final fallback
         if os.path.exists(output_apk):
             try: os.remove(output_apk)
             except Exception: pass
@@ -2088,7 +2110,7 @@ class Level5_APKBuilder:
         ], capture_output=True, text=True)
 
         if r.returncode == 0 and os.path.exists(output_apk):
-            logger.info("[Level5] Built via apktool full rebuild")
+            logger.info("[Level5] Built via apktool full rebuild — final fallback")
             return self._validate_apk(output_apk)
 
         raise RuntimeError(
@@ -12154,6 +12176,12 @@ class ManualControlEngine:
                 result["smali_files_updated"] = mcr_result.get("smali_files_updated", 0)
                 result["rename_map"]          = mcr_result.get("rename_map", {})
                 result["status"]              = mcr_result.get("status", "❌ Manifest Component Renamer failed")
+                # ── Mark manifest as modified so rebuild uses full apktool ────
+                if mcr_result.get("renamed", 0) > 0 and workspace:
+                    try:
+                        open(os.path.join(workspace, ".epic_manifest_modified"), "w").close()
+                    except Exception:
+                        pass
 
             elif op_key == "obfuscation":
 
