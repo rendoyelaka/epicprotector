@@ -18031,11 +18031,13 @@ async def button_handler(update, context):
         engine   = ManualControlEngine(CryptoEngine(), work_dir)
         step_label = engine.STEP_LABELS.get(last_op, last_op).replace(" ", "_")
 
-        # Build filename — P1 or P2_StepN_StepName
+        # Build filename — P1 or P2_StepN_StepName + unique build ID
+        import secrets
+        build_id = f"{int(time.time())}_{secrets.token_hex(3).upper()}"
         if sbs_p2_active.get(user.id):
-            apk_fname = f"P2_Step{p2_step}_{step_label}_{apk_name}"
+            apk_fname = f"P2_Step{p2_step}_{step_label}_{build_id}_{apk_name}"
         else:
-            apk_fname = f"P{phase_idx}_{step_label}_{apk_name}"
+            apk_fname = f"P{phase_idx}_{step_label}_{build_id}_{apk_name}"
 
         final_apk = None
         for r in reversed(step_results):
@@ -18302,7 +18304,9 @@ async def button_handler(update, context):
         best_apk  = candidates[0]
         size_mb   = os.path.getsize(best_apk) / (1024 * 1024)
         stage_name = f"Phase{phase_idx}" if phase_idx else "Stage0"
-        out_fname  = f"{stage_name}_{apk_name}"
+        import secrets as _sec
+        build_id   = f"{int(time.time())}_{_sec.token_hex(3).upper()}"
+        out_fname  = f"{stage_name}_{build_id}_{apk_name}"
 
         with open(best_apk, "rb") as f:
             await context.bot.send_document(
