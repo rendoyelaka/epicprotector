@@ -9116,54 +9116,51 @@ class ManifestComponentRenamerEngine:
 
     def patch_binary_manifest(self, apk_path: str, rename_map: dict) -> bool:
         """
-        Directly patch component class names in the binary AXML manifest
-        inside the APK ZIP. Works without apktool — replaces UTF-8 encoded
-        class name bytes directly in the binary string pool.
+        OPTION 4 — Binary manifest fallback patch.
+
+        Uses the EXACT same rename_map that apply() used for smali files.
+        This guarantees smali and manifest are always in sync —
+        the DEX has new_name, the manifest has new_name → no crash.
+
+        The rename_map values are the same-length safe names already
+        written to smali by apply(). We just patch the binary manifest
+        to match — no new name generation needed here.
 
         CRITICAL: new name MUST be same byte length as old name.
-        The AXML string pool uses absolute byte offsets — any length
-        change corrupts all subsequent string references and crashes the app.
-        _make_same_length_name() guarantees exact length match.
-
+        apply() already guarantees this via _make_same_length_name().
         Returns True if any replacements were made.
         """
         if not rename_map or not os.path.exists(apk_path):
             return False
 
         try:
-            # Read current manifest from APK
-            with zipfile.ZipFile(apk_path, 'r') as zf:
+            with zipfile.ZipFile(apk_path, "r") as zf:
                 if "AndroidManifest.xml" not in zf.namelist():
                     return False
                 manifest_data = zf.read("AndroidManifest.xml")
 
             # Verify binary AXML format
             if len(manifest_data) < 8 or manifest_data[:2] != bytes([0x03, 0x00]):
-                logger.warning(
-                    "[ManifestComponentRenamer] Not binary AXML — "
-                    "skipping binary patch")
+                logger.warning("[MCR] Not binary AXML — skipping binary patch")
                 return False
 
             patched      = bytearray(manifest_data)
             replacements = 0
-            used_names   = set()   # prevents collision across all renames
 
-            for old_name in sorted(rename_map.keys()):
+            # Use EXACT same rename_map as apply() used for smali
+            # — smali has new_name, manifest will have new_name → sync guaranteed
+            for old_name, new_name in sorted(rename_map.items()):
                 old_bytes = old_name.encode("utf-8")
-                if old_bytes not in patched:
-                    logger.warning(
-                        f"[ManifestComponentRenamer] Binary: "
-                        f"not found: {old_name}")
-                    continue
-
-                # Generate same-length replacement name — collision-free
-                new_name  = self._make_same_length_name(old_name, used_names)
                 new_bytes = new_name.encode("utf-8")
 
-                # Strict same-length enforcement
+                if old_bytes not in patched:
+                    logger.warning(f"[MCR] Binary: not found: {old_name}")
+                    continue
+
+                # Verify same length — apply() guarantees this
                 if len(new_bytes) != len(old_bytes):
                     logger.warning(
-                        f"[ManifestComponentRenamer] Binary: length mismatch "
+                        f"[MCR] Binary: length mismatch "
                         f"{old_name}({len(old_bytes)}) vs "
                         f"{new_name}({len(new_bytes)}) — skipping")
                     continue
@@ -9172,10 +9169,11 @@ class ManifestComponentRenamerEngine:
                 patched = patched.replace(old_bytes, new_bytes)
                 replacements += count
                 logger.info(
-                    f"[ManifestComponentRenamer] Binary: "
-                    f"{old_name} → {new_name} ({count} occurrences)")
+                    f"[MCR] Binary: {old_name} → {new_name} "
+                    f"({count} occurrences)")
 
             if replacements == 0:
+                logger.warning("[MCR] Binary patch — no replacements made")
                 return False
 
             # Write patched manifest back into APK
@@ -9190,13 +9188,12 @@ class ManifestComponentRenamerEngine:
 
             os.replace(tmp_apk, apk_path)
             logger.info(
-                f"[ManifestComponentRenamer] Binary patch complete — "
-                f"{replacements} replacements in APK manifest")
+                f"[MCR] Binary patch complete — "
+                f"{replacements} replacements — smali/manifest in sync")
             return True
 
         except Exception as e:
-            logger.warning(
-                f"[ManifestComponentRenamer] Binary patch failed: {e}")
+            logger.warning(f"[MCR] Binary patch failed: {e}")
             return False
 
     def _to_smali_path(self, class_name: str) -> str:
@@ -9210,20 +9207,26 @@ class ManifestComponentRenamerEngine:
     def apply(self, workspace_dir: str) -> dict:
         """
         Rename all component class names in manifest + smali.
-        Returns summary dict.
+
+        OPTION 2 + 4 IMPLEMENTATION:
+          Step 0: Generate same-length safe names for ALL components first
+          Step 1: Apply to workspace AndroidManifest.xml (plain XML)
+          Step 2: Apply to all smali files (class refs + file names)
+          Step 3: Save rename_map — used by binary patch fallback (Option 4)
+
+        The binary patch in patch_binary_manifest() uses this EXACT rename_map
+        so smali and manifest are always in sync — no ClassNotFoundException.
         """
         import xml.etree.ElementTree as ET
         import re
 
-        workspace  = Path(workspace_dir)
+        workspace     = Path(workspace_dir)
         manifest_path = workspace / "AndroidManifest.xml"
 
         if not manifest_path.exists():
             return {
                 "status":   "❌ AndroidManifest.xml not found in workspace",
-                "renamed":  0,
-                "skipped":  0,
-                "rename_map": {},
+                "renamed":  0, "skipped": 0, "rename_map": {},
             }
 
         try:
@@ -9232,102 +9235,84 @@ class ManifestComponentRenamerEngine:
         except Exception as e:
             return {
                 "status":   f"❌ Manifest parse failed: {e}",
-                "renamed":  0,
-                "skipped":  0,
-                "rename_map": {},
+                "renamed":  0, "skipped": 0, "rename_map": {},
             }
 
-        # Get package name
         pkg = root.get("package", "")
         if not pkg:
             return {
                 "status":   "❌ Package name not found in manifest",
-                "renamed":  0,
-                "skipped":  0,
-                "rename_map": {},
+                "renamed":  0, "skipped": 0, "rename_map": {},
             }
 
         ns = "http://schemas.android.com/apk/res/android"
-        # Support both Clark notation {ns}name and android:name prefix
         def get_android_attr(elem, attr):
             val = elem.get(f"{{{ns}}}{attr}")
             if val is None:
                 val = elem.get(f"android:{attr}")
             return val or ""
 
-        # Find the LAUNCHER activity — never rename it
+        # ── Find LAUNCHER activity — never rename ─────────────────────────
         launcher_activities = set()
         for activity in root.iter("activity"):
             for intent_filter in activity.iter("intent-filter"):
                 for category in intent_filter.iter("category"):
-                    if get_android_attr(category, "name") == "android.intent.category.LAUNCHER":
+                    if get_android_attr(category, "name") ==                             "android.intent.category.LAUNCHER":
                         name = get_android_attr(activity, "name")
                         if name:
+                            if name.startswith("."): name = pkg + name
                             launcher_activities.add(name)
 
-        # Collect all component class names
+        # ── Collect all component class names ─────────────────────────────
         components = {}
-        component_tags = ["activity", "service", "receiver", "provider"]
-        for tag in component_tags:
+        for tag in ["activity", "service", "receiver", "provider"]:
             for elem in root.iter(tag):
                 name = get_android_attr(elem, "name")
-                if not name:
-                    continue
-                if name.startswith("."):
-                    name = pkg + name
-                if not name.startswith(pkg):
-                    continue
+                if not name: continue
+                if name.startswith("."): name = pkg + name
+                if not name.startswith(pkg): continue
                 if name in launcher_activities:
-                    logger.info(f"[ManifestComponentRenamer] Skipping launcher: {name}")
+                    logger.info(f"[MCR] Skipping launcher: {name}")
                     continue
                 components[name] = tag
 
-        # ── Also collect <application> android:name (custom Application subclass) ──
+        # ── Also collect <application> android:name ───────────────────────
         for app_elem in root.iter("application"):
             app_name = get_android_attr(app_elem, "name")
-            if not app_name:
-                continue
-            if app_name.startswith("."):
-                app_name = pkg + app_name
-            # Only rename if it is a custom subclass inside the app package
-            # Skip generic android.app.Application and third-party ones
-            if not app_name.startswith(pkg):
-                continue
-            # Skip if it points to framework classes
+            if not app_name: continue
+            if app_name.startswith("."): app_name = pkg + app_name
+            if not app_name.startswith(pkg): continue
             if app_name in ("android.app.Application",
-                            "androidx.multidex.MultiDexApplication"):
-                continue
+                            "androidx.multidex.MultiDexApplication"): continue
             components[app_name] = "application"
-            logger.info(
-                f"[ManifestComponentRenamer] "
-                f"Found custom Application class: {app_name}")
+            logger.info(f"[MCR] Found custom Application class: {app_name}")
 
         if not components:
             return {
-                "status":   "✅ Manifest Component Renamer — no renameable components found",
+                "status":   "✅ MCR — no renameable components found",
                 "renamed":  0,
                 "skipped":  len(launcher_activities),
                 "rename_map": {},
             }
 
-        # Build rename map
+        # ── OPTION 2: Generate same-length names FIRST ────────────────────
+        # Both smali and manifest will use IDENTICAL names — guaranteed sync
+        # No ClassNotFoundException at runtime
         rename_map = {}
-        for idx, old_name in enumerate(sorted(components.keys())):
-            new_name = self._safe_name(pkg, idx, components[old_name])
+        used_names = set()
+        for old_name in sorted(components.keys()):
+            new_name = self._make_same_length_name(old_name, used_names)
             rename_map[old_name] = new_name
-            logger.info(
-                f"[ManifestComponentRenamer] {old_name} → {new_name}")
+            logger.info(f"[MCR] {old_name} ({len(old_name)}) "
+                        f"→ {new_name} ({len(new_name)})")
 
-        # ── Step 1: Update AndroidManifest.xml ───────────────────────────
-        manifest_content = manifest_path.read_text(encoding="utf-8",
-                                                    errors="ignore")
+        # ── Step 1: Update workspace AndroidManifest.xml (plain XML) ──────
+        manifest_content  = manifest_path.read_text(encoding="utf-8",
+                                                     errors="ignore")
         original_manifest = manifest_content
-
         for old_name, new_name in rename_map.items():
-            # Replace full name
             manifest_content = manifest_content.replace(old_name, new_name)
-            # Replace relative short name .ClassName
-            short = old_name.replace(pkg, "")
+            short     = old_name.replace(pkg, "")
             short_new = new_name.replace(pkg, "")
             if short != old_name:
                 manifest_content = manifest_content.replace(
@@ -9335,9 +9320,9 @@ class ManifestComponentRenamerEngine:
 
         if manifest_content != original_manifest:
             manifest_path.write_text(manifest_content, encoding="utf-8")
-            logger.info("[ManifestComponentRenamer] AndroidManifest.xml updated")
+            logger.info("[MCR] AndroidManifest.xml updated")
 
-        # ── Step 2: Update all smali files ───────────────────────────────
+        # ── Step 2: Update all smali files ────────────────────────────────
         smali_files_updated = 0
         smali_dirs = [workspace / "smali"]
         for i in range(2, 10):
@@ -9345,71 +9330,62 @@ class ManifestComponentRenamerEngine:
             if d.exists():
                 smali_dirs.append(d)
 
-        # Build full replacement set — class refs + file path patterns
         replacements = []
         for old_name, new_name in rename_map.items():
-            old_ref = self._to_class_ref(old_name)
-            new_ref = self._to_class_ref(new_name)
-            old_path = self._to_smali_path(old_name)
-            new_path = self._to_smali_path(new_name)
-            replacements.append((old_ref,  new_ref))
+            replacements.append((self._to_class_ref(old_name),
+                                  self._to_class_ref(new_name)))
             replacements.append((old_name, new_name))
-            replacements.append((old_path, new_path))
+            replacements.append((self._to_smali_path(old_name),
+                                  self._to_smali_path(new_name)))
 
         for smali_dir in smali_dirs:
-            if not smali_dir.exists():
-                continue
+            if not smali_dir.exists(): continue
             for fp in smali_dir.rglob("*.smali"):
                 try:
-                    content = fp.read_text(encoding="utf-8", errors="ignore")
-                    original = content
+                    text = fp.read_text(encoding="utf-8", errors="ignore")
+                    orig = text
                     for old, new in replacements:
-                        if old in content:
-                            content = content.replace(old, new)
-                    if content != original:
-                        fp.write_text(content, encoding="utf-8")
+                        if old in text:
+                            text = text.replace(old, new)
+                    if text != orig:
+                        fp.write_text(text, encoding="utf-8")
                         smali_files_updated += 1
                 except Exception as e:
-                    logger.warning(
-                        f"[ManifestComponentRenamer] Smali update failed "
-                        f"{fp.name}: {e}")
+                    logger.warning(f"[MCR] Smali update failed {fp.name}: {e}")
 
-        # ── Step 3: Rename smali files on disk ───────────────────────────
+        # ── Step 3: Rename smali files on disk ────────────────────────────
         files_renamed = 0
         for old_name, new_name in rename_map.items():
-            old_rel = self._to_smali_path(old_name)  # com/android/pictach/MainActivity
-            new_rel = self._to_smali_path(new_name)  # com/android/pictach/CoreHandler000
+            old_rel = self._to_smali_path(old_name)
+            new_rel = self._to_smali_path(new_name)
             for smali_dir in smali_dirs:
                 old_file = smali_dir / (old_rel + ".smali")
                 new_file = smali_dir / (new_rel + ".smali")
                 if old_file.exists():
                     try:
-                        # Create parent directory if new package path differs
                         new_file.parent.mkdir(parents=True, exist_ok=True)
                         old_file.rename(new_file)
                         files_renamed += 1
-                        logger.info(
-                            f"[ManifestComponentRenamer] "
-                            f"File: {old_file.name} → {new_file.name}")
+                        logger.info(f"[MCR] File: {old_file.name} "
+                                    f"→ {new_file.name}")
                     except Exception as e:
-                        logger.warning(
-                            f"[ManifestComponentRenamer] File rename failed "
-                            f"{old_file}: {e}")
+                        logger.warning(f"[MCR] File rename failed "
+                                       f"{old_file}: {e}")
 
         renamed_count = len(rename_map)
         return {
             "status": (
                 f"✅ Manifest Component Renamer — "
                 f"{renamed_count} components renamed | "
-                f"{len(launcher_activities)} launcher activities preserved | "
-                f"{smali_files_updated} smali files updated | "
-                f"{files_renamed} smali files renamed on disk"
+                f"{len(launcher_activities)} launcher preserved | "
+                f"{smali_files_updated} smali updated | "
+                f"{files_renamed} files renamed on disk"
             ),
-            "renamed":    renamed_count,
-            "skipped":    len(launcher_activities),
+            "renamed":             renamed_count,
+            "skipped":             len(launcher_activities),
             "smali_files_updated": smali_files_updated,
-            "files_renamed": files_renamed,
-            "rename_map": rename_map,
+            "files_renamed":       files_renamed,
+            "rename_map":          rename_map,
         }
 
 
