@@ -9067,33 +9067,51 @@ class ManifestComponentRenamerEngine:
         base   = self.SAFE_PREFIXES[index % len(self.SAFE_PREFIXES)]
         return f"{pkg}.{base}{suffix}"
 
-    def _make_same_length_name(self, old_name: str) -> str:
+    def _make_same_length_name(self, old_name: str,
+                               used_names: set = None) -> str:
         """
         Generate a safe professional-looking class name that is
         EXACTLY the same byte length as old_name.
         Required for binary AXML manifest patching — length prefix
         bytes in the string pool must not change.
+        used_names set prevents collisions across multiple calls.
         """
         import random as _rnd
-        _rnd.seed(hash(old_name) & 0xFFFFFF)
-        pkg       = old_name.rsplit(".", 1)[0]
-        old_len   = len(old_name.encode("utf-8"))
-        PREFIXES  = ["Core","Base","Data","Net","Sys","App","Sec","Lib","Svc","Sdk"]
-        SUFFIXES  = ["Unit","Module","Handler","Manager","Service",
-                     "Helper","Engine","Worker","Agent","Bridge"]
-        idx       = abs(hash(old_name)) % len(PREFIXES)
-        base      = f"{pkg}.{PREFIXES[idx]}{SUFFIXES[idx]}"
-        base_len  = len(base.encode("utf-8"))
-        if base_len < old_len:
-            fill = "".join(_rnd.choices("abcdefghijklmnopqrstuvwxyz",
-                                        k=old_len - base_len))
-            new = base + fill
-        elif base_len > old_len:
-            new = base[:old_len]
-        else:
-            new = base
-        # Guarantee same length
-        assert len(new.encode("utf-8")) == old_len
+        import hashlib as _hl
+        if used_names is None:
+            used_names = set()
+        pkg     = old_name.rsplit(".", 1)[0]
+        old_len = len(old_name.encode("utf-8"))
+        PREFIXES = ["Core","Base","Data","Net","Sys","Svc","Sec","Lib","Imp","Sdk",
+                    "Mgr","Ctx","Env","Ext","Fmt","Gen","Ipc","Job","Log","Map"]
+        SUFFIXES = ["Unit","Module","Handler","Manager","Service","Helper",
+                    "Engine","Worker","Agent","Bridge","Runner","Loader",
+                    "Binder","Proxy","Util","Cache","Store","Queue","Pool","Task"]
+        # Try different prefix/suffix combos until no collision
+        _seed = int(_hl.sha256(old_name.encode()).hexdigest()[:8], 16)
+        for attempt in range(len(PREFIXES) * len(SUFFIXES)):
+            _rnd.seed(_seed + attempt)
+            pidx = (_seed + attempt) % len(PREFIXES)
+            sidx = (_seed + attempt) % len(SUFFIXES)
+            base = f"{pkg}.{PREFIXES[pidx]}{SUFFIXES[sidx]}"
+            base_len = len(base.encode("utf-8"))
+            if base_len < old_len:
+                _rnd.seed(_seed + attempt + 1)
+                fill = "".join(_rnd.choices(
+                    "abcdefghijklmnopqrstuvwxyz",
+                    k=old_len - base_len))
+                new = base + fill
+            elif base_len > old_len:
+                new = base[:old_len]
+            else:
+                new = base
+            if len(new.encode("utf-8")) == old_len and new not in used_names:
+                used_names.add(new)
+                return new
+        # Fallback — use hex suffix guaranteed unique
+        _rnd.seed(_seed)
+        suffix = _hl.sha256(old_name.encode()).hexdigest()[:old_len-len(pkg)-2]
+        new = (f"{pkg}.X{suffix}")[:old_len]
         return new
 
     def patch_binary_manifest(self, apk_path: str, rename_map: dict) -> bool:
@@ -9128,8 +9146,9 @@ class ManifestComponentRenamerEngine:
 
             patched      = bytearray(manifest_data)
             replacements = 0
+            used_names   = set()   # prevents collision across all renames
 
-            for old_name in rename_map.keys():
+            for old_name in sorted(rename_map.keys()):
                 old_bytes = old_name.encode("utf-8")
                 if old_bytes not in patched:
                     logger.warning(
@@ -9137,14 +9156,17 @@ class ManifestComponentRenamerEngine:
                         f"not found: {old_name}")
                     continue
 
-                # Generate same-length replacement name
-                new_name  = self._make_same_length_name(old_name)
+                # Generate same-length replacement name — collision-free
+                new_name  = self._make_same_length_name(old_name, used_names)
                 new_bytes = new_name.encode("utf-8")
 
                 # Strict same-length enforcement
-                assert len(new_bytes) == len(old_bytes), (
-                    f"Length mismatch: {old_name}({len(old_bytes)}) vs "
-                    f"{new_name}({len(new_bytes)})")
+                if len(new_bytes) != len(old_bytes):
+                    logger.warning(
+                        f"[ManifestComponentRenamer] Binary: length mismatch "
+                        f"{old_name}({len(old_bytes)}) vs "
+                        f"{new_name}({len(new_bytes)}) — skipping")
+                    continue
 
                 count   = patched.count(old_bytes)
                 patched = patched.replace(old_bytes, new_bytes)
