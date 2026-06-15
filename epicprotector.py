@@ -9035,7 +9035,8 @@ class ManifestComponentRenamerEngine:
       - All Service class names → safe meaningless names
       - All BroadcastReceiver class names → safe meaningless names
       - All ContentProvider authorities/names → safe meaningless names
-      - Application android:name → if custom Application subclass
+      - Application android:name → custom Application subclass (e.g. .App)
+        Skips android.app.Application and MultiDexApplication
 
     What it NEVER renames:
       - Package name (android:package) — app identity
@@ -9258,7 +9259,26 @@ class ManifestComponentRenamerEngine:
                     logger.info(f"[ManifestComponentRenamer] Skipping launcher: {name}")
                     continue
                 components[name] = tag
-                components[name] = tag
+
+        # ── Also collect <application> android:name (custom Application subclass) ──
+        for app_elem in root.iter("application"):
+            app_name = get_android_attr(app_elem, "name")
+            if not app_name:
+                continue
+            if app_name.startswith("."):
+                app_name = pkg + app_name
+            # Only rename if it is a custom subclass inside the app package
+            # Skip generic android.app.Application and third-party ones
+            if not app_name.startswith(pkg):
+                continue
+            # Skip if it points to framework classes
+            if app_name in ("android.app.Application",
+                            "androidx.multidex.MultiDexApplication"):
+                continue
+            components[app_name] = "application"
+            logger.info(
+                f"[ManifestComponentRenamer] "
+                f"Found custom Application class: {app_name}")
 
         if not components:
             return {
