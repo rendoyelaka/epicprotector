@@ -8461,80 +8461,6 @@ class Level6_Signer:
             raise
 
 
-    def apply_hardening_v1resign(self, apk_path: str, keystore_ctx: dict) -> str:
-        """
-        Apply ManifestEntryHardening AFTER v1+v2+v3 signing, then re-sign with v1 only.
-        v1 (JAR) signing does not protect local file headers — hardening survives.
-        v2/v3 are intentionally omitted so they don't cover the hardened bytes.
-        Returns path to final hardened+signed APK.
-        """
-        # Step 1 — apply hardening to the signed APK in-place
-        meh = ManifestEntryHardeningEngine()
-        meh_result = meh.apply(apk_path)
-        logger.info(
-            f"[Level6] Hardening applied after signing — "
-            f"comp_type={meh_result.get('comp_type')}")
-
-        # Step 2 — strip existing v1+v2+v3 signature (hardening invalidated it)
-        stripper = SignatureStripper()
-        stripped = apk_path.replace(".apk", "_hs.apk")
-        stripper.strip(apk_path, stripped)
-
-        # Step 3 — re-sign with v1 ONLY (jarsigner path — v1 doesn't cover local headers)
-        apksigner = self._find_apksigner()
-        out = apk_path  # overwrite in place
-
-        ks   = keystore_ctx.get("keystore_path", self.keystore)
-        ali  = keystore_ctx.get("alias",         self.alias)
-        ksp  = keystore_ctx.get("ks_pass",        self.sp)
-        kp   = keystore_ctx.get("key_pass",       self.kp)
-
-        # Try apksigner v1-only first
-        cmd = [
-            apksigner, "sign",
-            "--ks",            ks,
-            "--ks-key-alias",  ali,
-            "--ks-pass",       f"pass:{ksp}",
-            "--key-pass",      f"pass:{kp}",
-            "--v1-signing-enabled", "true",
-            "--v2-signing-enabled", "false",
-            "--v3-signing-enabled", "false",
-            "--out", out,
-            stripped,
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        if r.returncode == 0 and os.path.exists(out):
-            logger.info("[Level6] v1-only re-sign after hardening complete.")
-            try:
-                os.remove(stripped)
-            except Exception:
-                pass
-            return out
-
-        # Fallback — jarsigner v1
-        import shutil as _sh
-        _sh.copy2(stripped, out)
-        cmd2 = [
-            "jarsigner", "-verbose",
-            "-keystore",  ks,
-            "-storepass", ksp,
-            "-keypass",   kp,
-            "-sigalg",    "SHA256withRSA",
-            "-digestalg", "SHA-256",
-            out, ali,
-        ]
-        r2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=120)
-        try:
-            os.remove(stripped)
-        except Exception:
-            pass
-        if r2.returncode == 0:
-            logger.info("[Level6] jarsigner v1-only re-sign after hardening complete.")
-            return out
-        logger.warning("[Level6] v1-only re-sign failed — returning hardened unsigned APK")
-        return out
-
-
 # ── POST-PROTECTION VERIFIER ─────────────────────────────────────────────────
 class PostProtectionVerifier:
     """
@@ -12196,8 +12122,8 @@ class MultiDexEncryptionEngine:
             s        = raw[str_pos:str_pos + blen_val].decode('utf-8', errors='replace')
             entry_size = (str_pos - abs_off) + blen_val + 1
         else:
-            clen = struct.unpack_from('<H', raw, abs_off)[0]
-            s    = raw[abs_off+2:abs_off+2+clen*2].decode('utf-16-le', errors='replace')
+            clen       = struct.unpack_from('<H', raw, abs_off)[0]
+            s          = raw[abs_off+2:abs_off+2+clen*2].decode('utf-16-le', errors='replace')
             entry_size = 2 + clen * 2 + 2
         return s, entry_size
 
@@ -12236,11 +12162,11 @@ class MultiDexEncryptionEngine:
                 break
             if ct == 0x0102:
                 tn_idx = struct.unpack_from('<I', raw, pos + 20)[0]
-                tn = strings[tn_idx] if tn_idx < len(strings) else ''
+                tn     = strings[tn_idx] if tn_idx < len(strings) else ''
                 if tn == 'application':
                     ac = struct.unpack_from('<H', raw, pos + 28)[0]
                     for a in range(ac):
-                        ap = pos + 36 + a * 20
+                        ap     = pos + 36 + a * 20
                         if ap + 20 > len(raw):
                             break
                         an_idx = struct.unpack_from('<I', raw, ap + 4)[0]
@@ -12281,7 +12207,7 @@ class MultiDexEncryptionEngine:
         target_idx     = -1
         target_abs_off = 0
         for i in range(sc):
-            off = struct.unpack_from('<I', raw, ob + i * 4)[0]
+            off     = struct.unpack_from('<I', raw, ob + i * 4)[0]
             abs_off = sa + off
             try:
                 s, _ = MultiDexEncryptionEngine._decode_pool_string(raw, abs_off, is_utf8)
@@ -12312,7 +12238,7 @@ class MultiDexEncryptionEngine:
                 ptr = ob + i * 4
                 struct.pack_into('<I', raw, ptr, struct.unpack_from('<I', raw, ptr)[0] + delta)
             struct.pack_into('<I', raw, sp + 4, struct.unpack_from('<I', raw, sp + 4)[0] + delta)
-            struct.pack_into('<I', raw, 4, struct.unpack_from('<I', raw, 4)[0] + delta)
+            struct.pack_into('<I', raw, 4,      struct.unpack_from('<I', raw, 4)[0]      + delta)
         try:
             manifest_path.write_bytes(bytes(raw))
             logger.info(f"[MultiDex] Manifest patched: '{old_class}' → '{new_class}'")
@@ -18616,21 +18542,6 @@ async def button_handler(update, context):
                     final_apk = b_result["final_apk"]
                     current_apk = final_apk
                     sbs_current_apk[user.id] = current_apk
-                    # Apply ZIP header hardening AFTER signing, then v1-only re-sign
-                    try:
-                        l6_harden = Level6_Signer(work_dir)
-                        _kctx = sbs_keystore_ctx.get(user.id) or keystore_ctx or {}
-                        hardened = await loop.run_in_executor(
-                            None,
-                            lambda: l6_harden.apply_hardening_v1resign(final_apk, _kctx))
-                        if hardened and os.path.exists(hardened):
-                            current_apk = hardened
-                            final_apk   = hardened
-                            sbs_current_apk[user.id] = hardened
-                            build_icons["manifest_entry_hardening"] = "✅"
-                    except Exception as _he:
-                        logger.warning(f"[Phase2] Hardening+resign failed: {_he}")
-                        build_icons["manifest_entry_hardening"] = "⚠️"
 
             # Advance to next step for next click
             sbs_p2_step_idx[user.id] = p2_step + 1
@@ -18883,20 +18794,6 @@ async def button_handler(update, context):
                 if b_op == "sign_apk" and br.get("final_apk"):
                     p1_final = br["final_apk"]
                     sbs_current_apk[user.id] = p1_final
-                    # Apply ZIP header hardening AFTER signing, then v1-only re-sign
-                    try:
-                        l6_harden = Level6_Signer(work_dir)
-                        _kctx = sbs_keystore_ctx.get(user.id) or keystore_ctx or {}
-                        hardened = await loop.run_in_executor(
-                            None,
-                            lambda: l6_harden.apply_hardening_v1resign(p1_final, _kctx))
-                        if hardened and os.path.exists(hardened):
-                            p1_final = hardened
-                            sbs_current_apk[user.id] = hardened
-                            p1_icons["manifest_entry_hardening"] = "✅"
-                    except Exception as _he:
-                        logger.warning(f"[Phase1] Hardening+resign failed: {_he}")
-                        p1_icons["manifest_entry_hardening"] = "⚠️"
 
             build_summary = "\n".join([
                 f"{p1_icons.get(b,'⬜')} {engine.STEP_LABELS.get(b,b)}"
