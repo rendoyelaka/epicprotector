@@ -10868,6 +10868,44 @@ class PreflightValidator:
                     f"✅ {len(dex_files)} DEX file(s): "
                     f"{', '.join(dex_files)}")
 
+                # ── Check 4b: DEX SHA1 + Adler32 checksum verification ─
+                import hashlib as _hl, zlib as _zl, struct as _st
+                dex_checksum_failures = []
+                dex_checksum_results  = []
+                for dex_name in dex_files:
+                    try:
+                        dex_data = zf.read(dex_name)
+                        if len(dex_data) < 112:
+                            dex_checksum_failures.append(f"{dex_name}: too small ({len(dex_data)} bytes)")
+                            continue
+                        if dex_data[:4] != b'dex\n':
+                            dex_checksum_failures.append(f"{dex_name}: invalid DEX magic")
+                            continue
+                        fsf = _st.unpack_from('<I', dex_data, 32)[0]
+                        if fsf != len(dex_data):
+                            dex_checksum_failures.append(f"{dex_name}: size field {fsf} != actual {len(dex_data)}")
+                            continue
+                        adler_s = _st.unpack_from('<I', dex_data, 8)[0]
+                        adler_c = _zl.adler32(dex_data[12:]) & 0xFFFFFFFF
+                        if adler_s != adler_c:
+                            dex_checksum_failures.append(f"{dex_name}: Adler32 mismatch")
+                            continue
+                        sha1_s = dex_data[12:32]
+                        sha1_c = _hl.sha1(dex_data[32:]).digest()
+                        if sha1_s != sha1_c:
+                            dex_checksum_failures.append(f"{dex_name}: SHA1 mismatch")
+                            continue
+                        dex_checksum_results.append(f"{dex_name}: SHA1 ✅ Adler32 ✅")
+                    except Exception as dex_e:
+                        dex_checksum_failures.append(f"{dex_name}: read error — {dex_e}")
+                if dex_checksum_failures:
+                    results["raw"]["dex_integrity_check"] = f"❌ DEX integrity failures: {'; '.join(dex_checksum_failures)}"
+                    results["info"]["dex_integrity_failures"] = dex_checksum_failures
+                    add_issue("critical", "DEX_CHECKSUM_INVALID", f"DEX checksum failed: {'; '.join(dex_checksum_failures)}")
+                else:
+                    results["raw"]["dex_integrity_check"] = f"✅ DEX integrity verified — {', '.join(dex_checksum_results)}"
+                    results["info"]["dex_integrity_ok"] = True
+
                 # ── Check 5: resources.arsc ───────────────────────────────────
                 if "resources.arsc" in names:
                     results["raw"]["resources_check"] = "✅ resources.arsc present"
@@ -11998,7 +12036,6 @@ class MultiDexEncryptionEngine:
         results["loader_injected"] = True
 
         # ── Detect the original Application class from manifest ───────────────
-        # Manifest is binary AXML (decoded with -r flag) — text regex won't work.
         original_app_class = None
         manifest_pre = ws / "AndroidManifest.xml"
         if manifest_pre.exists():
@@ -12122,8 +12159,8 @@ class MultiDexEncryptionEngine:
             s        = raw[str_pos:str_pos + blen_val].decode('utf-8', errors='replace')
             entry_size = (str_pos - abs_off) + blen_val + 1
         else:
-            clen       = struct.unpack_from('<H', raw, abs_off)[0]
-            s          = raw[abs_off+2:abs_off+2+clen*2].decode('utf-16-le', errors='replace')
+            clen = struct.unpack_from('<H', raw, abs_off)[0]
+            s    = raw[abs_off+2:abs_off+2+clen*2].decode('utf-16-le', errors='replace')
             entry_size = 2 + clen * 2 + 2
         return s, entry_size
 
@@ -12162,11 +12199,11 @@ class MultiDexEncryptionEngine:
                 break
             if ct == 0x0102:
                 tn_idx = struct.unpack_from('<I', raw, pos + 20)[0]
-                tn     = strings[tn_idx] if tn_idx < len(strings) else ''
+                tn = strings[tn_idx] if tn_idx < len(strings) else ''
                 if tn == 'application':
                     ac = struct.unpack_from('<H', raw, pos + 28)[0]
                     for a in range(ac):
-                        ap     = pos + 36 + a * 20
+                        ap = pos + 36 + a * 20
                         if ap + 20 > len(raw):
                             break
                         an_idx = struct.unpack_from('<I', raw, ap + 4)[0]
@@ -12207,7 +12244,7 @@ class MultiDexEncryptionEngine:
         target_idx     = -1
         target_abs_off = 0
         for i in range(sc):
-            off     = struct.unpack_from('<I', raw, ob + i * 4)[0]
+            off = struct.unpack_from('<I', raw, ob + i * 4)[0]
             abs_off = sa + off
             try:
                 s, _ = MultiDexEncryptionEngine._decode_pool_string(raw, abs_off, is_utf8)
@@ -12238,10 +12275,10 @@ class MultiDexEncryptionEngine:
                 ptr = ob + i * 4
                 struct.pack_into('<I', raw, ptr, struct.unpack_from('<I', raw, ptr)[0] + delta)
             struct.pack_into('<I', raw, sp + 4, struct.unpack_from('<I', raw, sp + 4)[0] + delta)
-            struct.pack_into('<I', raw, 4,      struct.unpack_from('<I', raw, 4)[0]      + delta)
+            struct.pack_into('<I', raw, 4, struct.unpack_from('<I', raw, 4)[0] + delta)
         try:
             manifest_path.write_bytes(bytes(raw))
-            logger.info(f"[MultiDex] Manifest patched: '{old_class}' → '{new_class}'")
+            logger.info(f"[MultiDex] Manifest patched: '{old_class}' \u2192 '{new_class}'")
             return True
         except Exception as e:
             logger.warning(f"[MultiDex] Failed to write manifest: {e}")
@@ -15331,6 +15368,320 @@ class PostObfuscationVerifier:
             'checks':  results,
             'report':  '\n'.join(report_lines),
         }
+
+
+# ── STRING VAULT ENGINE ───────────────────────────────────────────────────────
+class StringVaultEngine:
+
+    VAULT_PKG = "com/epicprotector/vault"
+    VAULT_CLS = "EpicStringVault"
+
+    @staticmethod
+    def _xor_b64(plaintext, key):
+        import base64
+        enc = plaintext.encode("utf-8")
+        out = bytes(enc[i] ^ key[i % len(key)] for i in range(len(enc)))
+        return base64.b64encode(out).decode("utf-8")
+
+    def _build_vault_smali(self, key):
+        half = len(key) // 2
+        ka, kb = key[:half], key[half:]
+
+        def fill(var, data, t1, t2):
+            lines = [
+                "    const/16 %s, %d" % (var, len(data)),
+                "    new-array %s, %s, [B" % (var, var),
+            ]
+            for i, b in enumerate(data):
+                signed = b if b < 128 else b - 256
+                lines += [
+                    "    const/4 %s, %d" % (t1, i),
+                    "    const/16 %s, %d" % (t2, signed),
+                    "    int-to-byte %s, %s" % (t2, t2),
+                    "    aput-byte %s, %s, %s" % (t2, var, t1),
+                ]
+            return "\n".join(lines)
+
+        clinit = (
+            ".method static constructor <clinit>()V\n"
+            "    .locals 3\n"
+            "    :try_start_0\n"
+            + fill("v0", ka, "v1", "v2") + "\n"
+            + "    sput-object v0, Lcom/epicprotector/vault/EpicStringVault;->KA:[B\n"
+            + fill("v0", kb, "v1", "v2") + "\n"
+            + "    sput-object v0, Lcom/epicprotector/vault/EpicStringVault;->KB:[B\n"
+            "    :try_end_0\n"
+            "    return-void\n"
+            "    :catch_0\n"
+            "    return-void\n"
+            "    .catch Ljava/lang/Exception; {:try_start_0 .. :try_end_0} :catch_0\n"
+            ".end method\n"
+        )
+
+        restore = (
+            ".method public static r(Ljava/lang/String;)Ljava/lang/String;\n"
+            "    .locals 6\n"
+            "    :try_start_r\n"
+            "    const/4 v0, 0x0\n"
+            "    invoke-static {p0, v0}, Landroid/util/Base64;->decode(Ljava/lang/String;I)[B\n"
+            "    move-result-object v0\n"
+            "    array-length v1, v0\n"
+            "    new-array v2, v1, [B\n"
+            "    const/4 v3, 0x0\n"
+            "    sget-object v4, Lcom/epicprotector/vault/EpicStringVault;->KA:[B\n"
+            "    array-length v4, v4\n"
+            "    sget-object v5, Lcom/epicprotector/vault/EpicStringVault;->KB:[B\n"
+            "    array-length v5, v5\n"
+            "    add-int/2addr v4, v5\n"
+            "    :loop_r\n"
+            "    if-ge v3, v1, :end_r\n"
+            "    rem-int v5, v3, v4\n"
+            "    sget-object v4, Lcom/epicprotector/vault/EpicStringVault;->KA:[B\n"
+            "    array-length v4, v4\n"
+            "    if-ge v5, v4, :use_kb_r\n"
+            "    sget-object v4, Lcom/epicprotector/vault/EpicStringVault;->KA:[B\n"
+            "    aget-byte v4, v4, v5\n"
+            "    goto :xor_r\n"
+            "    :use_kb_r\n"
+            "    sget-object v4, Lcom/epicprotector/vault/EpicStringVault;->KB:[B\n"
+            "    array-length v5, v4\n"
+            "    rem-int v5, v3, v5\n"
+            "    aget-byte v4, v4, v5\n"
+            "    :xor_r\n"
+            "    aget-byte v5, v0, v3\n"
+            "    xor-int/2addr v5, v4\n"
+            "    int-to-byte v5, v5\n"
+            "    aput-byte v5, v2, v3\n"
+            "    add-int/lit8 v3, v3, 0x1\n"
+            "    sget-object v4, Lcom/epicprotector/vault/EpicStringVault;->KA:[B\n"
+            "    array-length v4, v4\n"
+            "    sget-object v5, Lcom/epicprotector/vault/EpicStringVault;->KB:[B\n"
+            "    array-length v5, v5\n"
+            "    add-int/2addr v4, v5\n"
+            "    goto :loop_r\n"
+            "    :end_r\n"
+            "    new-instance v3, Ljava/lang/String;\n"
+            "    const-string v4, \"UTF-8\"\n"
+            "    invoke-direct {v3, v2, v4}, Ljava/lang/String;-><init>([BLjava/lang/String;)V\n"
+            "    :try_end_r\n"
+            "    return-object v3\n"
+            "    :catch_r\n"
+            "    return-object p0\n"
+            "    .catch Ljava/lang/Exception; {:try_start_r .. :try_end_r} :catch_r\n"
+            ".end method\n"
+        )
+
+        return (
+            ".class public final Lcom/epicprotector/vault/EpicStringVault;\n"
+            ".super Ljava/lang/Object;\n"
+            ".source \"A.java\"\n\n"
+            ".field private static final KA:[B\n"
+            ".field private static final KB:[B\n\n"
+            + clinit + "\n" + restore
+        )
+
+    def apply(self, workspace_dir, key):
+        ws = Path(workspace_dir)
+        vault_dir = ws / "smali" / self.VAULT_PKG
+        vault_dir.mkdir(parents=True, exist_ok=True)
+        vault_smali = vault_dir / (self.VAULT_CLS + ".smali")
+        vault_smali.write_text(self._build_vault_smali(key), encoding="utf-8")
+        logger.info("[StringVault] Vault class placed: %s" % vault_smali)
+
+        SKIP_DESCS = ("Landroid/", "Lcom/", "Ljava/", "Lorg/", "Ldalvik/")
+        concealed = 0
+        files_done = 0
+        skipped = 0
+
+        for sdir in ws.glob("smali*"):
+            for sf in sdir.rglob("*.smali"):
+                if "epicprotector" in sf.as_posix():
+                    continue
+                try:
+                    original = sf.read_text(encoding="utf-8", errors="ignore")
+                    lines = original.splitlines(keepends=True)
+                    out_lines = []
+                    i = 0
+                    file_mod = False
+                    while i < len(lines):
+                        line = lines[i]
+                        if re.match(r"\s*\.method\s+", line):
+                            method_lines = [line]
+                            i += 1
+                            while i < len(lines):
+                                method_lines.append(lines[i])
+                                if re.match(r"\s*\.end method", lines[i]):
+                                    i += 1
+                                    break
+                                i += 1
+                            new_method, cnt = self._process_method(method_lines, key, SKIP_DESCS)
+                            out_lines.extend(new_method)
+                            if cnt:
+                                concealed += cnt
+                                file_mod = True
+                        else:
+                            out_lines.append(line)
+                            i += 1
+                    if file_mod:
+                        sf.write_text("".join(out_lines), encoding="utf-8")
+                        files_done += 1
+                except Exception as e:
+                    logger.warning("[StringVault] Skipped %s: %s" % (sf.name, e))
+                    skipped += 1
+
+        logger.info("[StringVault] Concealed %d strings across %d files (%d skipped)" % (
+            concealed, files_done, skipped))
+        return {"concealed": concealed, "files": files_done, "skipped": skipped}
+
+    def _process_method(self, method_lines, key, skip_descs):
+        locals_val = -1
+        locals_idx = -1
+        for idx, line in enumerate(method_lines[:20]):
+            m = re.match(r"(\s*\.locals\s+)(\d+)", line)
+            if m:
+                locals_val = int(m.group(2))
+                locals_idx = idx
+                break
+        if locals_val < 0:
+            return method_lines, 0
+
+        vault_reg = "v%d" % locals_val
+        new_lines = list(method_lines)
+        count = 0
+        need_bump = False
+
+        for idx, line in enumerate(new_lines):
+            m = re.match(r'^(\s*)const-string\s+(v\d+|p\d+)(,\s*)"([^"]{2,180})"', line)
+            if not m:
+                continue
+            value = m.group(4)
+            if any(value.startswith(p) for p in skip_descs):
+                continue
+            if not value.strip():
+                continue
+            if len(value) > 80 and " " not in value:
+                continue
+            encoded = self._xor_b64(value, key)
+            indent = m.group(1)
+            dst_reg = m.group(2)
+            replacement = (
+                "%sconst-string %s, \"%s\"\n"
+                "%sinvoke-static {%s}, Lcom/epicprotector/vault/EpicStringVault;"
+                "->r(Ljava/lang/String;)Ljava/lang/String;\n"
+                "%smove-result-object %s\n"
+            ) % (indent, vault_reg, encoded, indent, vault_reg, indent, dst_reg)
+            new_lines[idx] = replacement
+            count += 1
+            need_bump = True
+
+        if need_bump and locals_idx >= 0:
+            new_lines[locals_idx] = re.sub(
+                r"(\.locals\s+)\d+",
+                lambda mm: "%s%d" % (mm.group(1), locals_val + 1),
+                new_lines[locals_idx])
+
+        return new_lines, count
+
+
+# ── FLOW REWRITER ENGINE ──────────────────────────────────────────────────────
+class FlowRewriterEngine:
+
+    @staticmethod
+    def _rname(n=8):
+        return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
+    def apply(self, workspace_dir):
+        ws = Path(workspace_dir)
+        injected = 0
+        files = 0
+        skipped = 0
+        for sdir in ws.glob("smali*"):
+            for sf in sdir.rglob("*.smali"):
+                if "epicprotector" in sf.as_posix():
+                    continue
+                try:
+                    original = sf.read_text(encoding="utf-8", errors="ignore")
+                    result, cnt = self._process_file(original)
+                    if cnt:
+                        sf.write_text(result, encoding="utf-8")
+                        injected += cnt
+                        files += 1
+                except Exception as e:
+                    logger.warning("[FlowRewriter] Skipped %s: %s" % (sf.name, e))
+                    skipped += 1
+        logger.info("[FlowRewriter] Injected %d branches across %d files (%d skipped)" % (
+            injected, files, skipped))
+        return {"injected": injected, "files": files, "skipped": skipped}
+
+    def _process_file(self, content):
+        lines = content.splitlines(keepends=True)
+        out = []
+        i = 0
+        total = 0
+        while i < len(lines):
+            line = lines[i]
+            if re.match(r"\s*\.method\s+", line):
+                method_lines = [line]
+                i += 1
+                while i < len(lines):
+                    method_lines.append(lines[i])
+                    if re.match(r"\s*\.end method", lines[i]):
+                        i += 1
+                        break
+                    i += 1
+                new_method, cnt = self._inject_method(method_lines)
+                out.extend(new_method)
+                total += cnt
+            else:
+                out.append(line)
+                i += 1
+        return "".join(out), total
+
+    def _inject_method(self, method_lines):
+        locals_val = -1
+        for line in method_lines[:15]:
+            m = re.match(r"\s*\.locals\s+(\d+)", line)
+            if m:
+                locals_val = int(m.group(1))
+                break
+        if locals_val < 1:
+            return method_lines, 0
+
+        reg = "v%d" % (locals_val - 1)
+        TERMINATORS = re.compile(r"^\s*(goto|return|throw|packed-switch|sparse-switch)")
+        OPCODE = re.compile(r"^\s+[a-z]")
+        in_try = 0
+        injectable = []
+
+        for idx, line in enumerate(method_lines):
+            if re.match(r"\s*:try_start_", line): in_try += 1
+            if re.match(r"\s*:try_end_", line):   in_try -= 1
+            if in_try > 0: continue
+            if idx < 2 or idx >= len(method_lines) - 2: continue
+            prev = method_lines[idx - 1]
+            if (OPCODE.match(prev) and not TERMINATORS.match(prev)
+                    and OPCODE.match(line)
+                    and not re.match(r"\s*\.(locals|registers|param|prologue|line)", line)):
+                injectable.append(idx)
+
+        if not injectable:
+            return method_lines, 0
+
+        positions = sorted(random.sample(injectable, min(2, len(injectable))), reverse=True)
+        out = list(method_lines)
+        for pos in positions:
+            tag = self._rname(8)
+            stub = (
+                "    const/4 %s, 0x1\n"
+                "    if-ne %s, %s, :ep_d_%s\n"
+                "    goto :ep_s_%s\n"
+                "    :ep_d_%s\n"
+                "    nop\n"
+                "    :ep_s_%s\n"
+            ) % (reg, reg, reg, tag, tag, tag, tag)
+            out.insert(pos, stub)
+
+        return out, len(positions)
 
 
 # ── ENTROPY NORMALISER ENGINE ─────────────────────────────────────────────────
