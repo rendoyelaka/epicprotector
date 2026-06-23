@@ -13749,6 +13749,7 @@ class ManualControlEngine:
                     "obfuscation", "safe_rename", "encryption",
                     "security_guard", "tamper_detection", "dex_repackaging",
                     "native_methods_obfuscation", "dex_sourcefile_strip",
+                    "string_vault", "flow_rewriter",
                 }
                 # Use completed_ops passed from caller — accurate per-session
                 # If no smali-modifying ops ran — bypass apktool entirely
