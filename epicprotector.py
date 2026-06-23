@@ -12560,6 +12560,8 @@ class ProtectionScoreEngine:
         "decode_workspace":      3,
         "safe_rename":           7,
         "obfuscation":           10,
+        "string_vault":          9,
+        "flow_rewriter":          8,
         "security_guard":        10,
         "tamper_detection":      9,
         "encryption":            10,
@@ -12708,6 +12710,8 @@ class ManualControlEngine:
         "decode_workspace":     "📂 Decode → Workspace",
         "safe_rename":          "✏️ Safe Rename",
         "obfuscation":          "🔀 Obfuscation",
+        "string_vault":         "🔒 String Vault",
+        "flow_rewriter":         "🌀 Flow Rewriter",
         "security_guard":       "🛡️ Security Guard",
         "tamper_detection":     "🛑 Tamper Detection",
         "encryption":           "🔐 Encryption",
@@ -13257,7 +13261,7 @@ class ManualControlEngine:
 
         # Track whether this step modifies smali — used by rebuild bypass logic
         SMALI_MODIFYING_STEPS = {
-            "obfuscation", "safe_rename", "encryption", "security_guard",
+            "obfuscation", "string_vault", "flow_rewriter", "safe_rename", "encryption", "security_guard",
             "tamper_detection", "dex_repackaging",
             "dex_sourcefile_strip", "resource_normalisation",
         }
@@ -13266,7 +13270,7 @@ class ManualControlEngine:
 
         # Steps that require a decoded workspace — fail cleanly if not present
         NEEDS_WORKSPACE = {
-            "safe_rename", "obfuscation", "security_guard", "tamper_detection",
+            "safe_rename", "obfuscation", "string_vault", "flow_rewriter", "security_guard", "tamper_detection",
             "encryption", "dex_repackaging", "metadata_stripping",
             "apk_size_optimizer", "rebuild_apk", "string_splitting",
             "dex_sourcefile_strip", "resource_normalisation",
@@ -14136,6 +14140,41 @@ class ManualControlEngine:
                 result["files_fixed"]  = res_result.get("files_fixed", 0)
                 result["refs_fixed"]   = res_result.get("refs_fixed", 0)
                 result["status"]       = res_result.get("status", "✅ Done")
+
+            elif op_key == "string_vault":
+                try:
+                    vault_key = os.urandom(32)
+                    sve = StringVaultEngine()
+                    sv_result = sve.apply(workspace, vault_key)
+                    result["status"] = (
+                        f"✅ String Vault — {sv_result['concealed']} strings concealed "
+                        f"across {sv_result['files']} files"
+                    )
+                    result["concealed"] = sv_result["concealed"]
+                    result["files"]     = sv_result["files"]
+                    logger.info(
+                        f"[StringVault] Done — {sv_result['concealed']} strings "
+                        f"concealed across {sv_result['files']} files")
+                except Exception as e:
+                    result["status"] = f"❌ String Vault failed: {e}"
+                    logger.warning(f"[StringVault] Failed: {e}")
+
+            elif op_key == "flow_rewriter":
+                try:
+                    fre = FlowRewriterEngine()
+                    fr_result = fre.apply(workspace)
+                    result["status"] = (
+                        f"✅ Flow Rewriter — {fr_result['injected']} branches injected "
+                        f"across {fr_result['files']} files"
+                    )
+                    result["injected"] = fr_result["injected"]
+                    result["files"]    = fr_result["files"]
+                    logger.info(
+                        f"[FlowRewriter] Done — {fr_result['injected']} branches "
+                        f"across {fr_result['files']} files")
+                except Exception as e:
+                    result["status"] = f"❌ Flow Rewriter failed: {e}"
+                    logger.warning(f"[FlowRewriter] Failed: {e}")
 
             elif op_key == "native_methods_obfuscation":
                 native_engine = NativeMethodsObfuscationEngine()
@@ -18133,6 +18172,9 @@ SBS_PHASES = [
         "label": "Phase 2 — Code Protection",
         "icon":  "🛡️",
         "steps": [
+            "obfuscation",
+            "string_vault",
+            "flow_rewriter",
             "dex_repackaging",
             "security_guard",
             "tamper_detection",
