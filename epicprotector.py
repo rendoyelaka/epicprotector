@@ -18912,12 +18912,12 @@ async def button_handler(update, context):
                 try:
                     b_result = await loop.run_in_executor(
                         None,
-                        lambda o=_b_op: engine.run_operation(
+                        lambda o=_b_op, d=_done: engine.run_operation(
                             o, current_apk, current_ws,
                             work_dir, aes_key, tools, scanner,
                             rebuilt_apk_override=current_apk,
                             keystore_ctx=keystore_ctx,
-                            completed_ops=set(done_steps)))
+                            completed_ops=d))
                 except Exception as e:
                     b_result = {"status": f"❌ {str(e)[:150]}"}
 
