@@ -12463,6 +12463,271 @@ class ManifestEntryHardeningEngine:
             return result
 
 
+# ── ARCHIVE PADDER ENGINE ────────────────────────────────────────────────────
+class ArchivePadderEngine:
+    """
+    Archive Protection Layer — adds protection marker entries to the APK ZIP.
+
+    Inserts entries with Unicode Hangul Filler (U+3164) path sequences into
+    the ZIP Central Directory. These entries are invisible to standard analysis
+    tools and cause automated scanners to miscount or misparse the archive.
+
+    Android PackageManager ignores unknown entries — zero runtime impact.
+    Protected entries (AndroidManifest.xml, classes.dex, resources.arsc)
+    are never modified.
+
+    Position in pipeline: after manifest_entry_hardening, before archive_footer.
+    Operates on the built APK file — not the workspace.
+    """
+
+    FILLER_CHAR   = "\u3164"          # Hangul Filler — invisible, valid Unicode
+    TARGET_COUNT  = 408               # protection marker entries to add
+    ENTRY_MIN_SZ  = 0                 # stored size zero — no data content
+    PROTECTED     = {
+        "AndroidManifest.xml", "classes.dex", "resources.arsc"
+    }
+
+    def apply(self, apk_path: str) -> dict:
+        import struct, random, io
+
+        result = {
+            "status":          "❌ Archive Padder failed",
+            "entries_added":   0,
+            "apk_path":        apk_path,
+        }
+
+        if not apk_path or not os.path.exists(apk_path):
+            result["status"] = "❌ APK file not found"
+            return result
+
+        try:
+            # Read all existing entries
+            with zipfile.ZipFile(apk_path, "r") as zin:
+                existing = zin.infolist()
+                entry_data = {e.filename: zin.read(e.filename) for e in existing}
+
+            tmp_path = apk_path + ".archpad.tmp"
+
+            with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED,
+                                 allowZip64=False) as zout:
+                # Write all original entries first — preserve exact compression
+                for info in existing:
+                    zout.writestr(info, entry_data[info.filename])
+
+                # Add protection marker entries
+                added = 0
+                for i in range(self.TARGET_COUNT):
+                    # Build path: varying-depth Hangul filler segments
+                    depth   = random.randint(1, 4)
+                    parts   = [
+                        self.FILLER_CHAR * random.randint(2, 6)
+                        for _ in range(depth)
+                    ]
+                    # Append index suffix to guarantee uniqueness
+                    marker_name = "/".join(parts) + f"/{i:04x}"
+                    zout.writestr(marker_name, b"")
+                    added += 1
+
+            os.replace(tmp_path, apk_path)
+
+            result["status"]        = (
+                f"✅ Archive protection applied — "
+                f"{added} marker entries added"
+            )
+            result["entries_added"] = added
+            logger.info(
+                f"[ArchivePadder] {added} marker entries added to {os.path.basename(apk_path)}"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"[ArchivePadder] Error: {e}")
+            if os.path.exists(apk_path + ".archpad.tmp"):
+                try:
+                    os.remove(apk_path + ".archpad.tmp")
+                except Exception:
+                    pass
+            result["status"] = f"❌ Archive Padder error: {e}"
+            return result
+
+
+# ── ENTRY PADDER ENGINE ───────────────────────────────────────────────────────
+class EntryPadderEngine:
+    """
+    Entry Field Protection Layer — extends the extra field of existing ZIP entries.
+
+    Appends random-length padding to the local file header extra field of
+    all non-protected entries. This disrupts tools that rely on fixed extra
+    field offsets for parsing and breaks naive ZIP structure walkers.
+
+    Protected entries (AndroidManifest.xml, classes.dex, resources.arsc)
+    are never modified.
+
+    Position in pipeline: after archive_padder, before archive_footer.
+    Operates on the built APK file binary directly — not via zipfile module.
+    """
+
+    PROTECTED   = {b"AndroidManifest.xml", b"classes.dex", b"resources.arsc"}
+    PAD_MIN     = 8     # minimum extra field padding bytes
+    PAD_MAX     = 48    # maximum extra field padding bytes
+    LFH_SIG     = b"PK\x03\x04"
+
+    def apply(self, apk_path: str) -> dict:
+        import struct, random
+
+        result = {
+            "status":        "❌ Entry Padder failed",
+            "entries_padded": 0,
+            "bytes_added":    0,
+            "apk_path":       apk_path,
+        }
+
+        if not apk_path or not os.path.exists(apk_path):
+            result["status"] = "❌ APK file not found"
+            return result
+
+        try:
+            data    = bytearray(open(apk_path, "rb").read())
+            out     = bytearray()
+            pos     = 0
+            padded  = 0
+            total_added = 0
+
+            # Build patched binary by scanning all Local File Headers
+            while pos < len(data):
+                if data[pos:pos+4] == self.LFH_SIG and pos + 30 <= len(data):
+                    fname_len   = struct.unpack_from("<H", data, pos + 26)[0]
+                    extra_len   = struct.unpack_from("<H", data, pos + 28)[0]
+                    fname_bytes = data[pos+30 : pos+30+fname_len]
+
+                    # Header size + filename + original extra + file data
+                    comp_size   = struct.unpack_from("<I", data, pos + 18)[0]
+                    header_end  = pos + 30 + fname_len + extra_len
+                    entry_end   = header_end + comp_size
+
+                    if fname_bytes in self.PROTECTED:
+                        # Pass through protected entries unchanged
+                        out += data[pos:entry_end]
+                        pos  = entry_end
+                        continue
+
+                    # Build padding block — random bytes
+                    pad_size = random.randint(self.PAD_MIN, self.PAD_MAX)
+                    padding  = bytes(random.randint(0, 255) for _ in range(pad_size))
+
+                    new_extra_len = extra_len + pad_size
+
+                    # Write patched LFH with updated extra_len field
+                    lfh = bytearray(data[pos:pos+30])
+                    struct.pack_into("<H", lfh, 28, new_extra_len)
+                    out += bytes(lfh)
+                    # Original filename
+                    out += data[pos+30 : pos+30+fname_len]
+                    # Original extra + new padding
+                    out += data[pos+30+fname_len : header_end]
+                    out += padding
+                    # File data unchanged
+                    out += data[header_end:entry_end]
+
+                    padded      += 1
+                    total_added += pad_size
+                    pos          = entry_end
+                else:
+                    # Non-LFH bytes (Central Directory, EOCD, etc.) — pass through
+                    out += data[pos:pos+1]
+                    pos += 1
+
+            with open(apk_path, "wb") as f:
+                f.write(out)
+
+            result["status"]         = (
+                f"✅ Entry field protection applied — "
+                f"{padded} entries padded, {total_added} bytes added"
+            )
+            result["entries_padded"] = padded
+            result["bytes_added"]    = total_added
+            logger.info(
+                f"[EntryPadder] {padded} entries padded, "
+                f"{total_added} bytes added"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"[EntryPadder] Error: {e}")
+            result["status"] = f"❌ Entry Padder error: {e}"
+            return result
+
+
+# ── ARCHIVE FOOTER SHIELD ENGINE ─────────────────────────────────────────────
+class ArchiveFooterShieldEngine:
+    """
+    Archive Footer Shield — appends a protection comment to the ZIP EOCD record.
+
+    The ZIP End of Central Directory (EOCD) comment field accepts up to 65,535
+    bytes of arbitrary data. Android PackageManager reads the comment field
+    length but ignores its content — zero runtime impact.
+
+    Analysis tools that do not handle EOCD comment data correctly will fail
+    to locate the start of the Central Directory, causing parse failures.
+
+    Position in pipeline: after entry_padder, before integrity_manifest.
+    Operates on the built APK file binary directly.
+    """
+
+    COMMENT_MIN = 64    # minimum comment bytes
+    COMMENT_MAX = 256   # maximum comment bytes
+    EOCD_SIG    = b"PK\x05\x06"
+
+    def apply(self, apk_path: str) -> dict:
+        import struct, random
+
+        result = {
+            "status":       "❌ Archive Footer Shield failed",
+            "comment_bytes": 0,
+            "apk_path":      apk_path,
+        }
+
+        if not apk_path or not os.path.exists(apk_path):
+            result["status"] = "❌ APK file not found"
+            return result
+
+        try:
+            data     = bytearray(open(apk_path, "rb").read())
+            eocd_off = data.rfind(self.EOCD_SIG)
+
+            if eocd_off < 0:
+                result["status"] = "❌ EOCD signature not found in APK"
+                return result
+
+            comment_size = random.randint(self.COMMENT_MIN, self.COMMENT_MAX)
+            comment      = bytes(random.randint(0, 255) for _ in range(comment_size))
+
+            # Patch EOCD comment length field (offset +20, 2 bytes LE)
+            struct.pack_into("<H", data, eocd_off + 20, comment_size)
+
+            # Append comment after the 22-byte EOCD record
+            # Any existing comment is replaced (truncated first)
+            patched = bytes(data[:eocd_off + 22]) + comment
+
+            with open(apk_path, "wb") as f:
+                f.write(patched)
+
+            result["status"]        = (
+                f"✅ Archive footer shield applied — "
+                f"{comment_size} byte comment written"
+            )
+            result["comment_bytes"] = comment_size
+            logger.info(
+                f"[ArchiveFooter] {comment_size} byte comment written to EOCD"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"[ArchiveFooter] Error: {e}")
+            result["status"] = f"❌ Archive Footer Shield error: {e}"
+            return result
+
+
 # ── PSEUDO ENCRYPTION ENGINE ─────────────────────────────────────────────────
 
 
@@ -12569,6 +12834,9 @@ class ProtectionScoreEngine:
         "apk_size_optimizer":    2,
         "rebuild_apk":           3,
         "manifest_entry_hardening": 8, # ZIP header anti-analysis — tool blocking layer
+        "archive_padder":           7, # archive protection marker entries
+        "entry_padder":             6, # entry extra field protection
+        "archive_footer":           5, # EOCD footer shield
         "integrity_manifest":    5,
         "aes_key_management":    4,
         "keystore_generation":   5,
@@ -12635,6 +12903,9 @@ class ManualControlEngine:
         "apk_size_optimizer":         ["decode_workspace"],
         "rebuild_apk":                ["decode_workspace"],
         "manifest_entry_hardening":   ["rebuild_apk"],
+        "archive_padder":             ["rebuild_apk", "manifest_entry_hardening"],
+        "entry_padder":               ["rebuild_apk", "archive_padder"],
+        "archive_footer":             ["rebuild_apk", "entry_padder"],
         "integrity_manifest":         ["rebuild_apk"],
         "certificate_aging":          ["rebuild_apk"],
         "keystore_generation":        ["rebuild_apk"],
@@ -12659,7 +12930,10 @@ class ManualControlEngine:
         "apk_size_optimizer":         "aes_key_management",
         "aes_key_management":         "rebuild_apk",
         "rebuild_apk":                "manifest_entry_hardening",
-        "manifest_entry_hardening":   "integrity_manifest",
+        "manifest_entry_hardening":   "archive_padder",
+        "archive_padder":             "entry_padder",
+        "entry_padder":               "archive_footer",
+        "archive_footer":             "integrity_manifest",
         "integrity_manifest":         "certificate_aging",
         "certificate_aging":          "unique_fingerprint",
         "keystore_generation":        "unique_fingerprint",
@@ -12688,7 +12962,10 @@ class ManualControlEngine:
         # ── Phase 4: Build ────────────────────────────────────────────────────
         "rebuild_apk",             # 20. rebuild — all changes baked in
         "manifest_entry_hardening", # 21. ZIP header protection — anti-analysis layer
-        "integrity_manifest",      # 22. hash final APK state — correct hashes
+        "archive_padder",          # 22. archive protection marker entries
+        "entry_padder",            # 23. entry extra field protection
+        "archive_footer",          # 24. EOCD footer shield
+        "integrity_manifest",      # 25. hash final APK state — correct hashes
         # ── Phase 5: Sign with Coherent Identity + GPP Lineage ───────────────
         # Path A — GPP optimised: certificate_aging → unique_fingerprint → signing_lineage
         # Path B — Standard:      keystore_generation → unique_fingerprint → zipalign → sign_apk
@@ -12719,6 +12996,9 @@ class ManualControlEngine:
         "apk_size_optimizer":   "📦 APK Size Optimizer",
         "rebuild_apk":          "🔨 Rebuild APK",
         "manifest_entry_hardening": "🛡️ Manifest Entry Hardening",
+        "archive_padder":           "📦 Archive Protection Layer",
+        "entry_padder":             "🗂️ Entry Field Protection",
+        "archive_footer":           "🔒 Archive Footer Shield",
         "integrity_manifest":   "🔗 Integrity Manifest",
         "aes_key_management":   "🔑 AES Key Management",
         "keystore_generation":  "🗝️ Keystore Generation",
@@ -13768,8 +14048,7 @@ class ManualControlEngine:
                     "✅ APK rebuilt via apktool — all smali changes compiled"
                 )
 
-            elif op_key == "manifest_entry_hardening":
-                # Operates on the built APK — after rebuild_apk and zipalign
+            elif op_key == "manifest_entry_hardening":                # Operates on the built APK — after rebuild_apk and zipalign
                 # Prefer aligned.apk (produced by zipalign) over rebuilt.apk
                 # so zipalign does not destroy the non-standard compression later
                 meh_apk = None
@@ -13807,6 +14086,70 @@ class ManualControlEngine:
                     result["comp_type"]   = meh_result.get("comp_type")
                     result["extra_bytes"] = meh_result.get("extra_bytes", 0)
                     result["status"]      = meh_result.get("status", "❌ Manifest Entry Hardening failed")
+
+            elif op_key == "archive_padder":
+                _ap_apk = None
+                for _candidate in ["aligned.apk", "rebuilt.apk"]:
+                    _p = os.path.join(work_dir, _candidate)
+                    if os.path.exists(_p):
+                        _ap_apk = _p
+                        break
+                if not _ap_apk and rebuilt_apk_override and os.path.exists(rebuilt_apk_override):
+                    _ap_apk = rebuilt_apk_override
+                if not _ap_apk:
+                    for _found in list(Path(work_dir).rglob("rebuilt.apk")):
+                        _ap_apk = str(_found)
+                        break
+                if not _ap_apk:
+                    result["status"] = "❌ Archive Padder — no APK found"
+                else:
+                    _ap_engine = ArchivePadderEngine()
+                    _ap_result = _ap_engine.apply(_ap_apk)
+                    result["entries_added"] = _ap_result.get("entries_added", 0)
+                    result["status"]        = _ap_result.get("status", "❌ Archive Padder failed")
+
+            elif op_key == "entry_padder":
+                _ep_apk = None
+                for _candidate in ["aligned.apk", "rebuilt.apk"]:
+                    _p = os.path.join(work_dir, _candidate)
+                    if os.path.exists(_p):
+                        _ep_apk = _p
+                        break
+                if not _ep_apk and rebuilt_apk_override and os.path.exists(rebuilt_apk_override):
+                    _ep_apk = rebuilt_apk_override
+                if not _ep_apk:
+                    for _found in list(Path(work_dir).rglob("rebuilt.apk")):
+                        _ep_apk = str(_found)
+                        break
+                if not _ep_apk:
+                    result["status"] = "❌ Entry Padder — no APK found"
+                else:
+                    _ep_engine = EntryPadderEngine()
+                    _ep_result = _ep_engine.apply(_ep_apk)
+                    result["entries_padded"] = _ep_result.get("entries_padded", 0)
+                    result["bytes_added"]    = _ep_result.get("bytes_added", 0)
+                    result["status"]         = _ep_result.get("status", "❌ Entry Padder failed")
+
+            elif op_key == "archive_footer":
+                _af_apk = None
+                for _candidate in ["aligned.apk", "rebuilt.apk"]:
+                    _p = os.path.join(work_dir, _candidate)
+                    if os.path.exists(_p):
+                        _af_apk = _p
+                        break
+                if not _af_apk and rebuilt_apk_override and os.path.exists(rebuilt_apk_override):
+                    _af_apk = rebuilt_apk_override
+                if not _af_apk:
+                    for _found in list(Path(work_dir).rglob("rebuilt.apk")):
+                        _af_apk = str(_found)
+                        break
+                if not _af_apk:
+                    result["status"] = "❌ Archive Footer Shield — no APK found"
+                else:
+                    _af_engine = ArchiveFooterShieldEngine()
+                    _af_result = _af_engine.apply(_af_apk)
+                    result["comment_bytes"] = _af_result.get("comment_bytes", 0)
+                    result["status"]        = _af_result.get("status", "❌ Archive Footer Shield failed")
 
             elif op_key == "integrity_manifest":
                 guardian = IntegrityGuardian(work_dir)
@@ -18511,6 +18854,9 @@ SBS_PHASES = [
         "steps": [
             "rebuild_apk",
             "manifest_entry_hardening",
+            "archive_padder",
+            "entry_padder",
+            "archive_footer",
             "integrity_manifest",
         ],
     },
