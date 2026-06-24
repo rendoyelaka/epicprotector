@@ -15944,6 +15944,20 @@ class StringVaultEngine:
             )
             if any(value == sv for sv in SKIP_VALUES):
                 continue
+            # Skip pure Base64-encoded data strings — these are binary data
+            # (Firebase keys, cert pins, tokens, embedded payloads).
+            # Vaulting them produces garbage at runtime since the app
+            # uses the decoded bytes directly, not the string for display.
+            # Criteria: only base64 charset, length >= 8, valid padding,
+            # decodes to >= 4 bytes, AND contains no spaces or path chars.
+            if re.match(r'^[A-Za-z0-9+/]{8,}={0,2}$', value):
+                try:
+                    import base64 as _b64
+                    _dec = _b64.b64decode(value + '==')
+                    if len(_dec) >= 4 and '/' not in value[:4] and ' ' not in value:
+                        continue
+                except Exception:
+                    pass
             dst_reg = m.group(2)
             # Check register number is safe (v0-v15 for non-range invoke)
             reg_num = int(dst_reg[1:])
