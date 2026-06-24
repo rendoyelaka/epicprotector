@@ -15459,7 +15459,7 @@ class StringVaultEngine:
         #   v6 = scratch (index/value)
         restore = (
             ".method public static r(Ljava/lang/String;)Ljava/lang/String;\n"
-            "    .locals 7\n"
+            "    .locals 8\n"
             "    :try_start_r\n"
             "    const/4 v0, 0x0\n"
             "    invoke-static {p0, v0}, Landroid/util/Base64;->decode(Ljava/lang/String;I)[B\n"
@@ -15467,11 +15467,12 @@ class StringVaultEngine:
             "    array-length v1, v0\n"
             "    new-array v2, v1, [B\n"
             + fill_local("v3", full_key, "v4", "v5") + "\n"
-            + "    const/4 v4, 0x0\n"
+            + "    array-length v7, v3\n"
+            "    const/4 v4, 0x0\n"
             "    :loop_r\n"
             "    if-ge v4, v1, :end_r\n"
-            "    rem-int v6, v4, %d\n" % key_len
-            + "    aget-byte v5, v3, v6\n"
+            "    rem-int v6, v4, v7\n"
+            "    aget-byte v5, v3, v6\n"
             "    aget-byte v6, v0, v4\n"
             "    xor-int/2addr v6, v5\n"
             "    int-to-byte v6, v6\n"
@@ -17254,8 +17255,8 @@ def _sbs_commit_workspace_to_repo() -> str:
         return ""
 
 def _sbs_download_workspace_from_telegram(file_id: str, work_dir: str, bot_token: str) -> str:
-    """Download workspace archive from GitHub using Git Data API (handles files > 1MB)."""
-    import urllib.request, base64
+    """Download workspace archive from GitHub using Git blob API with base64 decode."""
+    import urllib.request, base64 as _b64
     if not GH_PAT:
         return ""
 
@@ -17267,38 +17268,42 @@ def _sbs_download_workspace_from_telegram(file_id: str, work_dir: str, bot_token
     base_url = f"https://api.github.com/repos/{GH_REPO}"
 
     try:
-        # Get file info via contents API to get blob SHA
+        # Step 1: Get blob SHA from contents API
         api_url = f"{base_url}/contents/sbs_workspace.tar.gz"
         req = urllib.request.Request(api_url, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read())
 
-        # Use download_url for direct download (no size limit)
-        dl_url = data.get("download_url")
-        if not dl_url:
-            # Fallback: use blob SHA to get raw content
-            blob_sha = data.get("sha")
-            if not blob_sha:
-                return ""
-            blob_headers = dict(headers)
-            blob_headers["Accept"] = "application/vnd.github.v3.raw"
-            req2 = urllib.request.Request(
-                f"{base_url}/git/blobs/{blob_sha}",
-                headers=blob_headers)
-            with urllib.request.urlopen(req2, timeout=120) as resp:
-                raw = resp.read()
-        else:
-            dl_headers = {"Authorization": f"token {GH_PAT}", "User-Agent": "EpicProtector-Bot"}
-            req = urllib.request.Request(dl_url, headers=dl_headers)
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                raw = resp.read()
+        blob_sha = data.get("sha")
+        if not blob_sha:
+            logger.warning("[SBSState] No blob SHA in contents response")
+            return ""
 
+        # Step 2: Fetch blob content as base64 via Git blobs API
+        blob_headers = {
+            "Authorization": f"token {GH_PAT}",
+            "Accept":        "application/vnd.github.v3+json",
+            "User-Agent":    "EpicProtector-Bot",
+        }
+        blob_url = f"{base_url}/git/blobs/{blob_sha}"
+        req2 = urllib.request.Request(blob_url, headers=blob_headers)
+        with urllib.request.urlopen(req2, timeout=120) as resp:
+            blob_data = json.loads(resp.read())
+
+        # Blob content is base64 encoded
+        content_b64 = blob_data.get("content", "").replace("\n", "")
+        if not content_b64:
+            logger.warning("[SBSState] Empty blob content")
+            return ""
+
+        raw = _b64.b64decode(content_b64)
         if not raw:
             return ""
+
         os.makedirs(WORK_DIR, exist_ok=True)
         with open(SBS_WS_ARCHIVE, "wb") as f:
             f.write(raw)
-        logger.info(f"[SBSState] Workspace downloaded from GitHub ({len(raw)/1024/1024:.1f} MB)")
+        logger.info(f"[SBSState] Workspace downloaded from GitHub blob ({len(raw)/1024/1024:.1f} MB)")
         return _sbs_restore_workspace(work_dir)
 
     except Exception as e:
