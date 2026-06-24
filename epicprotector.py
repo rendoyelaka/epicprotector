@@ -15537,6 +15537,10 @@ class StringVaultEngine:
                                     i += 1
                                     break
                                 i += 1
+                            first = method_lines[0]
+                            if "<clinit>" in first or "<init>" in first:
+                                out_lines.extend(method_lines)
+                                continue
                             new_method, cnt = self._process_method(method_lines, key, SKIP_DESCS)
                             out_lines.extend(new_method)
                             if cnt:
@@ -15567,8 +15571,10 @@ class StringVaultEngine:
             mp = re.match(r"\s*\.param\s+", l)
             if ml: locals_val = int(ml.group(1))
             if mr: registers_val = int(mr.group(1))
-        # Skip abstract/native methods
+        # Skip abstract/native methods and zero-local methods
         if locals_val < 0 and registers_val < 0:
+            return method_lines, 0
+        if locals_val == 0:
             return method_lines, 0
         # Total registers available
         total_regs = registers_val if registers_val >= 0 else locals_val + 64  # rough max
@@ -15586,6 +15592,13 @@ class StringVaultEngine:
             if not value.strip():
                 continue
             if len(value) > 80 and " " not in value:
+                continue
+            # Skip strings that reference res/xml/manifest resources
+            SKIP_VALUES = (
+                "http://schemas.android.com/apk/res/android",
+                ".xml",
+            )
+            if any(value == sv for sv in SKIP_VALUES):
                 continue
             dst_reg = m.group(2)
             # Check register number is safe (v0-v15 for non-range invoke)
