@@ -19065,7 +19065,7 @@ async def button_handler(update, context):
             f"📋 Phase 1 of {len(SBS_PHASES)}",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(
-                _sbs_phase_intro_kb(phase_idx, phase)))
+                _sbs_phase_intro_kb(0, phase)))
         return
 
     # ── RUN CURRENT PHASE ─────────────────────────────────────────────────────
