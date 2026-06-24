@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'sbs_state.json'
+      - 'sbs_workspace.tar.gz'
+      - 'config.json'
   workflow_dispatch:
   schedule:
     - cron: '0 */5 * * *'
@@ -18,7 +22,9 @@ jobs:
   notify-push:
     name: Push Notification
     runs-on: ubuntu-22.04
-    if: github.event_name == 'push'
+    if: |
+      github.event_name == 'push' &&
+      !startsWith(github.event.head_commit.message, 'EpicProtector:')
     steps:
       - name: Send Push Notification to Telegram
         env:
