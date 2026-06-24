@@ -119,8 +119,6 @@ except Exception:
 
 
 # ── SESSION STATE — SMALI TREE SELECTOR ──────────────────────────────────────
-smali_tree_workspace  = {}   # workspace path for current tree session
-smali_tree_path       = {}   # current folder path being browsed (relative)
 smali_selected_files  = {}   # set of selected smali file absolute paths
 smali_scan_results    = {}   # red flag scan results waiting for admin decision
 
@@ -17043,9 +17041,7 @@ res_tree_path       = {}   # current path in res/ tree
 res_tree_selected   = {}   # selected files in res/ tree
 manifest_workspace  = {}   # workspace for manifest browser
 arsc_workspace      = {}   # workspace for resources.arsc browser
-arsc_entries        = {}   # cached string entries for arsc browser
 session_reports     = {}   # SessionReportEngine per user
-smali_safety_cache  = {}   # cached safety analysis results per user
 
 # ── QUICK TEST PANEL SESSION STATE ────────────────────────────────────────────
 quick_test_selected   = {}   # {user_id: set()} — which steps are ON
@@ -17346,37 +17342,7 @@ sbs_p2_active     = {}   # {user_id: bool}  — True when in Phase 2 step mode
 def admin_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧪 Step-by-Step Test",         callback_data="sbs_open")],
-        [InlineKeyboardButton("📊 Protection History",        callback_data="admin_history")],
         [InlineKeyboardButton("📦 Base APK",                  callback_data="admin_base_apk")],
-        [InlineKeyboardButton("📁 Workspace Browser",         callback_data="ws_browse")],
-    ])
-
-
-def ws_folder_kb(has_workspace: bool = True) -> "InlineKeyboardMarkup":
-    """Workspace Browser — folder selection keyboard."""
-    if not has_workspace:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Back", callback_data="back_admin")]
-        ])
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📁 smali/",   callback_data="ws_compress_smali"),
-            InlineKeyboardButton("📁 assets/",  callback_data="ws_compress_assets"),
-        ],
-        [
-            InlineKeyboardButton("📁 res/",     callback_data="ws_compress_res"),
-            InlineKeyboardButton("📁 lib/",     callback_data="ws_compress_lib"),
-        ],
-        [
-            InlineKeyboardButton("📁 META-INF", callback_data="ws_compress_meta"),
-            InlineKeyboardButton("📦 Full Workspace", callback_data="ws_compress_full"),
-        ],
-        [InlineKeyboardButton("📲 Download Current APK", callback_data="ws_download_apk")],
-        [
-            InlineKeyboardButton("📸 BEFORE Snapshot", callback_data="ws_snapshot_before"),
-            InlineKeyboardButton("📸 AFTER Snapshot",  callback_data="ws_snapshot_after"),
-        ],
-        [InlineKeyboardButton("🔙 Back", callback_data="back_admin")],
     ])
 
 
@@ -18415,9 +18381,6 @@ async def _rebuild_sign_deliver(query, context, user, label: str):
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(
-                        "🌲 Continue Browsing",
-                        callback_data="smali_tree_open")],
-                    [InlineKeyboardButton(
                         "⬅️ Back to Menu",
                         callback_data="back_admin")],
                 ]))
@@ -18498,8 +18461,7 @@ async def button_handler(update, context):
 
     # ── BACK TO ADMIN ─────────────────────────────────────────────────────────
     if data == "back_admin":
-        for d in [smali_safety_cache,
-                  pending_base_apk, smali_tree_workspace, smali_tree_path,
+        for d in [pending_base_apk,
                   smali_selected_files, smali_scan_results,
                   sbs_step_index, sbs_work_dir, sbs_apk_path, sbs_workspace,
                   sbs_current_apk, sbs_aes_key, sbs_keystore_ctx,
@@ -18533,55 +18495,6 @@ async def button_handler(update, context):
         return
 
     # ── PROTECT APK — DIRECT PROTECTION FLOW ─────────────────────────────────
-    elif data == "admin_history":
-        if not is_admin(user.id): return
-        if not job_history:
-            await query.edit_message_text(
-                "📊 *Protection History*\n\n"
-                "No protection jobs recorded yet.\n\n"
-                "Run a protection job first.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(
-                        "⬅️ Back", callback_data="back_admin")],
-                ]))
-            return
-
-        lines = [
-            "📊 *Protection History*\n",
-            f"━━━━━━━━━━━━━━━━━━━━━",
-            f"Last {len(job_history)} jobs:\n",
-        ]
-        for i, job in enumerate(reversed(job_history), 1):
-            icon  = "✅" if job.get("success") else "❌"
-            score = job.get("score", "—")
-            grade = job.get("grade", "")
-            preset = job.get("preset", "—")
-            ts    = job.get("timestamp", "—")
-            steps = job.get("steps", "—")
-            elapsed = job.get("elapsed", "—")
-            lines += [
-                f"{icon} *Job {i}* — {ts}",
-                f"   📦 `{job.get('apk_name','—')}`",
-                f"   🛡️ {preset}",
-                f"   📊 {score}/100 — {grade}",
-                f"   ✅ {steps} steps — ⏱️ {elapsed}",
-                f"   ━━━━━━━━━━━━━━━",
-            ]
-
-        text = "\n".join(lines)
-        if len(text) > 4000:
-            text = text[:4000] + "\n_...truncated_"
-
-        await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "⬅️ Back", callback_data="back_admin")],
-            ]))
-        return
-
     # ── QUICK TEST PANEL — OPEN ───────────────────────────────────────────────
     elif data == "quick_test_open":
         if not is_admin(user.id): return
@@ -19517,7 +19430,6 @@ async def button_handler(update, context):
             kb = []
             if apk_ready:
                 kb.append([InlineKeyboardButton("📲 Download APK at This Stage", callback_data="ws_download_apk")])
-            kb.append([InlineKeyboardButton("📁 Browse Workspace Folders", callback_data="ws_browse")])
             if next_phase:
                 kb.append([InlineKeyboardButton(
                     f"✅ Install OK — Continue to {next_phase['icon']} {next_phase['label']}",
@@ -19794,7 +19706,6 @@ async def button_handler(update, context):
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("📸 Take AFTER Snapshot", callback_data="ws_snapshot_after")],
-                        [InlineKeyboardButton("📁 Browse Workspace", callback_data="ws_browse")],
                         [InlineKeyboardButton("🔙 Back", callback_data="back_admin")],
                     ]))
             else:
@@ -19829,7 +19740,6 @@ async def button_handler(update, context):
                         "📥 Download BEFORE Snapshot", callback_data="ws_dl_before")])
                 kb_rows.append([InlineKeyboardButton(
                     "📥 Download AFTER Snapshot", callback_data="ws_dl_after")])
-                kb_rows.append([InlineKeyboardButton("📁 Browse Workspace", callback_data="ws_browse")])
                 kb_rows.append([InlineKeyboardButton("🔙 Back", callback_data="back_admin")])
                 await query.edit_message_text(
                     f"✅ *AFTER snapshot saved*\n\n"
@@ -19878,23 +19788,6 @@ async def button_handler(update, context):
         return
 
     # ── WORKSPACE BROWSER ─────────────────────────────────────────────────────
-    elif data == "ws_browse":
-        if not is_admin(user.id): return
-        workspace = sbs_workspace.get(user.id)
-        work_dir  = sbs_work_dir.get(user.id, WORK_DIR)
-        has_ws    = workspace and os.path.isdir(workspace)
-        msg = (
-            f"📁 *Workspace Browser*\n\n"
-            + (f"✅ Workspace active\n`{os.path.basename(workspace)}`\n\n"
-               f"Select a folder to compress and download:"
-               if has_ws else
-               "⚠️ No active workspace.\n\nRun Step-by-Step Test first to decode an APK.")
-        )
-        await query.edit_message_text(
-            msg, parse_mode="Markdown",
-            reply_markup=ws_folder_kb(has_ws))
-        return
-
     # ── WORKSPACE COMPRESS & DOWNLOAD ─────────────────────────────────────────
     elif data.startswith("ws_compress_"):
         if not is_admin(user.id): return
@@ -20236,217 +20129,7 @@ async def button_handler(update, context):
                 parse_mode="HTML", reply_markup=base_apk_kb())
 
     # ── SMALI TREE — Open root ────────────────────────────────────────────────
-    elif data == "smali_tree_open":
-        if not is_admin(user.id): return
-
-        # Check workspace from smali_tree_workspace first, then sbs_workspace
-        workspace = smali_tree_workspace.get(user.id)
-        if not workspace or not os.path.exists(workspace):
-            workspace = sbs_workspace.get(user.id)
-
-        if not workspace or not os.path.exists(workspace):
-            await query.edit_message_text(
-                "🌲 *Smali Tree Browser*\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "⚠️ *No workspace found.*\n\n"
-                "You need to run at least\n"
-                "*Phase 1 — Setup* first to decode\n"
-                "your APK before browsing smali files.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-
-                    [InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="back_admin")],
-                ]))
-            return
-
-        smali_tree_workspace[user.id] = workspace
-        smali_tree_path[user.id]      = ""
-        smali_selected_files[user.id] = set()
-
-        roots = SmaliTreeBrowser.get_smali_roots(workspace)
-        if not roots:
-            await query.edit_message_text(
-                "🌲 *Smali Tree Browser*\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━\n"
-                "⚠️ *No smali folders found.*\n\n"
-                "Run Phase 1 to decode your APK first.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-
-                    [InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="back_admin")],
-                ]))
-            return
-
-        # Run safety analysis — cache results for this session
-        await query.edit_message_text(
-            "🌲 *Smali Tree Browser*\n\n⏳ Running safety analysis...",
-            parse_mode="Markdown")
-
-        try:
-            analyser     = SafetyAnalyserEngine()
-            safety       = analyser.analyse(workspace)
-            crash_files  = set(cr["file"].replace(".smali","")
-                               for cr in safety["crash_risk"])
-            prot_files   = set(p.split("/")[-1] for p in safety["protected"])
-            smali_safety_cache[user.id] = {
-                "crash_risk": crash_files,
-                "protected":  prot_files,
-                "safe_count": len(safety["safe"]),
-                "crash_count": len(safety["crash_risk"]),
-            }
-        except Exception:
-            smali_safety_cache[user.id] = {
-                "crash_risk": set(),
-                "protected":  set(),
-                "safe_count": 0,
-                "crash_count": 0,
-            }
-
-        cache       = smali_safety_cache[user.id]
-        total_smali = SmaliTreeBrowser.count_all_smali(workspace)
-
-        rows = []
-        for root in roots:
-            rows.append([InlineKeyboardButton(
-                f"📁 {root}", callback_data=f"smali_nav:{root}")])
-        rows.append([InlineKeyboardButton(
-            "⬅️ Back", callback_data="back_admin")])
-
-        await query.edit_message_text(
-            f"🌲 *Smali Tree Browser*\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Total smali files: {total_smali}\n"
-            f"✅ Safe to rename:    {cache['safe_count']}\n"
-            f"❌ Crash risk:        {cache['crash_count']}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Tap a folder to browse:\n\n"
-            f"_Each file shows:\n"
-            f"✅ Safe  ❌ Crash risk  🔒 Protected_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(rows))
-
     # ── SMALI TREE — Navigate into folder ────────────────────────────────────
-    elif data.startswith("smali_nav:"):
-        if not is_admin(user.id): return
-        workspace = smali_tree_workspace.get(user.id)
-
-        # Fallback — try sbs_workspace if smali_tree_workspace not set
-        if not workspace or not os.path.exists(workspace):
-            workspace = sbs_workspace.get(user.id)
-            if workspace and os.path.exists(workspace):
-                smali_tree_workspace[user.id] = workspace
-            else:
-                await query.answer(
-                    "⚠️ Workspace not found. Run Phase 1 or Decode step first.",
-                    show_alert=True)
-                return
-
-        rel_path   = data[len("smali_nav:"):]
-        listing    = SmaliTreeBrowser.list_folder(workspace, rel_path)
-        folders    = listing["folders"]
-        files      = listing["files"]
-        selected   = smali_selected_files.get(user.id, set())
-        breadcrumb = SmaliTreeBrowser.build_breadcrumb(rel_path)
-        cache      = smali_safety_cache.get(user.id, {
-            "crash_risk": set(), "protected": set()})
-        crash_files = cache.get("crash_risk", set())
-        prot_files  = cache.get("protected", set())
-
-        smali_tree_path[user.id] = rel_path
-
-        # Build parent path for back navigation
-        parts       = rel_path.replace("\\", "/").split("/")
-        parent_path = "/".join(parts[:-1]) if len(parts) > 1 else ""
-
-        rows = []
-
-        # Subfolders — with folder badge
-        for folder in folders:
-            child_rel  = f"{rel_path}/{folder}" if rel_path else folder
-            folder_badge = SmaliTreeBrowser.get_folder_badge(folder)
-            rows.append([InlineKeyboardButton(
-                f"{folder_badge} {folder}",
-                callback_data=f"smali_nav:{child_rel}")])
-
-        # Smali files — with risk badge + checkbox toggle
-        safe_files_in_folder = []
-        for fname in files:
-            abs_path   = os.path.join(listing["abs_path"], fname)
-            risk_badge = SmaliTreeBrowser.get_file_risk_badge(
-                fname, crash_files, prot_files)
-            check_icon = "☑️" if abs_path in selected else "☐"
-            rows.append([InlineKeyboardButton(
-                f"{check_icon} {risk_badge} {fname}",
-                callback_data=f"smali_toggle:{rel_path}:{fname}")])
-            if risk_badge == "✅":
-                safe_files_in_folder.append(abs_path)
-
-        # Controls
-        if files:
-            rows.append([
-                InlineKeyboardButton(
-                    f"✅ Select Safe ({len(safe_files_in_folder)})",
-                    callback_data=f"smali_all:{rel_path}:select"),
-                InlineKeyboardButton(
-                    "☐ Clear All",
-                    callback_data=f"smali_all:{rel_path}:clear"),
-            ])
-            rows.append([InlineKeyboardButton(
-                f"🔍 Scan & Fix Selected ({len(selected)} selected)",
-                callback_data="smali_scan")])
-            rows.append([InlineKeyboardButton(
-                "📁 Apply to Entire Folder (safe files only)",
-                callback_data=f"smali_folder:{rel_path}")])
-
-        # Back button
-        if parent_path or rel_path:
-            back_cb = f"smali_nav:{parent_path}" if parent_path else "smali_tree_open"
-            rows.append([InlineKeyboardButton("🔙 Back", callback_data=back_cb)])
-        else:
-            rows.append([InlineKeyboardButton("🔙 Back", callback_data="smali_tree_open")])
-
-        selected_count = len(selected)
-        # Count risk levels in current folder
-        safe_count  = sum(1 for f in files
-                          if SmaliTreeBrowser.get_file_risk_badge(
-                              f, crash_files, prot_files) == "✅")
-        crash_count = sum(1 for f in files
-                          if SmaliTreeBrowser.get_file_risk_badge(
-                              f, crash_files, prot_files) == "❌")
-        prot_count  = sum(1 for f in files
-                          if SmaliTreeBrowser.get_file_risk_badge(
-                              f, crash_files, prot_files) == "🔒")
-
-        if not files and folders:
-            nav_hint = "_No .smali files here — tap a subfolder to go deeper._"
-        elif files:
-            nav_hint = (
-                f"_✅ Safe: {safe_count}  "
-                f"❌ Crash risk: {crash_count}  "
-                f"🔒 Protected: {prot_count}_\n"
-                f"_Tap ✅ Select Safe to select safe files only._"
-            )
-        else:
-            nav_hint = "_This folder is empty._"
-
-        msg = (
-            f"🌲 *Smali Tree Browser*\n\n"
-            f"📍 `{breadcrumb}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📁 Subfolders: {len(folders)}   "
-            f"📄 Files: {len(files)}\n"
-            f"☑️  Selected: {selected_count} file(s)\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{nav_hint}"
-        )
-        await query.edit_message_text(
-            msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(rows))
-
     # ── SMALI TREE — Toggle file selection ───────────────────────────────────
     elif data.startswith("smali_toggle:"):
         if not is_admin(user.id): return
@@ -20642,197 +20325,10 @@ async def button_handler(update, context):
         await _smali_run_scan(query, user, workspace, selected)
 
     # ── SMALI TREE — Run scan on selected files ───────────────────────────────
-    elif data == "smali_scan":
-        if not is_admin(user.id): return
-        workspace = smali_tree_workspace.get(user.id)
-        selected  = smali_selected_files.get(user.id, set())
-
-        if not selected:
-            await query.answer(
-                "⚠️ No files selected. Tap files to select them first.",
-                show_alert=True)
-            return
-
-        await _smali_run_scan(query, user, workspace, selected)
-
     # ── SMALI TREE — Fix All + Rename ────────────────────────────────────────
-    elif data == "smali_fix_rename":
-        if not is_admin(user.id): return
-        workspace    = smali_tree_workspace.get(user.id)
-        scan_results = smali_scan_results.get(user.id, {})
-        selected     = smali_selected_files.get(user.id, set())
-
-        if not selected:
-            await query.answer("⚠️ No files selected.", show_alert=True)
-            return
-
-        await query.edit_message_text(
-            "🔧 *Applying Fix All + Rename...*\n\n⏳ Please wait...",
-            parse_mode="Markdown")
-
-        try:
-            fixer   = SmaliRedFlagFixer()
-            renamer = ManualSmaliRenamer()
-
-            fix_result    = fixer.fix_files(scan_results)
-            rename_result = renamer.rename_files(list(selected))
-
-            smali_selected_files.pop(user.id, None)
-            smali_scan_results.pop(user.id, None)
-
-            lines = [
-                "✅ *Fix All + Rename Complete*\n",
-                "━━━━━━━━━━━━━━━━━━━━━",
-                f"🔧 Words fixed:   {fix_result['total_fixed']}",
-                f"📄 Files fixed:   {fix_result['files_fixed']}",
-                f"✏️  Files renamed: {rename_result['total_renamed']}",
-                "━━━━━━━━━━━━━━━━━━━━━",
-            ]
-            for r in rename_result["renamed"][:10]:
-                lines.append(
-                    f"  `{r['original']}` → `{r['renamed']}`")
-            if len(rename_result["renamed"]) > 10:
-                lines.append(
-                    f"  _...and {len(rename_result['renamed'])-10} more_")
-            for log in fix_result["fix_log"][:5]:
-                lines.append(
-                    f"  🔧 `{log['file']}` — {log['fixed']} words fixed")
-            if rename_result["errors"]:
-                lines.append("━━━━━━━━━━━━━━━━━━━━━")
-                lines.append("⚠️ *Errors:*")
-                for err in rename_result["errors"][:3]:
-                    lines.append(f"  `{err}`")
-            lines.append("━━━━━━━━━━━━━━━━━━━━━")
-            lines.append("✅ All changes applied to workspace.")
-
-            await query.edit_message_text(
-                "\n".join(lines),
-                parse_mode="Markdown")
-
-            # Auto-deliver signed APK for install testing
-            await _rebuild_sign_deliver(
-                query, context, user,
-                "Fix + Rename — Install & Test")
-
-        except Exception as e:
-            await query.edit_message_text(
-                f"❌ *Fix + Rename Failed:* `{e}`",
-                parse_mode="Markdown", reply_markup=back_a())
-
     # ── SMALI TREE — Fix Only ─────────────────────────────────────────────────
-    elif data == "smali_fix_only":
-        if not is_admin(user.id): return
-        scan_results = smali_scan_results.get(user.id, {})
-
-        if not scan_results:
-            await query.answer("⚠️ No scan results found.", show_alert=True)
-            return
-
-        await query.edit_message_text(
-            "🔧 *Applying Fix Only...*\n\n⏳ Please wait...",
-            parse_mode="Markdown")
-
-        try:
-            fixer      = SmaliRedFlagFixer()
-            fix_result = fixer.fix_files(scan_results)
-
-            smali_scan_results.pop(user.id, None)
-
-            lines = [
-                "✅ *Fix Only Complete*\n",
-                "━━━━━━━━━━━━━━━━━━━━━",
-                f"🔧 Words fixed: {fix_result['total_fixed']}",
-                f"📄 Files fixed: {fix_result['files_fixed']}",
-                "━━━━━━━━━━━━━━━━━━━━━",
-            ]
-            for log in fix_result["fix_log"][:8]:
-                lines.append(
-                    f"  🔧 `{log['file']}` — {log['fixed']} words fixed")
-            lines.append("━━━━━━━━━━━━━━━━━━━━━")
-            lines.append("✅ All red flag words replaced in workspace.")
-
-            await query.edit_message_text(
-                "\n".join(lines),
-                parse_mode="Markdown")
-
-            await _rebuild_sign_deliver(
-                query, context, user,
-                "Fix Only — Install & Test")
-
-        except Exception as e:
-            await query.edit_message_text(
-                f"❌ *Fix Only Failed:* `{e}`",
-                parse_mode="Markdown", reply_markup=back_a())
-
     # ── SMALI TREE — Rename Only ──────────────────────────────────────────────
-    elif data == "smali_rename_only":
-        if not is_admin(user.id): return
-        selected = smali_selected_files.get(user.id, set())
-
-        if not selected:
-            await query.answer("⚠️ No files selected.", show_alert=True)
-            return
-
-        await query.edit_message_text(
-            "✏️ *Applying Rename Only...*\n\n⏳ Please wait...",
-            parse_mode="Markdown")
-
-        try:
-            renamer       = ManualSmaliRenamer()
-            rename_result = renamer.rename_files(list(selected))
-
-            smali_selected_files.pop(user.id, None)
-            smali_scan_results.pop(user.id, None)
-
-            lines = [
-                "✅ *Rename Only Complete*\n",
-                "━━━━━━━━━━━━━━━━━━━━━",
-                f"✏️  Files renamed: {rename_result['total_renamed']}",
-                f"⏭️  Files skipped: {len(rename_result['skipped'])}",
-                "━━━━━━━━━━━━━━━━━━━━━",
-            ]
-            for r in rename_result["renamed"][:10]:
-                lines.append(
-                    f"  `{r['original']}` → `{r['renamed']}`")
-            if len(rename_result["renamed"]) > 10:
-                lines.append(
-                    f"  _...and {len(rename_result['renamed'])-10} more_")
-            if rename_result["errors"]:
-                lines.append("━━━━━━━━━━━━━━━━━━━━━")
-                for err in rename_result["errors"][:3]:
-                    lines.append(f"  ⚠️ `{err}`")
-            lines.append("━━━━━━━━━━━━━━━━━━━━━")
-            lines.append("✅ All selected files renamed in workspace.")
-
-            await query.edit_message_text(
-                "\n".join(lines),
-                parse_mode="Markdown")
-
-            await _rebuild_sign_deliver(
-                query, context, user,
-                "Rename Only — Install & Test")
-
-        except Exception as e:
-            await query.edit_message_text(
-                f"❌ *Rename Only Failed:* `{e}`",
-                parse_mode="Markdown", reply_markup=back_a())
-
     # ── SMALI TREE — Cancel ───────────────────────────────────────────────────
-    elif data == "smali_cancel":
-        if not is_admin(user.id): return
-        smali_selected_files.pop(user.id, None)
-        smali_scan_results.pop(user.id, None)
-        await query.edit_message_text(
-            "❌ *Operation cancelled.*\n\nNo changes made.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    "🌲 Back to Tree", callback_data="smali_tree_open")],
-                [InlineKeyboardButton(
-                    "🔙 Back to Panel", callback_data="back_admin")],
-            ]))
-
-
     # ── SAFETY ANALYSIS ───────────────────────────────────────────────────────
     elif data == "safety_analyse":
         if not is_admin(user.id): return
