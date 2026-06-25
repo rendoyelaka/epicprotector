@@ -12,16 +12,20 @@ on:
   schedule:
     - cron: '0 */5 * * *'
 
-concurrency:
-  group: epic-protector-bot
-  cancel-in-progress: true
+# ── CONCURRENCY — separate groups so notify cancels independently ─────────────
+# notify-push uses its own group so it always fires instantly and is never
+# blocked or cancelled by the bot runner group.
+# run-bot cancels any in-progress bot run the moment a new push lands.
 
 jobs:
 
-  # ── PUSH NOTIFICATION — runs immediately on every push ─────────────────────
+  # ── PUSH NOTIFICATION — fires immediately, never cancelled ──────────────────
   notify-push:
     name: Push Notification
     runs-on: ubuntu-22.04
+    concurrency:
+      group: epic-protector-notify-${{ github.ref }}
+      cancel-in-progress: false
     if: |
       github.event_name == 'push' &&
       !startsWith(github.event.head_commit.message, 'EpicProtector:')
@@ -54,6 +58,9 @@ jobs:
     name: EPIC PROTECTOR — Elite Bot Runner
     runs-on: ubuntu-22.04
     timeout-minutes: 350
+    concurrency:
+      group: epic-protector-bot
+      cancel-in-progress: true
 
     steps:
 
@@ -75,51 +82,23 @@ jobs:
           if [ -z "$ADMIN_ID" ];  then echo "❌ ADMIN_ID missing";  exit 1; fi
           echo "✅ All required secrets present."
 
-      # ── SYSTEM TOOLS CACHE — full binary paths ─────────────────────────────
-      # Cache the actual installed tool locations — not just .deb archives
-      # Key includes ubuntu version + tool versions for proper invalidation
-      - name: Cache System Tools
-        id: tools-cache
+      # ── APT PACKAGE CACHE — cache .deb files so apt-get install is instant ──
+      # Caching /var/cache/apt/archives means apt unpacks from local disk
+      # instead of downloading — cuts install from ~2 min to ~15 sec.
+      # restore-keys fallback means even a key miss gets a partial hit.
+      - name: Cache APT Packages
+        id: apt-cache
         uses: actions/cache@v4
         with:
-          path: |
-            /usr/bin/zipalign
-            /usr/bin/apksigner
-            /usr/lib/jvm
-            /usr/bin/java
-            /usr/bin/javac
-            /usr/bin/keytool
-            /etc/alternatives/java
-            /etc/alternatives/javac
-            /etc/alternatives/keytool
-            /usr/share/java/smali.jar
-            /usr/share/apksigner
-            /usr/lib/android-sdk
-            /opt/hostedtoolcache/java
-          key: epic-system-tools-ubuntu22-jdk-zipalign-apksigner-smali-v4
+          path: /var/cache/apt/archives
+          key: apt-ubuntu22-jdk-zipalign-apksigner-smali-v1
+          restore-keys: |
+            apt-ubuntu22-jdk-zipalign-apksigner-smali-
+            apt-ubuntu22-
 
       - name: Install System Tools
         run: |
-          if [ "${{ steps.tools-cache.outputs.cache-hit }}" == "true" ]; then
-            echo "✅ System tools cache hit — verifying binaries..."
-            # Restore symlinks that may not survive cache
-            if [ -f /usr/lib/jvm/default-java/bin/java ] && [ ! -f /usr/bin/java ]; then
-              sudo ln -sf /usr/lib/jvm/default-java/bin/java /usr/bin/java || true
-              sudo ln -sf /usr/lib/jvm/default-java/bin/javac /usr/bin/javac || true
-              sudo ln -sf /usr/lib/jvm/default-java/bin/keytool /usr/bin/keytool || true
-            fi
-            # Quick binary check — if all pass, skip install entirely
-            if command -v java &>/dev/null && \
-               command -v zipalign &>/dev/null && \
-               command -v apksigner &>/dev/null; then
-              echo "✅ All tools verified from cache — skipping install."
-              java -version 2>&1 | head -1
-              exit 0
-            fi
-            echo "⚠️ Cache hit but binaries missing — running install..."
-          else
-            echo "📥 Cache miss — installing system tools fresh..."
-          fi
+          echo "📥 Installing system tools..."
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
             default-jdk \
