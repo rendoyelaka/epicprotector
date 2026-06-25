@@ -13359,13 +13359,40 @@ class ManualControlEngine:
                     modified
                 )
 
-                # 4. Insert junk NOP comments to shift DEX offsets
-                lines = modified.splitlines(keepends=True)
-                if len(lines) > 4:
-                    junk = f"# ep-{self._rname(12)}\n"
-                    insert_at = random.randint(1, min(4, len(lines)-1))
-                    lines.insert(insert_at, junk)
-                    modified = "".join(lines)
+                # 4. Insert junk ep- comments inside every eligible method
+                # — skips <clinit> and <init> (crash risk)
+                # — injects 2-4 comments at random positions within each method body
+                def _inject_ep_comments(smali_text):
+                    method_pat = re.compile(r'(^\s*\.method\b.*$)', re.MULTILINE)
+                    end_pat    = re.compile(r'^\s*\.end method\s*$', re.MULTILINE)
+                    out = []
+                    pos = 0
+                    for ms in method_pat.finditer(smali_text):
+                        out.append(smali_text[pos:ms.start()])
+                        end_m = end_pat.search(smali_text, ms.end())
+                        if end_m:
+                            method_block = smali_text[ms.start():end_m.end()]
+                            pos = end_m.end()
+                        else:
+                            method_block = smali_text[ms.start():]
+                            pos = len(smali_text)
+                        # skip clinit / init
+                        if '<clinit>' in ms.group(1) or '<init>' in ms.group(1):
+                            out.append(method_block)
+                            continue
+                        # inject 2-4 ep- comments at random lines inside method
+                        mlines = method_block.splitlines(keepends=True)
+                        if len(mlines) > 3:
+                            n_inject = random.randint(2, min(4, len(mlines) - 2))
+                            positions = sorted(random.sample(
+                                range(1, len(mlines) - 1), n_inject), reverse=True)
+                            for p in positions:
+                                mlines.insert(p, f"    # ep-{self._rname(12)}\n")
+                        out.append("".join(mlines))
+                    out.append(smali_text[pos:])
+                    return "".join(out)
+
+                modified = _inject_ep_comments(modified)
 
                 if modified != raw:
                     with open(sf, "w", encoding="utf-8") as f:
