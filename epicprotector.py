@@ -11544,15 +11544,22 @@ class SafeRenameEngine:
         if not os.path.exists(manifest):
             return protected
         try:
-            with open(manifest, "r", errors="ignore") as f:
-                content = f.read()
-            for m in re.finditer(r'android:name="([^"]+)"', content):
-                val = m.group(1).strip()
-                # Dot-separated → slash-separated
-                protected.add(val.replace(".", "/"))
-                # Also handle relative names starting with '.'
-                if val.startswith("."):
-                    protected.add(val.lstrip("/").replace(".", "/"))
+            with open(manifest, "rb") as f:
+                raw = f.read()
+            # AndroidManifest.xml in apktool workspace is binary XML —
+            # android:name attributes are not present as plain text.
+            # Extract all dot-separated class name strings directly from raw bytes.
+            import re as _re
+            for m in _re.finditer(rb'([\w]+(?:\.[\w]+){2,})', raw):
+                val = m.group(1).decode("utf-8", errors="ignore").strip()
+                if not val:
+                    continue
+                slash = val.replace(".", "/")
+                protected.add(slash)
+                protected.add(slash.split("/")[-1])
+                # Also add simple name for inner classes like Api$1
+                simple = slash.split("/")[-1]
+                protected.add(simple)
         except Exception:
             pass
         return protected
@@ -15217,12 +15224,15 @@ class SafetyAnalyserEngine:
         manifest_path = os.path.join(workspace_dir, 'AndroidManifest.xml')
         if os.path.exists(manifest_path):
             try:
-                with open(manifest_path, 'r', errors='ignore') as _mf:
-                    _mc = _mf.read()
-                for _mm in re.finditer(r'android:name="([^"]+)"', _mc):
-                    _val = _mm.group(1).strip().replace('.', '/')
-                    protected.add(_val)
-                    protected.add(_val.split('/')[-1])
+                with open(manifest_path, 'rb') as _mf:
+                    _raw = _mf.read()
+                for _mm in re.finditer(rb'([\w]+(?:\.[\w]+){2,})', _raw):
+                    _val = _mm.group(1).decode('utf-8', errors='ignore').strip()
+                    if not _val:
+                        continue
+                    _slash = _val.replace('.', '/')
+                    protected.add(_slash)
+                    protected.add(_slash.split('/')[-1])
             except Exception:
                 pass
 
