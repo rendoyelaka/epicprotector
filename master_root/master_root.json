@@ -4,9 +4,14 @@
   "ks_pass": "MR_EsjNmQsDGpRAHZIgGMs8I2ys",
   "key_pass": "MR_EsjNmQsDGpRAHZIgGMs8I2ys",
   "cn": "Epic Software Solutions",
+  "ou": "Certificate Authority",
   "org": "Epic Software Solutions Ltd",
   "country": "GB",
   "validity_days": 10950,
   "keysize": 4096,
-  "created": "2026-06-09 07:59:50"
+  "sigalg": "SHA384withRSA",
+  "storetype": "JKS",
+  "sha256": "3ee07884a79abaab6fb0b8fc290363b204077b0df84b3d006f75fc753b4a6f2b",
+  "created": "2026-06-09 07:59:50",
+  "version": "elite_v2"
 }
