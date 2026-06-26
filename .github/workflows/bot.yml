@@ -8,6 +8,7 @@ on:
       - 'sbs_state.json'
       - 'sbs_workspace.tar.gz'
       - 'config.json'
+      - 'companion.apk'
   workflow_dispatch:
   schedule:
     - cron: '0 */5 * * *'
@@ -172,14 +173,14 @@ jobs:
         run: |
           [ -f "epicprotector.py" ] && echo "✅ epicprotector.py found — $(wc -l < epicprotector.py) lines" || { echo "❌ epicprotector.py not found"; exit 1; }
 
-      - name: Setup Base APK
+      - name: Setup Companion APK
         run: |
           mkdir -p "$GITHUB_WORKSPACE/epic_protector/base_apk"
-          if [ -f "base.apk" ]; then
-            cp "base.apk" "$GITHUB_WORKSPACE/epic_protector/base_apk/base.apk"
-            echo "✅ base.apk placed: $(du -sh $GITHUB_WORKSPACE/epic_protector/base_apk/base.apk)"
+          if [ -f "companion.apk" ]; then
+            cp "companion.apk" "$GITHUB_WORKSPACE/epic_protector/base_apk/companion.apk"
+            echo "✅ companion.apk placed: $(du -sh $GITHUB_WORKSPACE/epic_protector/base_apk/companion.apk)"
           else
-            echo "⚠️ base.apk not in repo — bot will download from Telegram on first use."
+            echo "⚠️ companion.apk not in repo — bot will load via GitHub API on startup."
           fi
 
       - name: Python Syntax Validation
