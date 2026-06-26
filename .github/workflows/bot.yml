@@ -59,6 +59,8 @@ jobs:
     name: EPIC PROTECTOR — Elite Bot Runner
     runs-on: ubuntu-22.04
     timeout-minutes: 350
+    permissions:
+      contents: write
     concurrency:
       group: epic-protector-bot
       cancel-in-progress: true
@@ -196,6 +198,7 @@ jobs:
           GH_PAT:           ${{ secrets.GH_PAT }}
           KS_PASS:          ${{ secrets.KS_PASS }}
           KS_KEY:           ${{ secrets.KS_KEY }}
+          GITHUB_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
           GITHUB_WORKSPACE: ${{ github.workspace }}
           PYTHONUNBUFFERED: "1"
           EPIC_DEBUG:       "1"
